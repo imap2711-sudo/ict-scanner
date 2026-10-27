@@ -72,7 +72,8 @@ def process_setup_logic(df, daily_df, eval_day, day_start, day_end, ticker, cmp,
         if bo_cands.empty: continue
             
         bo_idx = bo_cands.index[0]
-        if (df_index_list.index(bo_idx) - df_index_list.index(sweep_idx)) > 5: continue 
+        # UPDATED: Max 7 candles for breakout
+        if (df_index_list.index(bo_idx) - df_index_list.index(sweep_idx)) > 7: continue 
             
         leg = df.loc[sweep_idx:bo_idx]
         if leg['High'].max() >= pdh: continue
@@ -124,7 +125,8 @@ def process_setup_logic(df, daily_df, eval_day, day_start, day_end, ticker, cmp,
         if bo_cands.empty: continue
             
         bo_idx = bo_cands.index[0]
-        if (df_index_list.index(bo_idx) - df_index_list.index(sweep_idx)) > 5: continue 
+        # UPDATED: Max 7 candles for breakout
+        if (df_index_list.index(bo_idx) - df_index_list.index(sweep_idx)) > 7: continue 
             
         leg = df.loc[sweep_idx:bo_idx]
         if leg['Low'].min() <= pdl: continue
@@ -202,7 +204,6 @@ def run_historical_backtest(ticker, target_date_str):
         day_start = target_date
         day_end = day_start + pd.Timedelta(days=1)
         
-        # 1. Identify Setup
         setups = process_setup_logic(df, daily_df, target_date, day_start, day_end, ticker, 0, mode="backtest")
         if not setups: return None
         
@@ -210,19 +211,12 @@ def run_historical_backtest(ticker, target_date_str):
         for s in setups:
             bo_idx = s['Breakout_Idx']
             
-            # 2. Determine Entry Window (Same day + Next trading day)
-            future_daily = daily_df.loc[daily_df.index > target_date]
-            if future_daily.empty:
-                entry_limit = day_end + pd.Timedelta(hours=15) 
-            else:
-                next_day_start = future_daily.index[0]
-                entry_limit = next_day_start + pd.Timedelta(days=1)
-            
+            # UPDATED: Entry Window Strictly Limited to the Same Day
+            entry_limit = day_end
             entry_window = df.loc[(df.index > bo_idx) & (df.index < entry_limit)]
             entered = False
             entry_idx = None
             
-            # 3. Check for Entry
             if s['Direction'] == 'Bullish':
                 for idx, row in entry_window.iterrows():
                     if row['Low'] <= s['Entry_50']:
@@ -240,7 +234,7 @@ def run_historical_backtest(ticker, target_date_str):
                 results.append({**s, "Triggered": False, "Max_Move_Pct": 0, "Outcome": "Missed Entry"})
                 continue
                 
-            # 4. Forward Track (SL vs Target & Max Excursion)
+            # UPDATED: Forward Track runs until end of data, targeting multi-day holds
             forward_df = df.loc[df.index > entry_idx]
             max_move_pct = 0
             outcome = "Open / End of Data"
@@ -363,7 +357,7 @@ with tab_live:
                     st.plotly_chart(plot_interactive_chart(setup_options[selected_key]), use_container_width=True)
 
 with tab_hist:
-    st.markdown("Select any trading date in the last **60 days** to backtest T+1 entry and stop-loss metrics.")
+    st.markdown("Select any trading date in the last **60 days** to backtest Same-Day Entry and Multi-Day Target/SL tracking.")
     all_60_days = reversed(get_trading_days(60))
     hist_date = st.selectbox("Select Backtest Date", all_60_days, key="hist_date")
     
@@ -383,7 +377,7 @@ with tab_hist:
                 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Total Setups Identified", total_setups)
-                c2.metric("Entered (Touched 50%)", triggered)
+                c2.metric("Entered (Same-Day 50% Touch)", triggered)
                 c3.metric("Failed (Hit SL before Target)", sl_hits)
                 c4.metric("Avg Max Favorable Excursion", f"{avg_move:.2f}%" if pd.notna(avg_move) else "0%")
                 
