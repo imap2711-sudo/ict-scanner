@@ -6,11 +6,9 @@ import io
 import concurrent.futures
 from datetime import datetime
 import pytz
+import plotly.graph_objects as go
 
-# Streamlit Page Config
 st.set_page_config(page_title="ICT 15m Scanner", layout="wide", page_icon="⚡")
-
-# Force IST Timezone
 ist = pytz.timezone('Asia/Kolkata')
 
 @st.cache_data(ttl=3600)
@@ -122,13 +120,15 @@ def find_15m_ict_setup(ticker):
                 setups.append({
                     "Direction": "Bullish",
                     "Date": bo_idx.strftime('%Y-%m-%d'),
-                    "Time": bo_idx.strftime('%H:%M'),
+                    "Breakout Time (15m Close)": bo_idx.strftime('%H:%M'),
                     "Symbol": ticker.replace('.NS',''),
                     "HTF Pool": swept_level[1],
-                    "Anchor": sweep_low,
-                    "Displacement": disp_high,
-                    "Entry (50%)": round(eq_50, 2),
-                    "CMP": round(cmp, 2),
+                    "HTF Level (₹)": round(swept_level[0], 2),
+                    "MSS Break Level (₹)": round(break_level, 2),
+                    "Anchor (₹)": round(sweep_low, 2),
+                    "Displacement (₹)": round(disp_high, 2),
+                    "Entry 50% (₹)": round(eq_50, 2),
+                    "CMP (₹)": round(cmp, 2),
                     "Gap (%)": round(((cmp - eq_50) / cmp) * 100, 2)
                 })
                 bull_found = True
@@ -173,13 +173,15 @@ def find_15m_ict_setup(ticker):
                 setups.append({
                     "Direction": "Bearish",
                     "Date": bo_idx.strftime('%Y-%m-%d'),
-                    "Time": bo_idx.strftime('%H:%M'),
+                    "Breakout Time (15m Close)": bo_idx.strftime('%H:%M'),
                     "Symbol": ticker.replace('.NS',''),
                     "HTF Pool": swept_level[1],
-                    "Anchor": sweep_high,
-                    "Displacement": disp_low,
-                    "Entry (50%)": round(eq_50, 2),
-                    "CMP": round(cmp, 2),
+                    "HTF Level (₹)": round(swept_level[0], 2),
+                    "MSS Break Level (₹)": round(break_level, 2),
+                    "Anchor (₹)": round(sweep_high, 2),
+                    "Displacement (₹)": round(disp_low, 2),
+                    "Entry 50% (₹)": round(eq_50, 2),
+                    "CMP (₹)": round(cmp, 2),
                     "Gap (%)": round(((eq_50 - cmp) / cmp) * 100, 2)
                 })
                 bear_found = True
@@ -194,8 +196,50 @@ def run_market_scan(tickers):
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
         for res in executor.map(find_15m_ict_setup, tickers):
             if res: results.extend(res)
-    return pd.DataFrame(results) if results else pd.DataFrame()
+    return results
 
+def plot_interactive_chart(setup):
+    ticker = setup['Symbol'] + ".NS"
+    t = yf.Ticker(ticker)
+    
+    # Fetch 4 days of data to give good visual context around the PDL/PDH
+    df = t.history(period="4d", interval="15m")
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
+    
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+        increasing_line_color='#26a69a', decreasing_line_color='#ef5350'
+    )])
+    
+    # HTF Sweep Line (Red Dash)
+    fig.add_hline(y=setup['HTF Level (₹)'], line_dash="dash", line_color="#ef5350", 
+                  annotation_text=f" Swept {setup['HTF Pool']} ", annotation_position="bottom right",
+                  annotation_font_color="white", annotation_bgcolor="#ef5350")
+    
+    # MSS Break Level (Orange Dot)
+    fig.add_hline(y=setup['MSS Break Level (₹)'], line_dash="dot", line_color="#ff9800", 
+                  annotation_text=" MSS Break ", annotation_position="top left",
+                  annotation_font_color="black", annotation_bgcolor="#ff9800")
+    
+    # 50% Limit Entry Level (Green Dash)
+    fig.add_hline(y=setup['Entry 50% (₹)'], line_dash="dash", line_color="#26a69a", 
+                  annotation_text=" 50% Entry Level ", annotation_position="bottom right",
+                  annotation_font_color="white", annotation_bgcolor="#26a69a")
+
+    # Layout styling for dark mode
+    fig.update_layout(
+        title=f"{setup['Symbol']} | {setup['Direction']} 15m Setup | Breakout @ {setup['Breakout Time (15m Close)']}",
+        yaxis_title="Price (₹)",
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark",
+        height=500,
+        margin=dict(l=20, r=20, t=50, b=20)
+    )
+    
+    # Exclude non-trading hours from the x-axis to remove empty weekend/night gaps
+    fig.update_xaxes(rangebreaks=[dict(bounds=["15:30", "09:15"]), dict(bounds=["sat", "mon"])])
+    return fig
 
 # --- STREAMLIT UI ---
 st.title("⚡ ICT Intraday Precision Scanner")
@@ -205,11 +249,12 @@ st.markdown(f"**Market Data Current As Of:** `{now_str}`")
 if st.button("🚀 Fetch Live Market Data & Scan", type="primary"):
     with st.spinner("Scanning Nifty 500 for strict PDL / PDH Sweeps..."):
         tickers = get_nifty500_symbols()
-        st.session_state['scan_data'] = run_market_scan(tickers)
+        raw_results = run_market_scan(tickers)
+        st.session_state['raw_data'] = raw_results
         st.session_state['valid_dates'] = get_last_5_trading_days()
 
-if 'scan_data' in st.session_state:
-    df_all = st.session_state['scan_data']
+if 'raw_data' in st.session_state:
+    df_all = pd.DataFrame(st.session_state['raw_data'])
     valid_dates = reversed(st.session_state['valid_dates'])
     
     col1, col2 = st.columns(2)
@@ -222,7 +267,7 @@ if 'scan_data' in st.session_state:
     if not df_all.empty:
         df_filtered = df_all[df_all['Date'] == sel_date]
         if sel_time != "View Full Day":
-            df_filtered = df_filtered[df_filtered['Time'] <= sel_time]
+            df_filtered = df_filtered[df_filtered['Breakout Time (15m Close)'] <= sel_time]
             
         df_bull = df_filtered[df_filtered['Direction'] == 'Bullish'].sort_values('Gap (%)')
         df_bear = df_filtered[df_filtered['Direction'] == 'Bearish'].sort_values('Gap (%)')
@@ -243,5 +288,22 @@ if 'scan_data' in st.session_state:
             st.info(f"No strictly compliant PDH sweeps found on {sel_date} by {sel_time}.")
         else:
             st.dataframe(df_bear.drop(columns=['Direction', 'Date']), use_container_width=True, hide_index=True)
+
+    # --- CHART VISUALIZER SECTION ---
+    st.divider()
+    st.subheader("📈 Visualize 15m Setup")
+    
+    if not df_filtered.empty:
+        # Create a dropdown mapping symbols to their raw dictionary data
+        setup_options = {f"{row['Symbol']} ({row['Direction']} @ {row['Breakout Time (15m Close)']})": row.to_dict() for _, row in df_filtered.iterrows()}
+        selected_key = st.selectbox("Select a stock from the filtered setups above to render its chart:", list(setup_options.keys()))
+        
+        if selected_key:
+            selected_setup = setup_options[selected_key]
+            with st.spinner(f"Loading live 15m chart for {selected_setup['Symbol']}..."):
+                fig = plot_interactive_chart(selected_setup)
+                st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.write("No setups available to visualize for this date/time filter.")
 else:
     st.info("👆 Click the button above to pull real-time data from Yahoo Finance and execute the scan.")
