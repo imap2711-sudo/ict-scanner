@@ -13,7 +13,7 @@ st.set_page_config(page_title="ICT 15m Scanner", layout="wide", page_icon="⚡")
 # Force IST Timezone
 ist = pytz.timezone('Asia/Kolkata')
 
-@st.cache_data(ttl=3600) # Cache symbols for 1 hour
+@st.cache_data(ttl=3600)
 def get_nifty500_symbols():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -59,7 +59,6 @@ def find_15m_ict_setup(ticker):
         df.loc[df.index[-1], 'Close'] = cmp
         
         daily_df = df.resample('D').agg({'High':'max', 'Low':'min', 'Close':'last'}).dropna()
-        weekly_df = df.resample('W-FRI').agg({'High':'max', 'Low':'min'}).dropna()
         if len(daily_df) < 10: return None
             
         setups = []
@@ -71,24 +70,14 @@ def find_15m_ict_setup(ticker):
             day_end = day_start + pd.Timedelta(days=1)
             
             hist_daily = daily_df.loc[daily_df.index < day_start]
-            hist_weekly = weekly_df.loc[weekly_df.index < day_start]
             if hist_daily.empty: continue
                 
+            # STRICT PDL / PDH ONLY
             pdh = hist_daily['High'].iloc[-1]
             pdl = hist_daily['Low'].iloc[-1]
             
             bullish_levels = [(pdl, "PDL")]
             bearish_levels = [(pdh, "PDH")]
-            
-            if not hist_weekly.empty:
-                bullish_levels.append((hist_weekly['Low'].iloc[-1], "PWL"))
-                bearish_levels.append((hist_weekly['High'].iloc[-1], "PWH"))
-                
-            for i in range(1, len(hist_daily)-1):
-                if hist_daily['Low'].iloc[i] < hist_daily['Low'].iloc[i-1] and hist_daily['Low'].iloc[i] < hist_daily['Low'].iloc[i+1]:
-                    bullish_levels.append((hist_daily['Low'].iloc[i], "Daily Swing Low"))
-                if hist_daily['High'].iloc[i] > hist_daily['High'].iloc[i-1] and hist_daily['High'].iloc[i] > hist_daily['High'].iloc[i+1]:
-                    bearish_levels.append((hist_daily['High'].iloc[i], "Daily Swing High"))
                     
             eval_window = df.loc[(df.index >= day_start) & (df.index < day_end)]
             if eval_window.empty: continue
@@ -199,7 +188,7 @@ def find_15m_ict_setup(ticker):
     except Exception:
         return None
 
-@st.cache_data(ttl=300, show_spinner=False) # Caches scan results for 5 minutes
+@st.cache_data(ttl=300, show_spinner=False)
 def run_market_scan(tickers):
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
@@ -213,9 +202,8 @@ st.title("⚡ ICT Intraday Precision Scanner")
 now_str = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S IST")
 st.markdown(f"**Market Data Current As Of:** `{now_str}`")
 
-# Run Scan Button
 if st.button("🚀 Fetch Live Market Data & Scan", type="primary"):
-    with st.spinner("Scanning Nifty 500 across 15m timeframes (Last 5 Days)..."):
+    with st.spinner("Scanning Nifty 500 for strict PDL / PDH Sweeps..."):
         tickers = get_nifty500_symbols()
         st.session_state['scan_data'] = run_market_scan(tickers)
         st.session_state['valid_dates'] = get_last_5_trading_days()
@@ -228,11 +216,9 @@ if 'scan_data' in st.session_state:
     with col1:
         sel_date = st.selectbox("Select Date", valid_dates)
     with col2:
-        # Generate 15m intervals
         times = ["View Full Day"] + [f"{h:02d}:{m:02d}" for h in range(9, 16) for m in (0, 15, 30, 45) if not (h==9 and m==0) and not (h==15 and m>30)]
         sel_time = st.selectbox("Simulated Screener Time", times)
 
-    # Filter Logic
     if not df_all.empty:
         df_filtered = df_all[df_all['Date'] == sel_date]
         if sel_time != "View Full Day":
@@ -248,13 +234,13 @@ if 'scan_data' in st.session_state:
     
     with tab1:
         if df_bull.empty:
-            st.info(f"No Bullish setups met the strict criteria on {sel_date} by {sel_time}.")
+            st.info(f"No strictly compliant PDL sweeps found on {sel_date} by {sel_time}.")
         else:
             st.dataframe(df_bull.drop(columns=['Direction', 'Date']), use_container_width=True, hide_index=True)
             
     with tab2:
         if df_bear.empty:
-            st.info(f"No Bearish setups met the strict criteria on {sel_date} by {sel_time}.")
+            st.info(f"No strictly compliant PDH sweeps found on {sel_date} by {sel_time}.")
         else:
             st.dataframe(df_bear.drop(columns=['Direction', 'Date']), use_container_width=True, hide_index=True)
 else:
