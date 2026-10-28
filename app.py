@@ -39,9 +39,6 @@ def process_setup_logic(df, daily_df, eval_day, day_start, day_end, ticker, cmp,
         
     pdh = hist_daily['High'].iloc[-1]
     pdl = hist_daily['Low'].iloc[-1]
-    
-    bullish_levels = [(pdl, "PDL")]
-    bearish_levels = [(pdh, "PDH")]
             
     eval_window = df.loc[(df.index >= day_start) & (df.index < day_end)]
     if eval_window.empty: return []
@@ -49,111 +46,101 @@ def process_setup_logic(df, daily_df, eval_day, day_start, day_end, ticker, cmp,
     setups = []
     df_index_list = df.index.tolist()
     
-    # --- BULLISH ---
-    bull_found = False
-    for sweep_idx in eval_window.index:
-        if bull_found: break
+    # --- BULLISH (Strictly FIRST sweep of the day) ---
+    bull_sweeps = eval_window[eval_window['Low'] <= pdl]
+    if not bull_sweeps.empty:
+        # Isolate the chronologically first candle that touches/sweeps PDL
+        sweep_idx = bull_sweeps.index[0]
         sweep_low = df.loc[sweep_idx, 'Low']
         
-        swept_level = next(((px, name) for px, name in bullish_levels if sweep_low < px), None)
-        if not swept_level: continue
-        
         pre_df = df.loc[:sweep_idx].iloc[-40:-1] 
-        if len(pre_df) < 3: continue
-            
-        shs = [pre_df['High'].iloc[i] for i in range(1, len(pre_df)-1) if pre_df['High'].iloc[i] > pre_df['High'].iloc[i-1] and pre_df['High'].iloc[i] > pre_df['High'].iloc[i+1]]
-        if not shs: continue
-        break_level = shs[-1]
-        if len(shs) > 1 and abs(shs[-2] - break_level) / break_level < 0.0015:
-            break_level = max(break_level, shs[-2])
-        
-        post_df = eval_window.loc[sweep_idx:]
-        bo_cands = post_df[post_df['Close'] > break_level]
-        if bo_cands.empty: continue
-            
-        bo_idx = bo_cands.index[0]
-        # UPDATED: Max 7 candles for breakout
-        if (df_index_list.index(bo_idx) - df_index_list.index(sweep_idx)) > 7: continue 
-            
-        leg = df.loc[sweep_idx:bo_idx]
-        if leg['High'].max() >= pdh: continue
-            
-        if not any(leg['Low'].iloc[i+2] > leg['High'].iloc[i] for i in range(len(leg)-2)): continue
-        
-        disp_high = leg['High'].max()
-        eq_50 = (sweep_low + disp_high) / 2
-        
-        if mode == "live":
-            post_high = df.loc[leg['High'].idxmax():]
-            if len(post_high) > 1 and post_high['Low'].iloc[1:].min() <= eq_50: continue
-            if cmp <= eq_50: continue
-            
-            setups.append({
-                "Direction": "Bullish", "Date": bo_idx.strftime('%Y-%m-%d'), "Breakout Time (15m Close)": bo_idx.strftime('%H:%M'),
-                "Symbol": ticker.replace('.NS',''), "HTF Pool": swept_level[1], "HTF Level (₹)": round(swept_level[0], 2),
-                "MSS Break Level (₹)": round(break_level, 2), "Anchor (₹)": round(sweep_low, 2),
-                "Displacement (₹)": round(disp_high, 2), "Entry 50% (₹)": round(eq_50, 2),
-                "CMP (₹)": round(cmp, 2), "Gap (%)": round(((cmp - eq_50) / cmp) * 100, 2)
-            })
-        else:
-            setups.append({
-                "Direction": "Bullish", "Breakout_Idx": bo_idx, "Symbol": ticker.replace('.NS',''),
-                "Anchor": sweep_low, "Displacement_Peak": disp_high, "Entry_50": eq_50
-            })
-        bull_found = True
+        if len(pre_df) >= 3:
+            shs = [pre_df['High'].iloc[i] for i in range(1, len(pre_df)-1) if pre_df['High'].iloc[i] > pre_df['High'].iloc[i-1] and pre_df['High'].iloc[i] > pre_df['High'].iloc[i+1]]
+            if shs:
+                break_level = shs[-1]
+                if len(shs) > 1 and abs(shs[-2] - break_level) / break_level < 0.0015:
+                    break_level = max(break_level, shs[-2])
+                
+                post_df = eval_window.loc[sweep_idx:]
+                bo_cands = post_df[post_df['Close'] > break_level]
+                if not bo_cands.empty:
+                    bo_idx = bo_cands.index[0]
+                    
+                    if (df_index_list.index(bo_idx) - df_index_list.index(sweep_idx)) <= 7:
+                        leg = df.loc[sweep_idx:bo_idx]
+                        
+                        # Invalidation: No subsequent candle in displacement can touch PDL again or sweep PDH
+                        if not (len(leg) > 1 and leg['Low'].iloc[1:].min() <= pdl) and leg['High'].max() < pdh:
+                            
+                            # FVG Check
+                            if any(leg['Low'].iloc[i+2] > leg['High'].iloc[i] for i in range(len(leg)-2)):
+                                disp_high = leg['High'].max()
+                                eq_50 = (sweep_low + disp_high) / 2
+                                
+                                if mode == "live":
+                                    post_high = df.loc[leg['High'].idxmax():]
+                                    if not (len(post_high) > 1 and post_high['Low'].iloc[1:].min() <= eq_50):
+                                        if cmp > eq_50:
+                                            setups.append({
+                                                "Direction": "Bullish", "Date": bo_idx.strftime('%Y-%m-%d'), "Breakout Time (15m Close)": bo_idx.strftime('%H:%M'),
+                                                "Symbol": ticker.replace('.NS',''), "HTF Pool": "PDL", "HTF Level (₹)": round(pdl, 2),
+                                                "MSS Break Level (₹)": round(break_level, 2), "Anchor (₹)": round(sweep_low, 2),
+                                                "Displacement (₹)": round(disp_high, 2), "Entry 50% (₹)": round(eq_50, 2),
+                                                "CMP (₹)": round(cmp, 2), "Gap (%)": round(((cmp - eq_50) / cmp) * 100, 2)
+                                            })
+                                else:
+                                    setups.append({
+                                        "Direction": "Bullish", "Breakout_Idx": bo_idx, "Symbol": ticker.replace('.NS',''),
+                                        "Anchor": sweep_low, "Displacement_Peak": disp_high, "Entry_50": eq_50
+                                    })
 
-    # --- BEARISH ---
-    bear_found = False
-    for sweep_idx in eval_window.index:
-        if bear_found: break
+    # --- BEARISH (Strictly FIRST sweep of the day) ---
+    bear_sweeps = eval_window[eval_window['High'] >= pdh]
+    if not bear_sweeps.empty:
+        # Isolate the chronologically first candle that touches/sweeps PDH
+        sweep_idx = bear_sweeps.index[0]
         sweep_high = df.loc[sweep_idx, 'High']
         
-        swept_level = next(((px, name) for px, name in bearish_levels if sweep_high > px), None)
-        if not swept_level: continue
-        
         pre_df = df.loc[:sweep_idx].iloc[-40:-1] 
-        if len(pre_df) < 3: continue
-            
-        sls = [pre_df['Low'].iloc[i] for i in range(1, len(pre_df)-1) if pre_df['Low'].iloc[i] < pre_df['Low'].iloc[i-1] and pre_df['Low'].iloc[i] < pre_df['Low'].iloc[i+1]]
-        if not sls: continue
-        break_level = sls[-1]
-        if len(sls) > 1 and abs(sls[-2] - break_level) / break_level < 0.0015:
-            break_level = min(break_level, sls[-2])
-        
-        post_df = eval_window.loc[sweep_idx:]
-        bo_cands = post_df[post_df['Close'] < break_level]
-        if bo_cands.empty: continue
-            
-        bo_idx = bo_cands.index[0]
-        # UPDATED: Max 7 candles for breakout
-        if (df_index_list.index(bo_idx) - df_index_list.index(sweep_idx)) > 7: continue 
-            
-        leg = df.loc[sweep_idx:bo_idx]
-        if leg['Low'].min() <= pdl: continue
-            
-        if not any(leg['High'].iloc[i+2] < leg['Low'].iloc[i] for i in range(len(leg)-2)): continue
-        
-        disp_low = leg['Low'].min()
-        eq_50 = (sweep_high + disp_low) / 2
-        
-        if mode == "live":
-            post_low = df.loc[leg['Low'].idxmin():]
-            if len(post_low) > 1 and post_low['High'].iloc[1:].max() >= eq_50: continue
-            if cmp >= eq_50: continue
-            
-            setups.append({
-                "Direction": "Bearish", "Date": bo_idx.strftime('%Y-%m-%d'), "Breakout Time (15m Close)": bo_idx.strftime('%H:%M'),
-                "Symbol": ticker.replace('.NS',''), "HTF Pool": swept_level[1], "HTF Level (₹)": round(swept_level[0], 2),
-                "MSS Break Level (₹)": round(break_level, 2), "Anchor (₹)": round(sweep_high, 2),
-                "Displacement (₹)": round(disp_low, 2), "Entry 50% (₹)": round(eq_50, 2),
-                "CMP (₹)": round(cmp, 2), "Gap (%)": round(((eq_50 - cmp) / cmp) * 100, 2)
-            })
-        else:
-            setups.append({
-                "Direction": "Bearish", "Breakout_Idx": bo_idx, "Symbol": ticker.replace('.NS',''),
-                "Anchor": sweep_high, "Displacement_Peak": disp_low, "Entry_50": eq_50
-            })
-        bear_found = True
+        if len(pre_df) >= 3:
+            sls = [pre_df['Low'].iloc[i] for i in range(1, len(pre_df)-1) if pre_df['Low'].iloc[i] < pre_df['Low'].iloc[i-1] and pre_df['Low'].iloc[i] < pre_df['Low'].iloc[i+1]]
+            if sls:
+                break_level = sls[-1]
+                if len(sls) > 1 and abs(sls[-2] - break_level) / break_level < 0.0015:
+                    break_level = min(break_level, sls[-2])
+                
+                post_df = eval_window.loc[sweep_idx:]
+                bo_cands = post_df[post_df['Close'] < break_level]
+                if not bo_cands.empty:
+                    bo_idx = bo_cands.index[0]
+                    
+                    if (df_index_list.index(bo_idx) - df_index_list.index(sweep_idx)) <= 7:
+                        leg = df.loc[sweep_idx:bo_idx]
+                        
+                        # Invalidation: No subsequent candle in displacement can touch PDH again or sweep PDL
+                        if not (len(leg) > 1 and leg['High'].iloc[1:].max() >= pdh) and leg['Low'].min() > pdl:
+                            
+                            # FVG Check
+                            if any(leg['High'].iloc[i+2] < leg['Low'].iloc[i] for i in range(len(leg)-2)):
+                                disp_low = leg['Low'].min()
+                                eq_50 = (sweep_high + disp_low) / 2
+                                
+                                if mode == "live":
+                                    post_low = df.loc[leg['Low'].idxmin():]
+                                    if not (len(post_low) > 1 and post_low['High'].iloc[1:].max() >= eq_50):
+                                        if cmp < eq_50:
+                                            setups.append({
+                                                "Direction": "Bearish", "Date": bo_idx.strftime('%Y-%m-%d'), "Breakout Time (15m Close)": bo_idx.strftime('%H:%M'),
+                                                "Symbol": ticker.replace('.NS',''), "HTF Pool": "PDH", "HTF Level (₹)": round(pdh, 2),
+                                                "MSS Break Level (₹)": round(break_level, 2), "Anchor (₹)": round(sweep_high, 2),
+                                                "Displacement (₹)": round(disp_low, 2), "Entry 50% (₹)": round(eq_50, 2),
+                                                "CMP (₹)": round(cmp, 2), "Gap (%)": round(((eq_50 - cmp) / cmp) * 100, 2)
+                                            })
+                                else:
+                                    setups.append({
+                                        "Direction": "Bearish", "Breakout_Idx": bo_idx, "Symbol": ticker.replace('.NS',''),
+                                        "Anchor": sweep_high, "Displacement_Peak": disp_low, "Entry_50": eq_50
+                                    })
         
     return setups
 
@@ -211,7 +198,7 @@ def run_historical_backtest(ticker, target_date_str):
         for s in setups:
             bo_idx = s['Breakout_Idx']
             
-            # UPDATED: Entry Window Strictly Limited to the Same Day
+            # Entry Window Strictly Limited to the Same Day
             entry_limit = day_end
             entry_window = df.loc[(df.index > bo_idx) & (df.index < entry_limit)]
             entered = False
@@ -234,7 +221,7 @@ def run_historical_backtest(ticker, target_date_str):
                 results.append({**s, "Triggered": False, "Max_Move_Pct": 0, "Outcome": "Missed Entry"})
                 continue
                 
-            # UPDATED: Forward Track runs until end of data, targeting multi-day holds
+            # Forward Track runs until end of data, targeting multi-day holds
             forward_df = df.loc[df.index > entry_idx]
             max_move_pct = 0
             outcome = "Open / End of Data"
@@ -305,7 +292,6 @@ def plot_interactive_chart(setup):
     fig.update_layout(title=f"{setup['Symbol']} | {setup['Direction']} | Breakout @ {setup['Breakout Time (15m Close)']}", yaxis_title="Price (₹)", xaxis_rangeslider_visible=False, template="plotly_dark", height=500, margin=dict(l=20, r=20, t=50, b=20))
     fig.update_xaxes(rangebreaks=[dict(bounds=["15:30", "09:15"]), dict(bounds=["sat", "mon"])])
     return fig
-
 
 # --- STREAMLIT UI ---
 st.title("⚡ ICT Intraday Precision Scanner")
