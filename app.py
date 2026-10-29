@@ -265,10 +265,11 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str, strict_opposite):
+def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite):
     try:
         t = yf.Ticker(ticker)
-        target_date = pd.to_datetime(target_date_str).replace(hour=0, minute=0, second=0)
+        start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
+        end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         
         if timeframe == "15 Minute":
             df = t.history(period="60d", interval="15m", auto_adjust=False)
@@ -278,30 +279,27 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str, stric
             daily_df = df.resample('D').agg({'High':'max', 'Low':'min'}).dropna()
             
             if scan_state != "4":
-                if target_date not in daily_df.index: return None
-                past_days = daily_df.loc[daily_df.index < target_date]
+                if start_date not in daily_df.index: return None
+                past_days = daily_df.loc[daily_df.index < start_date]
                 if len(past_days) < 2: return None
                 
                 t_minus_1 = past_days.index[-1]
                 pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
                 pdl_yest, pdh_yest = past_days['Low'].iloc[-2], past_days['High'].iloc[-2]
                 
-                day_end = target_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                 
-                res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, target_date, day_end, strict_opposite, is_daily=False)
+                res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
                 eval_start_yest = t_minus_1 + pd.Timedelta(hours=12)
                 res_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, eval_start_yest, day_end, strict_opposite, is_daily=False)
                 
-                valid_res_yest = [r for r in (res_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < target_date]
+                valid_res_yest = [r for r in (res_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < start_date]
                 res = (res_today or []) + valid_res_yest
 
             else: 
-                month_start = target_date.replace(day=1)
-                month_end = month_start + pd.offsets.MonthEnd(0)
-                days_in_month = daily_df.loc[(daily_df.index >= month_start) & (daily_df.index <= month_end)].index
-                
+                days_in_range = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)].index
                 all_res = []
-                for d in days_in_month:
+                for d in days_in_range:
                     past_days = daily_df.loc[daily_df.index < d]
                     if len(past_days) < 2: continue
                     t_minus_1 = past_days.index[-1]
@@ -323,17 +321,29 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str, stric
             if df.empty: return None
             df.index = df.index.tz_localize(None)
             
-            target_month_start = target_date.replace(day=1)
-            hist_df = df.loc[df.index < target_month_start]
-            if hist_df.empty: return None
+            monthly_hist = df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
             
-            monthly_hist = hist_df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
-            if monthly_hist.empty: return None
-            
-            pml, pmh = monthly_hist['Low'].iloc[-1], monthly_hist['High'].iloc[-1]
-            target_month_end = target_date + pd.offsets.MonthEnd(0)
-            
-            res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, is_daily=True)
+            if scan_state != "4":
+                target_month_start = start_date.replace(day=1)
+                target_month_end = target_month_start + pd.offsets.MonthEnd(0)
+                
+                hist_df = monthly_hist.loc[monthly_hist.index < target_month_start]
+                if hist_df.empty: return None
+                pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
+                
+                res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, is_daily=True)
+            else:
+                months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
+                all_res = []
+                for m_start in months_in_range:
+                    m_end = m_start + pd.offsets.MonthEnd(0)
+                    hist_df = monthly_hist.loc[monthly_hist.index < m_start]
+                    if hist_df.empty: continue
+                    pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
+                    
+                    r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, is_daily=True)
+                    if r_month: all_res.extend(r_month)
+                res = all_res
 
         if res:
             for r in res: r['Stock name'] = ticker.replace('.NS', '')
@@ -355,7 +365,7 @@ with st.sidebar:
             "1. MSS done (Swing high not yet formed)", 
             "2. Awaiting entry (Price has not yet touched FVG/61%)", 
             "3. Trade open (Price has touched Entry, SL/Target not hit)", 
-            "4. Previous reports (Monthly Backtest Mode)"
+            "4. Previous reports (Date Range Backtest Mode)"
         ]
     )
     state_code = scan_state.split(".")[0]
@@ -367,81 +377,92 @@ with st.sidebar:
     
     st.divider()
     if state_code == "4":
-        st.subheader("Backtest Settings")
+        st.subheader("Backtest Date Range")
+        if timeframe == "15 Minute":
+            st.caption("Note: 15-minute historical data is limited to the last 60 days.")
+            
         today = pd.Timestamp.today()
         month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in (range(2) if timeframe == "15 Minute" else range(24))]
-        sel_month_str = st.selectbox("Select Backtest Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
-        target_date = pd.to_datetime(sel_month_str)
+        
+        from_month_str = st.selectbox("From Month", reversed(month_opts), format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
+        to_month_str = st.selectbox("To Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
+        
+        start_date = pd.to_datetime(from_month_str)
+        end_date = pd.to_datetime(to_month_str) + pd.offsets.MonthEnd(0)
         
         risk_per_trade = st.number_input("Risk per Trade (₹)", min_value=100, value=1000, step=100)
     else:
-        target_date = datetime.today()
+        start_date = datetime.today()
+        end_date = start_date
 
 if st.button("🚀 Execute Master Scan", type="primary"):
-    with st.spinner(f"Scanning Nifty 500 | {timeframe} | State: {state_code}..."):
-        tickers = get_nifty500_symbols()
-        results = []
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-            futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, target_date.strftime('%Y-%m-%d'), strict_opposite) for tick in tickers]
-            for f in concurrent.futures.as_completed(futures):
-                res = f.result()
-                if res: results.extend(res)
-                
-        if not results:
-            st.warning("No stocks matched these criteria for the selected state.")
-        else:
-            df_all = pd.DataFrame(results)
+    if state_code == "4" and start_date > end_date:
+        st.error("Error: 'From Month' must be earlier than or equal to 'To Month'.")
+    else:
+        with st.spinner(f"Scanning Nifty 500 | {timeframe} | State: {state_code}..."):
+            tickers = get_nifty500_symbols()
+            results = []
             
-            if state_code == "4":
-                def calculate_pnl(row):
-                    risk = risk_per_trade
-                    risk_dist = abs(row['Entry Level'] - row['Stop Loss'])
-                    if risk_dist == 0: return 0
-                    qty = risk / risk_dist
-                    reward_dist = abs(row['Target'] - row['Entry Level'])
-                    reward_ratio = reward_dist / risk_dist
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite) for tick in tickers]
+                for f in concurrent.futures.as_completed(futures):
+                    res = f.result()
+                    if res: results.extend(res)
                     
-                    if row['Outcome'] == 'Target Hit':
-                        return risk * reward_ratio
-                    elif row['Outcome'] == 'SL Hit':
-                        return -risk
-                    else: 
-                        if row['Direction'] == 'Bullish':
-                            return qty * (row['CMP'] - row['Entry Level'])
-                        else:
-                            return qty * (row['Entry Level'] - row['CMP'])
-                            
-                df_all['Trade P&L (₹)'] = df_all.apply(calculate_pnl, axis=1).round(2)
-            
-            df_bull = df_all[df_all['Direction'] == 'Bullish']
-            df_bear = df_all[df_all['Direction'] == 'Bearish']
-            
-            tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
-            
-            def render_tab_content(df, title):
-                if df.empty:
-                    st.info(f"No {title} Setups.")
-                else:
-                    if state_code == "4":
-                        total_pnl = df['Trade P&L (₹)'].sum()
-                        wins = len(df[df['Outcome'] == 'Target Hit'])
-                        losses = len(df[df['Outcome'] == 'SL Hit'])
-                        open_t = len(df[df['Outcome'] == 'Still Open'])
-                        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-                        
-                        st.subheader(f"📊 {title} Backtest Results (Risk: ₹{risk_per_trade}/trade)")
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Total Monthly P&L", f"₹ {total_pnl:,.2f}")
-                        c2.metric("Win Rate (Closed)", f"{win_rate:.1f}%")
-                        c3.metric("Closed Trades", f"{wins}W / {losses}L")
-                        c4.metric("Open Floating Trades", open_t)
-                        st.divider()
-                        
-                    st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
-
-            with tab1:
-                render_tab_content(df_bull, "Bullish")
+            if not results:
+                st.warning("No stocks matched these criteria for the selected parameters.")
+            else:
+                df_all = pd.DataFrame(results)
                 
-            with tab2:
-                render_tab_content(df_bear, "Bearish")
+                if state_code == "4":
+                    def calculate_pnl(row):
+                        risk = risk_per_trade
+                        risk_dist = abs(row['Entry Level'] - row['Stop Loss'])
+                        if risk_dist == 0: return 0
+                        qty = risk / risk_dist
+                        reward_dist = abs(row['Target'] - row['Entry Level'])
+                        reward_ratio = reward_dist / risk_dist
+                        
+                        if row['Outcome'] == 'Target Hit':
+                            return risk * reward_ratio
+                        elif row['Outcome'] == 'SL Hit':
+                            return -risk
+                        else: 
+                            if row['Direction'] == 'Bullish':
+                                return qty * (row['CMP'] - row['Entry Level'])
+                            else:
+                                return qty * (row['Entry Level'] - row['CMP'])
+                                
+                    df_all['Trade P&L (₹)'] = df_all.apply(calculate_pnl, axis=1).round(2)
+                
+                df_bull = df_all[df_all['Direction'] == 'Bullish']
+                df_bear = df_all[df_all['Direction'] == 'Bearish']
+                
+                tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
+                
+                def render_tab_content(df, title):
+                    if df.empty:
+                        st.info(f"No {title} Setups.")
+                    else:
+                        if state_code == "4":
+                            total_pnl = df['Trade P&L (₹)'].sum()
+                            wins = len(df[df['Outcome'] == 'Target Hit'])
+                            losses = len(df[df['Outcome'] == 'SL Hit'])
+                            open_t = len(df[df['Outcome'] == 'Still Open'])
+                            win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+                            
+                            st.subheader(f"📊 {title} Backtest Results (Risk: ₹{risk_per_trade}/trade)")
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("Total Range P&L", f"₹ {total_pnl:,.2f}")
+                            c2.metric("Win Rate (Closed)", f"{win_rate:.1f}%")
+                            c3.metric("Closed Trades", f"{wins}W / {losses}L")
+                            c4.metric("Open Floating Trades", open_t)
+                            st.divider()
+                            
+                        st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
+
+                with tab1:
+                    render_tab_content(df_bull, "Bullish")
+                    
+                with tab2:
+                    render_tab_content(df_bear, "Bearish")
