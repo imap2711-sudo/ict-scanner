@@ -90,15 +90,6 @@ def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
         else:
             return fib_618, "61.8% Fib"
 
-def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
-    risk_dist = abs(entry - stop_loss)
-    if risk_dist == 0: return 0.0
-    qty = risk_amt / risk_dist
-    if direction == 'Bullish':
-        return round(qty * (cmp - entry), 2)
-    else:
-        return round(qty * (entry - cmp), 2)
-
 def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, is_daily=False):
     setups = []
     df_index = df.index.tolist()
@@ -173,7 +164,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
-                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bullish", cmp, entry_price, sweep_low, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -256,7 +246,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
-                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bearish", cmp, entry_price, sweep_high, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -283,45 +272,39 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         
         if timeframe == "15 Minute":
-            # Fetch reliable 1-Day Data purely to build HTF levels (immune to 60-day limit)
-            daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
             df = t.history(period="60d", interval="15m", auto_adjust=False)
-            
-            if df.empty or daily_htf.empty: return None
+            if df.empty: return None
             df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
-            daily_htf.index = daily_htf.index.tz_localize(None)
             
-            available_dates = pd.Series(df.index.date).drop_duplicates().apply(lambda x: pd.to_datetime(x))
+            daily_df = df.resample('D').agg({'High':'max', 'Low':'min'}).dropna()
             
             if scan_state != "4":
-                # Current Day states (1, 2, 3)
-                if start_date not in available_dates.values:
-                    start_date = available_dates.iloc[-1] # Fallback to latest available intraday session
+                if start_date not in daily_df.index: return None
+                past_days = daily_df.loc[daily_df.index < start_date]
+                if len(past_days) < 1: return None
                 
-                past_htf = daily_htf.loc[daily_htf.index < start_date]
-                if len(past_htf) < 1: return None
-                
-                pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
                 day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                 
-                res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
-                
+                res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
+                res = res_today or []
+
             else: 
-                # Backtest Engine (Iterating specific dates)
-                days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
-                res = []
+                # Backtest Engine: Strictly Today's Setup ONLY
+                days_in_range = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)].index
+                all_res = []
                 for d in days_in_range:
-                    past_htf = daily_htf.loc[daily_htf.index < d]
-                    if len(past_htf) < 1: continue
-                    
-                    pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                    past_days = daily_df.loc[daily_df.index < d]
+                    if len(past_days) < 1: continue
+                    pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
                     day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                     
                     r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, is_daily=False)
-                    if r_today: res.extend(r_today)
+                    
+                    if r_today: all_res.extend(r_today)
+                res = all_res
                 
         else: 
-            # Daily Timeframe
             df = t.history(period="2y", interval="1d", auto_adjust=False)
             if df.empty: return None
             df.index = df.index.tz_localize(None)
@@ -339,7 +322,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                 res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, is_daily=True)
             else:
                 months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
-                res = []
+                all_res = []
                 for m_start in months_in_range:
                     m_end = m_start + pd.offsets.MonthEnd(0)
                     hist_df = monthly_hist.loc[monthly_hist.index < m_start]
@@ -347,7 +330,8 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                     pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
                     
                     r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, is_daily=True)
-                    if r_month: res.extend(r_month)
+                    if r_month: all_res.extend(r_month)
+                res = all_res
 
         if res:
             for r in res: r['Stock name'] = ticker.replace('.NS', '')
@@ -425,7 +409,7 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                     if res: results.extend(res)
                     
             if not results:
-                st.warning("No stocks matched these criteria. (Try unchecking 'Reject if Opposite Liquidity Touched' or expanding the date range).")
+                st.warning("No stocks matched these criteria for the selected parameters.")
             else:
                 df_all = pd.DataFrame(results)
                 
