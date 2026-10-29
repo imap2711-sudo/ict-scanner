@@ -158,38 +158,59 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             
                             confirm_pos = df_index.index(confirm_idx)
                             tracking_df = df.iloc[confirm_pos:]
-                            touched_entry = not tracking_df[tracking_df['Low'] <= entry_price].empty
+                            
+                            # Intraday 1 PM Entry Time Constraint
+                            touched_entry = False
+                            entry_idx = None
+                            touch_mask = tracking_df['Low'] <= entry_price
+                            
+                            if not touch_mask.empty and touch_mask.any():
+                                entry_idx = tracking_df[touch_mask].index[0]
+                                if is_daily or entry_idx.time() < pd.to_datetime('13:00').time():
+                                    touched_entry = True
                             
                             if not touched_entry and scan_state == "2":
-                                setups.append(setup_data)
+                                # Remove from Awaiting Entry if past 1PM
+                                if is_daily or df.index[-1].time() < pd.to_datetime('13:00').time():
+                                    setups.append(setup_data)
                                 
-                            elif touched_entry and scan_state == "3":
-                                entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
+                            elif touched_entry and scan_state in ["3", "4"]:
                                 forward_df = df.loc[entry_idx:]
                                 is_active = True
+                                outcome = "Still Open"
+                                highest_seen = entry_price
+                                exit_price = cmp
+                                
                                 for idx, row in forward_df.iterrows():
-                                    if row['Low'] <= sweep_low or row['High'] >= post_sh_val:
+                                    if row['High'] > highest_seen: highest_seen = row['High']
+                                    
+                                    if row['Low'] <= sweep_low:
                                         is_active = False
+                                        outcome = "SL Hit"
+                                        exit_price = sweep_low
                                         break
-                                if is_active:
+                                    elif row['High'] >= post_sh_val:
+                                        is_active = False
+                                        outcome = "Target Hit"
+                                        exit_price = post_sh_val
+                                        break
+                                        
+                                    # Hard 3:15 PM EOD Exit Constraint
+                                    if not is_daily and (idx.time() >= pd.to_datetime('15:15').time() or idx.date() > entry_idx.date()):
+                                        is_active = False
+                                        outcome = "Time Exit"
+                                        exit_price = row['Close'] if idx.date() == entry_idx.date() else row['Open']
+                                        break
+                                        
+                                if scan_state == "3" and is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
                                     setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bullish", cmp, entry_price, sweep_low, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
-                                entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
-                                forward_df = df.loc[entry_idx:]
-                                outcome, highest_seen = "Still Open", entry_price
-                                for idx, row in forward_df.iterrows():
-                                    if row['High'] > highest_seen: highest_seen = row['High']
-                                    if row['Low'] <= sweep_low:
-                                        outcome = "SL Hit"
-                                        break
-                                    elif row['High'] >= post_sh_val:
-                                        outcome = "Target Hit"
-                                        break
                                 setup_data["Max Move (%)"] = f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%"
                                 setup_data["Outcome"] = outcome
+                                setup_data["Exit Price"] = exit_price
                                 setups.append(setup_data)
 
     # --- BEARISH LOGIC ---
@@ -241,38 +262,58 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             
                             confirm_pos = df_index.index(confirm_idx)
                             tracking_df = df.iloc[confirm_pos:]
-                            touched_entry = not tracking_df[tracking_df['High'] >= entry_price].empty
+                            
+                            # Intraday 1 PM Entry Time Constraint
+                            touched_entry = False
+                            entry_idx = None
+                            touch_mask = tracking_df['High'] >= entry_price
+                            
+                            if not touch_mask.empty and touch_mask.any():
+                                entry_idx = tracking_df[touch_mask].index[0]
+                                if is_daily or entry_idx.time() < pd.to_datetime('13:00').time():
+                                    touched_entry = True
                             
                             if not touched_entry and scan_state == "2":
-                                setups.append(setup_data)
+                                if is_daily or df.index[-1].time() < pd.to_datetime('13:00').time():
+                                    setups.append(setup_data)
                                 
-                            elif touched_entry and scan_state == "3":
-                                entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
+                            elif touched_entry and scan_state in ["3", "4"]:
                                 forward_df = df.loc[entry_idx:]
                                 is_active = True
+                                outcome = "Still Open"
+                                lowest_seen = entry_price
+                                exit_price = cmp
+                                
                                 for idx, row in forward_df.iterrows():
-                                    if row['High'] >= sweep_high or row['Low'] <= post_sl_val:
+                                    if row['Low'] < lowest_seen: lowest_seen = row['Low']
+                                    
+                                    if row['High'] >= sweep_high:
                                         is_active = False
+                                        outcome = "SL Hit"
+                                        exit_price = sweep_high
                                         break
-                                if is_active:
+                                    elif row['Low'] <= post_sl_val:
+                                        is_active = False
+                                        outcome = "Target Hit"
+                                        exit_price = post_sl_val
+                                        break
+                                        
+                                    # Hard 3:15 PM EOD Exit Constraint
+                                    if not is_daily and (idx.time() >= pd.to_datetime('15:15').time() or idx.date() > entry_idx.date()):
+                                        is_active = False
+                                        outcome = "Time Exit"
+                                        exit_price = row['Close'] if idx.date() == entry_idx.date() else row['Open']
+                                        break
+                                        
+                                if scan_state == "3" and is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
                                     setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bearish", cmp, entry_price, sweep_high, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
-                                entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
-                                forward_df = df.loc[entry_idx:]
-                                outcome, lowest_seen = "Still Open", entry_price
-                                for idx, row in forward_df.iterrows():
-                                    if row['Low'] < lowest_seen: lowest_seen = row['Low']
-                                    if row['High'] >= sweep_high:
-                                        outcome = "SL Hit"
-                                        break
-                                    elif row['Low'] <= post_sl_val:
-                                        outcome = "Target Hit"
-                                        break
                                 setup_data["Max Move (%)"] = f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%"
                                 setup_data["Outcome"] = outcome
+                                setup_data["Exit Price"] = exit_price
                                 setups.append(setup_data)
     return setups
 
@@ -283,45 +324,38 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         
         if timeframe == "15 Minute":
-            # Fetch reliable 1-Day Data purely to build HTF levels (immune to 60-day limit)
-            daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
             df = t.history(period="60d", interval="15m", auto_adjust=False)
-            
-            if df.empty or daily_htf.empty: return None
+            if df.empty: return None
             df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
-            daily_htf.index = daily_htf.index.tz_localize(None)
             
-            available_dates = pd.Series(df.index.date).drop_duplicates().apply(lambda x: pd.to_datetime(x))
+            daily_df = df.resample('D').agg({'High':'max', 'Low':'min'}).dropna()
             
             if scan_state != "4":
-                # Current Day states (1, 2, 3)
-                if start_date not in available_dates.values:
-                    start_date = available_dates.iloc[-1] # Fallback to latest available intraday session
+                if start_date not in daily_df.index: return None
+                past_days = daily_df.loc[daily_df.index < start_date]
+                if len(past_days) < 1: return None
                 
-                past_htf = daily_htf.loc[daily_htf.index < start_date]
-                if len(past_htf) < 1: return None
-                
-                pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
                 day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                 
-                res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
-                
+                res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
+                res = res_today or []
+
             else: 
-                # Backtest Engine (Iterating specific dates)
-                days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
-                res = []
+                days_in_range = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)].index
+                all_res = []
                 for d in days_in_range:
-                    past_htf = daily_htf.loc[daily_htf.index < d]
-                    if len(past_htf) < 1: continue
-                    
-                    pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                    past_days = daily_df.loc[daily_df.index < d]
+                    if len(past_days) < 1: continue
+                    pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
                     day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                     
                     r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, is_daily=False)
-                    if r_today: res.extend(r_today)
+                    
+                    if r_today: all_res.extend(r_today)
+                res = all_res
                 
         else: 
-            # Daily Timeframe
             df = t.history(period="2y", interval="1d", auto_adjust=False)
             if df.empty: return None
             df.index = df.index.tz_localize(None)
@@ -339,7 +373,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                 res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, is_daily=True)
             else:
                 months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
-                res = []
+                all_res = []
                 for m_start in months_in_range:
                     m_end = m_start + pd.offsets.MonthEnd(0)
                     hist_df = monthly_hist.loc[monthly_hist.index < m_start]
@@ -347,7 +381,8 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                     pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
                     
                     r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, is_daily=True)
-                    if r_month: res.extend(r_month)
+                    if r_month: all_res.extend(r_month)
+                res = all_res
 
         if res:
             for r in res: r['Stock name'] = ticker.replace('.NS', '')
@@ -425,7 +460,7 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                     if res: results.extend(res)
                     
             if not results:
-                st.warning("No stocks matched these criteria. (Try unchecking 'Reject if Opposite Liquidity Touched' or expanding the date range).")
+                st.warning("No stocks matched these criteria for the selected parameters.")
             else:
                 df_all = pd.DataFrame(results)
                 
@@ -442,6 +477,11 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                             return risk * reward_ratio
                         elif row['Outcome'] == 'SL Hit':
                             return -risk
+                        elif row['Outcome'] == 'Time Exit':
+                            if row['Direction'] == 'Bullish':
+                                return qty * (row['Exit Price'] - row['Entry Level'])
+                            else:
+                                return qty * (row['Entry Level'] - row['Exit Price'])
                         else: 
                             if row['Direction'] == 'Bullish':
                                 return qty * (row['CMP'] - row['Entry Level'])
@@ -461,8 +501,10 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                     else:
                         if state_code == "4":
                             total_pnl = df['Trade P&L (₹)'].sum()
-                            wins = len(df[df['Outcome'] == 'Target Hit'])
-                            losses = len(df[df['Outcome'] == 'SL Hit'])
+                            
+                            closed_trades = df[df['Outcome'] != 'Still Open']
+                            wins = len(closed_trades[closed_trades['Trade P&L (₹)'] > 0])
+                            losses = len(closed_trades[closed_trades['Trade P&L (₹)'] <= 0])
                             open_t = len(df[df['Outcome'] == 'Still Open'])
                             win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
                             
