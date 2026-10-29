@@ -5,6 +5,7 @@ import requests
 import io
 import concurrent.futures
 from datetime import datetime, timedelta
+import datetime as dt
 import pytz
 
 st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
@@ -108,6 +109,8 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
     if window_df.empty: return setups
     
     time_fmt = '%Y-%m-%d' if is_daily else '%Y-%m-%d %H:%M'
+    cutoff_time = dt.time(13, 0)
+    exit_time = dt.time(15, 15)
 
     # --- BULLISH LOGIC ---
     bull_sweeps = window_df[window_df['Low'] <= htf_low]
@@ -166,12 +169,12 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             
                             if not touch_mask.empty and touch_mask.any():
                                 entry_idx = tracking_df[touch_mask].index[0]
-                                if is_daily or entry_idx.time() < pd.to_datetime('13:00').time():
+                                if is_daily or (entry_idx.date() == sweep_idx.date() and entry_idx.time() <= cutoff_time):
                                     touched_entry = True
                             
                             if not touched_entry and scan_state == "2":
-                                # Remove from Awaiting Entry if past 1PM
-                                if is_daily or df.index[-1].time() < pd.to_datetime('13:00').time():
+                                # Reject if past 1 PM today
+                                if is_daily or df.index[-1].time() <= cutoff_time:
                                     setups.append(setup_data)
                                 
                             elif touched_entry and scan_state in ["3", "4"]:
@@ -196,7 +199,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                         
                                     # Hard 3:15 PM EOD Exit Constraint
-                                    if not is_daily and (idx.time() >= pd.to_datetime('15:15').time() or idx.date() > entry_idx.date()):
+                                    if not is_daily and (idx.time() >= exit_time or idx.date() > entry_idx.date()):
                                         is_active = False
                                         outcome = "Time Exit"
                                         exit_price = row['Close'] if idx.date() == entry_idx.date() else row['Open']
@@ -270,11 +273,11 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             
                             if not touch_mask.empty and touch_mask.any():
                                 entry_idx = tracking_df[touch_mask].index[0]
-                                if is_daily or entry_idx.time() < pd.to_datetime('13:00').time():
+                                if is_daily or (entry_idx.date() == sweep_idx.date() and entry_idx.time() <= cutoff_time):
                                     touched_entry = True
                             
                             if not touched_entry and scan_state == "2":
-                                if is_daily or df.index[-1].time() < pd.to_datetime('13:00').time():
+                                if is_daily or df.index[-1].time() <= cutoff_time:
                                     setups.append(setup_data)
                                 
                             elif touched_entry and scan_state in ["3", "4"]:
@@ -299,7 +302,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                         
                                     # Hard 3:15 PM EOD Exit Constraint
-                                    if not is_daily and (idx.time() >= pd.to_datetime('15:15').time() or idx.date() > entry_idx.date()):
+                                    if not is_daily and (idx.time() >= exit_time or idx.date() > entry_idx.date()):
                                         is_active = False
                                         outcome = "Time Exit"
                                         exit_price = row['Close'] if idx.date() == entry_idx.date() else row['Open']
@@ -328,10 +331,13 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
             if df.empty: return None
             df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
             
+            # PERFECT MATCH: Create daily data explicitly from the exact 15m dataset
             daily_df = df.resample('D').agg({'High':'max', 'Low':'min'}).dropna()
             
             if scan_state != "4":
-                if start_date not in daily_df.index: return None
+                if start_date not in daily_df.index: 
+                    start_date = daily_df.index[-1] # Fallback to most recent day if today has no data yet
+                
                 past_days = daily_df.loc[daily_df.index < start_date]
                 if len(past_days) < 1: return None
                 
@@ -347,11 +353,11 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                 for d in days_in_range:
                     past_days = daily_df.loc[daily_df.index < d]
                     if len(past_days) < 1: continue
+                    
                     pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
                     day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                     
                     r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, is_daily=False)
-                    
                     if r_today: all_res.extend(r_today)
                 res = all_res
                 
@@ -425,7 +431,10 @@ with st.sidebar:
             min_date = (today - pd.Timedelta(days=59)).date()
             max_date = today.date()
             
-            start_date_input = st.date_input("From Date", min_date, min_value=min_date, max_value=max_date)
+            # Default to scanning the last 7 days automatically for better UX
+            default_start = max(min_date, (today - pd.Timedelta(days=7)).date())
+            
+            start_date_input = st.date_input("From Date", default_start, min_value=min_date, max_value=max_date)
             end_date_input = st.date_input("To Date", max_date, min_value=min_date, max_value=max_date)
             
             start_date = pd.to_datetime(start_date_input)
@@ -460,7 +469,7 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                     if res: results.extend(res)
                     
             if not results:
-                st.warning("No stocks matched these criteria for the selected parameters.")
+                st.warning("No stocks matched these criteria. (Try unchecking 'Reject if Opposite Liquidity Touched' or expanding the date range).")
             else:
                 df_all = pd.DataFrame(results)
                 
