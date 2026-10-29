@@ -1,7 +1,6 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import numpy as np
 import requests
 import io
 import concurrent.futures
@@ -26,13 +25,13 @@ def get_nifty500_symbols():
     return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS']
 
 def get_recent_swing(df, current_idx, direction='high'):
-    """Finds the most recent 15m/1d untested swing point prior to the sweep."""
+    """Finds the most recent untested swing point strictly prior to the sweep."""
     try:
         loc = df.index.get_loc(current_idx)
         for i in range(loc - 1, 1, -1):
             if direction == 'high':
                 if df['High'].iloc[i] > df['High'].iloc[i-1] and df['High'].iloc[i] > df['High'].iloc[i+1]:
-                    # Ensure it is untested between formation and sweep
+                    # Ensure it remained untested between its formation and the sweep
                     if df['High'].iloc[i:loc].max() <= df['High'].iloc[i]:
                         return df.index[i], df['High'].iloc[i]
             else:
@@ -44,13 +43,13 @@ def get_recent_swing(df, current_idx, direction='high'):
         return None, None
 
 def get_post_mss_swing(df, mss_idx, direction='high'):
-    """Finds the first swing point formed AFTER the MSS breakout."""
+    """Finds the first swing point formed AFTER the MSS breakout is completed."""
     try:
         loc = df.index.get_loc(mss_idx)
         for i in range(loc, len(df)-1):
             if direction == 'high':
                 if df['High'].iloc[i] > df['High'].iloc[i-1] and df['High'].iloc[i] > df['High'].iloc[i+1]:
-                    return df.index[i], df['High'].iloc[i], df.index[i+1] # Returns confirmation candle idx too
+                    return df.index[i], df['High'].iloc[i], df.index[i+1] # Returns the right-shoulder confirmation candle
             else:
                 if df['Low'].iloc[i] < df['Low'].iloc[i-1] and df['Low'].iloc[i] < df['Low'].iloc[i+1]:
                     return df.index[i], df['Low'].iloc[i], df.index[i+1]
@@ -58,35 +57,37 @@ def get_post_mss_swing(df, mss_idx, direction='high'):
     except:
         return None, None, None
 
-def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, is_daily=False):
+def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end):
     setups = []
     df_index = df.index.tolist()
     cmp = df['Close'].iloc[-1]
     
+    # Restrict the sweep search to the exact evaluation window (Today or This Month)
+    window_df = df.loc[(df.index >= eval_start) & (df.index <= eval_end)]
+    if window_df.empty: return setups
+    
     # -----------------------
     # BULLISH LOGIC
     # -----------------------
-    bull_sweeps = df[df['Low'] <= htf_low]
+    bull_sweeps = window_df[window_df['Low'] <= htf_low]
     if not bull_sweeps.empty:
-        sweep_idx = bull_sweeps.index[0] # First sweep
-        sweep_pos = df_index.index(sweep_idx)
+        sweep_idx = bull_sweeps.index[0] 
+        sweep_pos = df_index.index(sweep_idx) # Count candles using the full dataframe index
         sweep_low = df.loc[sweep_idx, 'Low']
         
-        # Rule: Must not touch opposite liquidity (HTF High) AFTER sweep
-        post_sweep_df = df.iloc[sweep_pos:]
+        # Rule: Must not touch opposite liquidity (HTF High) AFTER sweep inside the evaluation window
+        post_sweep_df = window_df.loc[sweep_idx:]
         if post_sweep_df['High'].max() < htf_high:
             
-            # Find Untested Swing High Prior to Sweep
+            # Find Untested Swing High Prior to Sweep (Searches the full un-truncated history)
             sh_idx, sh_val = get_recent_swing(df, sweep_idx, 'high')
             if sh_idx:
-                # Find MSS with displacement limit
                 mss_cands = post_sweep_df[post_sweep_df['Close'] > sh_val]
                 if not mss_cands.empty:
                     mss_idx = mss_cands.index[0]
                     mss_pos = df_index.index(mss_idx)
                     
                     if (mss_pos - sweep_pos) <= mss_limit:
-                        # Post MSS Swing
                         post_sh_idx, post_sh_val, confirm_idx = get_post_mss_swing(df, mss_idx, 'high')
                         
                         setup_data = {
@@ -97,7 +98,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, is_daily=False)
                             "Broken Swing High": round(sh_val, 2),
                         }
                         
-                        # State 1: MSS Done (Swing high not yet formed)
+                        # State 1: MSS Done
                         if not post_sh_idx:
                             if scan_state == "1":
                                 setups.append({**setup_data, "Status": "MSS Done, Building Leg"})
@@ -109,7 +110,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, is_daily=False)
                                 "50% Entry Level": round(eq_50, 2),
                             })
                             
-                            # Check 50% Touch
                             confirm_pos = df_index.index(confirm_idx)
                             tracking_df = df.iloc[confirm_pos:]
                             touched_50 = not tracking_df[tracking_df['Low'] <= eq_50].empty
@@ -122,7 +122,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, is_daily=False)
                             elif touched_50 and scan_state == "3":
                                 setups.append({**setup_data, "Status": "Trade Open", "Live CMP": round(cmp, 2)})
                                 
-                            # State 4: Previous Reports (Backtest)
+                            # State 4: Previous Reports (Backtest Mode)
                             elif touched_50 and scan_state == "4":
                                 entry_idx = tracking_df[tracking_df['Low'] <= eq_50].index[0]
                                 forward_df = df.loc[entry_idx:]
@@ -146,13 +146,13 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, is_daily=False)
     # -----------------------
     # BEARISH LOGIC
     # -----------------------
-    bear_sweeps = df[df['High'] >= htf_high]
+    bear_sweeps = window_df[window_df['High'] >= htf_high]
     if not bear_sweeps.empty:
         sweep_idx = bear_sweeps.index[0] 
         sweep_pos = df_index.index(sweep_idx)
         sweep_high = df.loc[sweep_idx, 'High']
         
-        post_sweep_df = df.iloc[sweep_pos:]
+        post_sweep_df = window_df.loc[sweep_idx:]
         if post_sweep_df['Low'].min() > htf_low:
             
             sl_idx, sl_val = get_recent_swing(df, sweep_idx, 'low')
@@ -215,7 +215,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, is_daily=False)
 
     return setups
 
-
 def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str):
     try:
         t = yf.Ticker(ticker)
@@ -234,12 +233,10 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str):
             if hist_daily.empty: return None
             
             pdl, pdh = hist_daily['Low'].iloc[-1], hist_daily['High'].iloc[-1]
-            day_end = target_date + pd.Timedelta(days=1)
-            eval_window = df.loc[(df.index >= target_date) & (df.index < day_end)]
+            day_end = target_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
             
-            if eval_window.empty: return None
-            
-            res = evaluate_setup(eval_window, pdh, pdl, mss_limit, scan_state, is_daily=False)
+            # Passes full df for fractal searches, but isolates sweep window to exactly target_date
+            res = evaluate_setup(df, pdh, pdl, mss_limit, scan_state, target_date, day_end)
             
         else: # Daily Timeframe
             df = t.history(period="2y", interval="1d", auto_adjust=False)
@@ -256,10 +253,8 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str):
             pml, pmh = hist_monthly['Low'].iloc[-1], hist_monthly['High'].iloc[-1]
             target_month_start = target_date.replace(day=1)
             
-            eval_window = df.loc[(df.index >= target_month_start) & (df.index <= target_month_end)]
-            if eval_window.empty: return None
-            
-            res = evaluate_setup(eval_window, pmh, pml, mss_limit, scan_state, is_daily=True)
+            # Passes full df for cross-month fractal searches, but isolates sweep window to target month
+            res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end)
 
         if res:
             for r in res: r['Symbol'] = ticker.replace('.NS', '')
@@ -287,7 +282,7 @@ with st.sidebar:
     )
     state_code = scan_state.split(".")[0]
     
-    mss_limit = st.selectbox("Max Displacement Candles for MSS", list(range(1, 8)), index=6)
+    mss_limit = st.selectbox("Max Displacement Candles for MSS", list(range(1, 11)), index=6)
     
     st.divider()
     if state_code == "4":
