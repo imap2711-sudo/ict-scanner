@@ -4,10 +4,10 @@ import pandas as pd
 import requests
 import io
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title="Ultimate ICT Precision Scanner (Daily Engine)", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
 
 @st.cache_data(ttl=3600)
@@ -69,8 +69,10 @@ def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
                 if fvg_top <= eq_50:
                     fvg_tops.append(fvg_top)
                     
-        if fvg_tops: return max(fvg_tops), "Discount FVG"
-        else: return fib_618, "61.8% Fib"
+        if fvg_tops:
+            return max(fvg_tops), "Discount FVG"
+        else:
+            return fib_618, "61.8% Fib"
             
     else:
         eq_50 = anchor - range_size * 0.5
@@ -83,10 +85,12 @@ def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
                 if fvg_bot >= eq_50:
                     fvg_bottoms.append(fvg_bot)
                     
-        if fvg_bottoms: return min(fvg_bottoms), "Premium FVG"
-        else: return fib_618, "61.8% Fib"
+        if fvg_bottoms:
+            return min(fvg_bottoms), "Premium FVG"
+        else:
+            return fib_618, "61.8% Fib"
 
-def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, target_pref, monthly_sh_val, monthly_sl_val):
+def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, is_daily=False):
     setups = []
     df_index = df.index.tolist()
     cmp = df['Close'].iloc[-1]
@@ -94,7 +98,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
     window_df = df.loc[(df.index >= eval_start) & (df.index <= eval_end)]
     if window_df.empty: return setups
     
-    time_fmt = '%Y-%m-%d'
+    time_fmt = '%Y-%m-%d' if is_daily else '%Y-%m-%d %H:%M'
 
     # --- BULLISH LOGIC ---
     bull_sweeps = window_df[window_df['Low'] <= htf_low]
@@ -102,6 +106,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
         sweep_idx = bull_sweeps.index[0] 
         sweep_pos = df_index.index(sweep_idx) 
         sweep_low = df.loc[sweep_idx, 'Low']
+        
         post_sweep_df = window_df.loc[sweep_idx:]
         
         if not strict_opposite or post_sweep_df['High'].max() < htf_high:
@@ -131,23 +136,14 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            # Target Resolution
-                            target_price = post_sh_val
-                            target_label = "Daily Anchor"
-                            if target_pref == "Monthly Untested Swing" and monthly_sh_val:
-                                if monthly_sh_val > post_sh_val:
-                                    target_price = monthly_sh_val
-                                    target_label = "Monthly Swing"
-
                             entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sh_idx, 'Bullish', sweep_low, post_sh_val)
                             gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
                             
                             setup_data.update({
-                                "Target Type": target_label,
                                 "Entry Type": entry_type,
                                 "Entry Level": round(entry_price, 2),
                                 "Stop Loss": round(sweep_low, 2),
-                                "Target": round(target_price, 2),
+                                "Target": round(post_sh_val, 2),
                                 "Entry Distance": f"{gap_pct}%"
                             })
                             
@@ -163,7 +159,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 forward_df = df.loc[entry_idx:]
                                 is_active = True
                                 for idx, row in forward_df.iterrows():
-                                    if row['Low'] <= sweep_low or row['High'] >= target_price:
+                                    if row['Low'] <= sweep_low or row['High'] >= post_sh_val:
                                         is_active = False
                                         break
                                 if is_active:
@@ -179,7 +175,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     if row['Low'] <= sweep_low:
                                         outcome = "SL Hit"
                                         break
-                                    elif row['High'] >= target_price:
+                                    elif row['High'] >= post_sh_val:
                                         outcome = "Target Hit"
                                         break
                                 setup_data["Max Move (%)"] = f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%"
@@ -192,6 +188,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
         sweep_idx = bear_sweeps.index[0] 
         sweep_pos = df_index.index(sweep_idx)
         sweep_high = df.loc[sweep_idx, 'High']
+        
         post_sweep_df = window_df.loc[sweep_idx:]
         
         if not strict_opposite or post_sweep_df['Low'].min() > htf_low:
@@ -221,23 +218,14 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            # Target Resolution
-                            target_price = post_sl_val
-                            target_label = "Daily Anchor"
-                            if target_pref == "Monthly Untested Swing" and monthly_sl_val:
-                                if monthly_sl_val < post_sl_val:
-                                    target_price = monthly_sl_val
-                                    target_label = "Monthly Swing"
-
                             entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sl_idx, 'Bearish', sweep_high, post_sl_val)
                             gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
                             
                             setup_data.update({
-                                "Target Type": target_label,
                                 "Entry Type": entry_type,
                                 "Entry Level": round(entry_price, 2),
                                 "Stop Loss": round(sweep_high, 2),
-                                "Target": round(target_price, 2),
+                                "Target": round(post_sl_val, 2),
                                 "Entry Distance": f"{gap_pct}%"
                             })
                             
@@ -253,7 +241,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 forward_df = df.loc[entry_idx:]
                                 is_active = True
                                 for idx, row in forward_df.iterrows():
-                                    if row['High'] >= sweep_high or row['Low'] <= target_price:
+                                    if row['High'] >= sweep_high or row['Low'] <= post_sl_val:
                                         is_active = False
                                         break
                                 if is_active:
@@ -269,7 +257,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     if row['High'] >= sweep_high:
                                         outcome = "SL Hit"
                                         break
-                                    elif row['Low'] <= target_price:
+                                    elif row['Low'] <= post_sl_val:
                                         outcome = "Target Hit"
                                         break
                                 setup_data["Max Move (%)"] = f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%"
@@ -277,50 +265,85 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, target_pref):
+def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite):
     try:
         t = yf.Ticker(ticker)
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         
-        # Deep 5 Year Pull for Pristine Monthly Fractals
-        df = t.history(period="5y", interval="1d", auto_adjust=False)
-        if df.empty: return None
-        df.index = df.index.tz_localize(None)
-        
-        monthly_hist = df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
-        if monthly_hist.empty: return None
-        
-        if scan_state != "4":
-            target_month_start = start_date.replace(day=1)
-            target_month_end = target_month_start + pd.offsets.MonthEnd(0)
+        if timeframe == "15 Minute":
+            df = t.history(period="60d", interval="15m", auto_adjust=False)
+            if df.empty: return None
+            df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
             
-            hist_df = monthly_hist.loc[monthly_hist.index < target_month_start]
-            if len(hist_df) < 2: return None
-            pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
-            m_idx = hist_df.index[-1]
+            daily_df = df.resample('D').agg({'High':'max', 'Low':'min'}).dropna()
             
-            monthly_sh_idx, monthly_sh_val = get_recent_swing(monthly_hist, m_idx, 'high')
-            monthly_sl_idx, monthly_sl_val = get_recent_swing(monthly_hist, m_idx, 'low')
-            
-            res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, target_pref, monthly_sh_val, monthly_sl_val)
-        else:
-            months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
-            all_res = []
-            for m_start in months_in_range:
-                m_end = m_start + pd.offsets.MonthEnd(0)
-                hist_df = monthly_hist.loc[monthly_hist.index < m_start]
-                if len(hist_df) < 2: continue
+            if scan_state != "4":
+                if start_date not in daily_df.index: return None
+                past_days = daily_df.loc[daily_df.index < start_date]
+                if len(past_days) < 2: return None
                 
+                t_minus_1 = past_days.index[-1]
+                pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
+                pdl_yest, pdh_yest = past_days['Low'].iloc[-2], past_days['High'].iloc[-2]
+                
+                day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                
+                res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
+                eval_start_yest = t_minus_1 + pd.Timedelta(hours=12)
+                res_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, eval_start_yest, day_end, strict_opposite, is_daily=False)
+                
+                valid_res_yest = [r for r in (res_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < start_date]
+                res = (res_today or []) + valid_res_yest
+
+            else: 
+                days_in_range = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)].index
+                all_res = []
+                for d in days_in_range:
+                    past_days = daily_df.loc[daily_df.index < d]
+                    if len(past_days) < 2: continue
+                    t_minus_1 = past_days.index[-1]
+                    pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
+                    pdl_yest, pdh_yest = past_days['Low'].iloc[-2], past_days['High'].iloc[-2]
+                    day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                    
+                    r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, is_daily=False)
+                    e_start_yest = t_minus_1 + pd.Timedelta(hours=12)
+                    r_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, e_start_yest, day_end, strict_opposite, is_daily=False)
+                    
+                    v_res_yest = [r for r in (r_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < d]
+                    if r_today: all_res.extend(r_today)
+                    all_res.extend(v_res_yest)
+                res = all_res
+                
+        else: 
+            df = t.history(period="2y", interval="1d", auto_adjust=False)
+            if df.empty: return None
+            df.index = df.index.tz_localize(None)
+            
+            monthly_hist = df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
+            
+            if scan_state != "4":
+                target_month_start = start_date.replace(day=1)
+                target_month_end = target_month_start + pd.offsets.MonthEnd(0)
+                
+                hist_df = monthly_hist.loc[monthly_hist.index < target_month_start]
+                if hist_df.empty: return None
                 pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
-                m_idx = hist_df.index[-1]
                 
-                monthly_sh_idx, monthly_sh_val = get_recent_swing(monthly_hist, m_idx, 'high')
-                monthly_sl_idx, monthly_sl_val = get_recent_swing(monthly_hist, m_idx, 'low')
-                
-                r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, target_pref, monthly_sh_val, monthly_sl_val)
-                if r_month: all_res.extend(r_month)
-            res = all_res
+                res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, is_daily=True)
+            else:
+                months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
+                all_res = []
+                for m_start in months_in_range:
+                    m_end = m_start + pd.offsets.MonthEnd(0)
+                    hist_df = monthly_hist.loc[monthly_hist.index < m_start]
+                    if hist_df.empty: continue
+                    pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
+                    
+                    r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, is_daily=True)
+                    if r_month: all_res.extend(r_month)
+                res = all_res
 
         if res:
             for r in res: r['Stock name'] = ticker.replace('.NS', '')
@@ -330,10 +353,11 @@ def scan_ticker(ticker, mss_limit, scan_state, start_date_str, end_date_str, str
         return None
 
 # --- STREAMLIT UI ---
-st.title("🎯 Ultimate ICT Precision Scanner (Daily Only)")
+st.title("🎯 Ultimate ICT Precision Scanner")
 
 with st.sidebar:
     st.header("⚙️ Scanner Configurations")
+    timeframe = st.selectbox("Execution Timeframe", ["15 Minute", "Daily"])
     
     scan_state = st.selectbox(
         "Select Market State", 
@@ -341,24 +365,24 @@ with st.sidebar:
             "1. MSS done (Swing high not yet formed)", 
             "2. Awaiting entry (Price has not yet touched FVG/61%)", 
             "3. Trade open (Price has touched Entry, SL/Target not hit)", 
-            "4. Previous reports (Monthly Backtest Mode)"
+            "4. Previous reports (Date Range Backtest Mode)"
         ]
     )
     state_code = scan_state.split(".")[0]
     
-    target_pref = st.selectbox(
-        "Target Level Selection", 
-        ["Daily Anchor Swing (Momentum Peak)", "Monthly Untested Swing"]
-    )
+    mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
+    mss_limit = st.selectbox("Max Displacement Candles for MSS", mss_options, index=6)
     
-    mss_limit = st.selectbox("Max Displacement Candles for MSS", list(range(1, 16)), index=6)
     strict_opposite = st.checkbox("Reject if Opposite Liquidity Touched", value=False)
     
     st.divider()
     if state_code == "4":
         st.subheader("Backtest Date Range")
+        if timeframe == "15 Minute":
+            st.caption("Note: 15-minute historical data is limited to the last 60 days.")
+            
         today = pd.Timestamp.today()
-        month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in range(36)]
+        month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in (range(2) if timeframe == "15 Minute" else range(24))]
         
         from_month_str = st.selectbox("From Month", reversed(month_opts), format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
         to_month_str = st.selectbox("To Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
@@ -375,12 +399,12 @@ if st.button("🚀 Execute Master Scan", type="primary"):
     if state_code == "4" and start_date > end_date:
         st.error("Error: 'From Month' must be earlier than or equal to 'To Month'.")
     else:
-        with st.spinner(f"Scanning Nifty 500 | Daily Timeframe | State: {state_code}..."):
+        with st.spinner(f"Scanning Nifty 500 | {timeframe} | State: {state_code}..."):
             tickers = get_nifty500_symbols()
             results = []
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                futures = [executor.submit(scan_ticker, tick, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, target_pref) for tick in tickers]
+                futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite) for tick in tickers]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res: results.extend(res)
@@ -404,8 +428,10 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                         elif row['Outcome'] == 'SL Hit':
                             return -risk
                         else: 
-                            if row['Direction'] == 'Bullish': return qty * (row['CMP'] - row['Entry Level'])
-                            else: return qty * (row['Entry Level'] - row['CMP'])
+                            if row['Direction'] == 'Bullish':
+                                return qty * (row['CMP'] - row['Entry Level'])
+                            else:
+                                return qty * (row['Entry Level'] - row['CMP'])
                                 
                     df_all['Trade P&L (₹)'] = df_all.apply(calculate_pnl, axis=1).round(2)
                 
@@ -435,5 +461,8 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                             
                         st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
 
-                with tab1: render_tab_content(df_bull, "Bullish")
-                with tab2: render_tab_content(df_bear, "Bearish")
+                with tab1:
+                    render_tab_content(df_bull, "Bullish")
+                    
+                with tab2:
+                    render_tab_content(df_bear, "Bearish")
