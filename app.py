@@ -6,6 +6,7 @@ import io
 import concurrent.futures
 from datetime import datetime, timedelta
 import pytz
+import numpy as np
 
 st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
@@ -167,7 +168,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            # Dynamic SL & Target Evaluation
                             if entry_method == "Breaker Block (Shallow Pullback)":
                                 entry_price = sh_val
                                 entry_type = "Breaker Block"
@@ -179,7 +179,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 
                             risk_dist = abs(entry_price - active_sl)
                             
-                            # Target Strategy Toggle
                             if target_method == "Fixed 1:2 Risk-to-Reward":
                                 active_target = entry_price + (2 * risk_dist)
                             else:
@@ -267,7 +266,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            # Dynamic SL & Target Evaluation
                             if entry_method == "Breaker Block (Shallow Pullback)":
                                 entry_price = sl_val
                                 entry_type = "Breaker Block"
@@ -279,7 +277,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 
                             risk_dist = abs(entry_price - active_sl)
                             
-                            # Target Strategy Toggle
                             if target_method == "Fixed 1:2 Risk-to-Reward":
                                 active_target = entry_price - (2 * risk_dist)
                             else:
@@ -338,7 +335,61 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         
-        if timeframe == "15 Minute":
+        if timeframe in ["75 Minute", "125 Minute"]:
+            daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
+            df_5m = t.history(period="60d", interval="5m", auto_adjust=False)
+            
+            if df_5m.empty or daily_htf.empty: return None
+            
+            # Resample 5m to 75m or 125m exactly matching NSE hours (375 mins/day)
+            chunk_size = 15 if timeframe == "75 Minute" else 25
+            resampled = []
+            for date, group in df_5m.groupby(df_5m.index.date):
+                for i in range(0, len(group), chunk_size):
+                    chunk = group.iloc[i:i+chunk_size]
+                    if len(chunk) > 0:
+                        resampled.append({
+                            'Datetime': chunk.index[-1],
+                            'Open': chunk['Open'].iloc[0],
+                            'High': chunk['High'].max(),
+                            'Low': chunk['Low'].min(),
+                            'Close': chunk['Close'].iloc[-1],
+                        })
+                        
+            df = pd.DataFrame(resampled).set_index('Datetime')
+            df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
+            daily_htf.index = daily_htf.index.tz_localize(None)
+            
+            # Create Weekly HTF for Previous Week High/Low sweeps
+            weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
+            
+            if scan_state != "4":
+                current_monday = start_date - pd.Timedelta(days=start_date.weekday())
+                past_htf = weekly_hist.loc[weekly_hist.index < current_monday]
+                if len(past_htf) < 1: return None
+                
+                pwl, pwh = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                week_end = current_monday + pd.Timedelta(days=6, hours=23, minutes=59)
+                
+                res = evaluate_setup(df, pwh, pwl, mss_limit, scan_state, current_monday, week_end, strict_opposite, entry_method, target_method, is_daily=False)
+                
+            else:
+                start_monday = start_date - pd.Timedelta(days=start_date.weekday())
+                weeks = pd.date_range(start=start_monday, end=end_date, freq='W-MON')
+                if start_monday not in weeks:
+                    weeks = weeks.insert(0, start_monday)
+                    
+                res = []
+                for w_start in weeks:
+                    past_htf = weekly_hist.loc[weekly_hist.index < w_start]
+                    if past_htf.empty: continue
+                    pwl, pwh = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                    w_end = w_start + pd.Timedelta(days=6, hours=23, minutes=59)
+                    
+                    r_week = evaluate_setup(df, pwh, pwl, mss_limit, scan_state, w_start, w_end, strict_opposite, entry_method, target_method, is_daily=False)
+                    if r_week: res.extend(r_week)
+                    
+        elif timeframe == "15 Minute":
             daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
             df = t.history(period="60d", interval="15m", auto_adjust=False)
             
@@ -412,7 +463,7 @@ st.title("🎯 Ultimate ICT Precision Scanner")
 
 with st.sidebar:
     st.header("⚙️ Scanner Configurations")
-    timeframe = st.selectbox("Execution Timeframe", ["15 Minute", "Daily"])
+    timeframe = st.selectbox("Execution Timeframe", ["15 Minute", "75 Minute", "125 Minute", "Daily"])
     
     scan_state = st.selectbox(
         "Select Market State", 
@@ -447,8 +498,8 @@ with st.sidebar:
         st.subheader("Backtest Date Range")
         today = pd.to_datetime(datetime.now(ist).date())
         
-        if timeframe == "15 Minute":
-            st.caption("Note: 15-minute historical data is restricted to the last 60 trading days.")
+        if timeframe in ["15 Minute", "75 Minute", "125 Minute"]:
+            st.caption(f"Note: {timeframe} historical data is restricted to the last 60 trading days.")
             valid_dates = get_valid_trading_dates()
             valid_dates_rev = list(reversed(valid_dates))
             
