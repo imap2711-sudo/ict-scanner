@@ -102,7 +102,13 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                         else:
                             eq_50 = (sweep_low + post_sh_val) / 2
                             gap_pct = round(((cmp - eq_50)/cmp)*100, 2)
-                            setup_data["50% distance"] = f"{gap_pct}%"
+                            
+                            setup_data.update({
+                                "50% Level": round(eq_50, 2),
+                                "Stop Loss": round(sweep_low, 2),
+                                "Target": round(post_sh_val, 2),
+                                "50% distance": f"{gap_pct}%"
+                            })
                             
                             confirm_pos = df_index.index(confirm_idx)
                             tracking_df = df.iloc[confirm_pos:]
@@ -117,7 +123,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 is_active = True
                                 for idx, row in forward_df.iterrows():
                                     if row['Low'] <= sweep_low or row['High'] >= post_sh_val:
-                                        is_active = False # Hit SL or Target
+                                        is_active = False
                                         break
                                 if is_active:
                                     setup_data["50% distance"] = "Touched (Active)"
@@ -177,7 +183,13 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                         else:
                             eq_50 = (sweep_high + post_sl_val) / 2
                             gap_pct = round(((eq_50 - cmp)/cmp)*100, 2)
-                            setup_data["50% distance"] = f"{gap_pct}%"
+                            
+                            setup_data.update({
+                                "50% Level": round(eq_50, 2),
+                                "Stop Loss": round(sweep_high, 2),
+                                "Target": round(post_sl_val, 2),
+                                "50% distance": f"{gap_pct}%"
+                            })
                             
                             confirm_pos = df_index.index(confirm_idx)
                             tracking_df = df.iloc[confirm_pos:]
@@ -192,7 +204,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 is_active = True
                                 for idx, row in forward_df.iterrows():
                                     if row['High'] >= sweep_high or row['Low'] <= post_sl_val:
-                                        is_active = False # Hit SL or Target
+                                        is_active = False
                                         break
                                 if is_active:
                                     setup_data["50% distance"] = "Touched (Active)"
@@ -227,7 +239,6 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str, stric
             
             daily_df = df.resample('D').agg({'High':'max', 'Low':'min'}).dropna()
             
-            # Normal Scanning (States 1, 2, 3)
             if scan_state != "4":
                 if target_date not in daily_df.index: return None
                 past_days = daily_df.loc[daily_df.index < target_date]
@@ -246,8 +257,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str, stric
                 valid_res_yest = [r for r in (res_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < target_date]
                 res = (res_today or []) + valid_res_yest
 
-            # Backtest Scanning (State 4) - Loops through the selected month
-            else:
+            else: # Backtest Loop
                 month_start = target_date.replace(day=1)
                 month_end = month_start + pd.offsets.MonthEnd(0)
                 days_in_month = daily_df.loc[(daily_df.index >= month_start) & (daily_df.index <= month_end)].index
@@ -315,7 +325,7 @@ with st.sidebar:
     mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
     mss_limit = st.selectbox("Max Displacement Candles for MSS", mss_options, index=6)
     
-    strict_opposite = st.checkbox("Reject if Opposite Liquidity Touched", value=False, help="Uncheck this to allow 'Outside Days/Months' (e.g., sweeps PDL/PML then rallies through PDH/PMH). Leave checked for strict rejection.")
+    strict_opposite = st.checkbox("Reject if Opposite Liquidity Touched", value=False)
     
     st.divider()
     if state_code == "4":
@@ -324,6 +334,8 @@ with st.sidebar:
         month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in (range(2) if timeframe == "15 Minute" else range(24))]
         sel_month_str = st.selectbox("Select Backtest Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
         target_date = pd.to_datetime(sel_month_str)
+        
+        risk_per_trade = st.number_input("Risk per Trade (₹)", min_value=100, value=1000, step=100)
     else:
         target_date = datetime.today()
 
@@ -342,6 +354,41 @@ if st.button("🚀 Execute Master Scan", type="primary"):
             st.warning("No stocks matched these criteria for the selected state.")
         else:
             df_all = pd.DataFrame(results)
+            
+            # --- PROFIT & LOSS CALCULATOR (State 4 Only) ---
+            if state_code == "4":
+                def calculate_pnl(row):
+                    risk = risk_per_trade
+                    risk_dist = abs(row['50% Level'] - row['Stop Loss'])
+                    if risk_dist == 0: return 0
+                    qty = risk / risk_dist
+                    
+                    if row['Outcome'] == 'Target Hit':
+                        return risk 
+                    elif row['Outcome'] == 'SL Hit':
+                        return -risk
+                    else: 
+                        if row['Direction'] == 'Bullish':
+                            return qty * (row['CMP'] - row['50% Level'])
+                        else:
+                            return qty * (row['50% Level'] - row['CMP'])
+                            
+                df_all['Trade P&L (₹)'] = df_all.apply(calculate_pnl, axis=1).round(2)
+                
+                total_pnl = df_all['Trade P&L (₹)'].sum()
+                wins = len(df_all[df_all['Outcome'] == 'Target Hit'])
+                losses = len(df_all[df_all['Outcome'] == 'SL Hit'])
+                open_t = len(df_all[df_all['Outcome'] == 'Still Open'])
+                win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+                
+                st.subheader(f"📊 Backtest Results ({timeframe} | Risk: ₹{risk_per_trade}/trade)")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Total Monthly P&L", f"₹ {total_pnl:,.2f}")
+                c2.metric("Win Rate (Closed Trades)", f"{win_rate:.1f}%")
+                c3.metric("Closed Trades", f"{wins}W / {losses}L")
+                c4.metric("Open Floating Trades", open_t)
+                st.divider()
+
             df_bull = df_all[df_all['Direction'] == 'Bullish']
             df_bear = df_all[df_all['Direction'] == 'Bearish']
             
