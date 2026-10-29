@@ -378,26 +378,38 @@ with st.sidebar:
     st.divider()
     if state_code == "4":
         st.subheader("Backtest Date Range")
+        today = pd.to_datetime(datetime.now(ist).date())
+        
         if timeframe == "15 Minute":
-            st.caption("Note: 15-minute historical data is limited to the last 60 days.")
+            st.caption("Note: 15-minute historical data is restricted to the last 60 days by the data provider.")
             
-        today = pd.Timestamp.today()
-        month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in (range(2) if timeframe == "15 Minute" else range(24))]
-        
-        from_month_str = st.selectbox("From Month", reversed(month_opts), format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
-        to_month_str = st.selectbox("To Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
-        
-        start_date = pd.to_datetime(from_month_str)
-        end_date = pd.to_datetime(to_month_str) + pd.offsets.MonthEnd(0)
+            # 60 day boundary constraints for the date picker
+            min_date = (today - pd.Timedelta(days=59)).date()
+            max_date = today.date()
+            
+            start_date_input = st.date_input("From Date", min_date, min_value=min_date, max_value=max_date)
+            end_date_input = st.date_input("To Date", max_date, min_value=min_date, max_value=max_date)
+            
+            start_date = pd.to_datetime(start_date_input)
+            end_date = pd.to_datetime(end_date_input)
+            
+        else:
+            month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in range(24)]
+            
+            from_month_str = st.selectbox("From Month", reversed(month_opts), format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
+            to_month_str = st.selectbox("To Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
+            
+            start_date = pd.to_datetime(from_month_str)
+            end_date = pd.to_datetime(to_month_str) + pd.offsets.MonthEnd(0)
         
         risk_per_trade = st.number_input("Risk per Trade (₹)", min_value=100, value=1000, step=100)
     else:
-        start_date = datetime.today()
+        start_date = pd.to_datetime(datetime.now(ist).date())
         end_date = start_date
 
 if st.button("🚀 Execute Master Scan", type="primary"):
     if state_code == "4" and start_date > end_date:
-        st.error("Error: 'From Month' must be earlier than or equal to 'To Month'.")
+        st.error("Error: 'From Date/Month' must be earlier than or equal to 'To Date/Month'.")
     else:
         with st.spinner(f"Scanning Nifty 500 | {timeframe} | State: {state_code}..."):
             tickers = get_nifty500_symbols()
