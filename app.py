@@ -54,7 +54,7 @@ def get_post_mss_swing(df, mss_idx, direction='high'):
     except:
         return None, None, None
 
-def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, is_daily=False):
+def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, is_daily=False):
     setups = []
     df_index = df.index.tolist()
     cmp = df['Close'].iloc[-1]
@@ -72,7 +72,9 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
         sweep_low = df.loc[sweep_idx, 'Low']
         
         post_sweep_df = window_df.loc[sweep_idx:]
-        if post_sweep_df['High'].max() < htf_high:
+        
+        # Check Opposite Liquidity Touch Rule
+        if not strict_opposite or post_sweep_df['High'].max() < htf_high:
             sh_idx, sh_val = get_recent_swing(df, sweep_idx, 'high')
             if sh_idx:
                 mss_cands = post_sweep_df[post_sweep_df['Close'] > sh_val]
@@ -136,7 +138,9 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
         sweep_high = df.loc[sweep_idx, 'High']
         
         post_sweep_df = window_df.loc[sweep_idx:]
-        if post_sweep_df['Low'].min() > htf_low:
+        
+        # Check Opposite Liquidity Touch Rule
+        if not strict_opposite or post_sweep_df['Low'].min() > htf_low:
             sl_idx, sl_val = get_recent_swing(df, sweep_idx, 'low')
             if sl_idx:
                 mss_cands = post_sweep_df[post_sweep_df['Close'] < sl_val]
@@ -193,7 +197,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str):
+def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str, strict_opposite):
     try:
         t = yf.Ticker(ticker)
         
@@ -216,10 +220,10 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str):
             
             day_end = target_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
             
-            res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, target_date, day_end, is_daily=False)
+            res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, target_date, day_end, strict_opposite, is_daily=False)
             
             eval_start_yest = t_minus_1 + pd.Timedelta(hours=12)
-            res_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, eval_start_yest, day_end, is_daily=False)
+            res_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, eval_start_yest, day_end, strict_opposite, is_daily=False)
             
             valid_res_yest = []
             if res_yest:
@@ -234,17 +238,20 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str):
             if df.empty: return None
             df.index = df.index.tz_localize(None)
             
-            monthly_df = df.resample('M').agg({'High':'max', 'Low':'min'}).dropna()
-            target_date = pd.to_datetime(target_date_str)
-            target_month_end = target_date + pd.offsets.MonthEnd(0)
-            
-            hist_monthly = monthly_df.loc[monthly_df.index < target_month_end]
-            if hist_monthly.empty: return None
-            
-            pml, pmh = hist_monthly['Low'].iloc[-1], hist_monthly['High'].iloc[-1]
+            target_date = pd.to_datetime(target_date_str).replace(hour=0, minute=0, second=0)
             target_month_start = target_date.replace(day=1)
             
-            res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, is_daily=True)
+            # Robust Pandas PMH/PML Extraction (No MonthEnd bugs)
+            hist_df = df.loc[df.index < target_month_start]
+            if hist_df.empty: return None
+            
+            monthly_hist = hist_df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
+            if monthly_hist.empty: return None
+            
+            pml, pmh = monthly_hist['Low'].iloc[-1], monthly_hist['High'].iloc[-1]
+            target_month_end = target_date + pd.offsets.MonthEnd(0)
+            
+            res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, is_daily=True)
 
         if res:
             for r in res: r['Stock name'] = ticker.replace('.NS', '')
@@ -274,6 +281,8 @@ with st.sidebar:
     mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
     mss_limit = st.selectbox("Max Displacement Candles for MSS", mss_options, index=6)
     
+    strict_opposite = st.checkbox("Reject if Opposite Liquidity Touched", value=False, help="Uncheck this to allow 'Outside Days/Months' (e.g., sweeps PDL/PML then rallies through PDH/PMH). Leave checked for strict rejection.")
+    
     st.divider()
     if state_code == "4":
         st.subheader("Backtest Settings")
@@ -287,7 +296,7 @@ if st.button("🚀 Execute Master Scan", type="primary"):
         results = []
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-            futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, target_date.strftime('%Y-%m-%d')) for tick in tickers]
+            futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, target_date.strftime('%Y-%m-%d'), strict_opposite) for tick in tickers]
             for f in concurrent.futures.as_completed(futures):
                 res = f.result()
                 if res: results.extend(res)
