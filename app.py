@@ -355,7 +355,7 @@ if st.button("🚀 Execute Master Scan", type="primary"):
         else:
             df_all = pd.DataFrame(results)
             
-            # --- PROFIT & LOSS CALCULATOR (State 4 Only) ---
+            # P&L Base Calculation (if in State 4)
             if state_code == "4":
                 def calculate_pnl(row):
                     risk = risk_per_trade
@@ -374,30 +374,35 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                             return qty * (row['50% Level'] - row['CMP'])
                             
                 df_all['Trade P&L (₹)'] = df_all.apply(calculate_pnl, axis=1).round(2)
-                
-                total_pnl = df_all['Trade P&L (₹)'].sum()
-                wins = len(df_all[df_all['Outcome'] == 'Target Hit'])
-                losses = len(df_all[df_all['Outcome'] == 'SL Hit'])
-                open_t = len(df_all[df_all['Outcome'] == 'Still Open'])
-                win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-                
-                st.subheader(f"📊 Backtest Results ({timeframe} | Risk: ₹{risk_per_trade}/trade)")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Monthly P&L", f"₹ {total_pnl:,.2f}")
-                c2.metric("Win Rate (Closed Trades)", f"{win_rate:.1f}%")
-                c3.metric("Closed Trades", f"{wins}W / {losses}L")
-                c4.metric("Open Floating Trades", open_t)
-                st.divider()
-
+            
             df_bull = df_all[df_all['Direction'] == 'Bullish']
             df_bear = df_all[df_all['Direction'] == 'Bearish']
             
             tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
             
+            def render_tab_content(df, title):
+                if df.empty:
+                    st.info(f"No {title} Setups.")
+                else:
+                    if state_code == "4":
+                        total_pnl = df['Trade P&L (₹)'].sum()
+                        wins = len(df[df['Outcome'] == 'Target Hit'])
+                        losses = len(df[df['Outcome'] == 'SL Hit'])
+                        open_t = len(df[df['Outcome'] == 'Still Open'])
+                        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+                        
+                        st.subheader(f"📊 {title} Backtest Results (Risk: ₹{risk_per_trade}/trade)")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Total Monthly P&L", f"₹ {total_pnl:,.2f}")
+                        c2.metric("Win Rate (Closed)", f"{win_rate:.1f}%")
+                        c3.metric("Closed Trades", f"{wins}W / {losses}L")
+                        c4.metric("Open Floating Trades", open_t)
+                        st.divider()
+                        
+                    st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
+
             with tab1:
-                if df_bull.empty: st.info("No Bullish Setups.")
-                else: st.dataframe(df_bull.drop(columns=['Direction']), use_container_width=True, hide_index=True)
+                render_tab_content(df_bull, "Bullish")
                 
             with tab2:
-                if df_bear.empty: st.info("No Bearish Setups.")
-                else: st.dataframe(df_bear.drop(columns=['Direction']), use_container_width=True, hide_index=True)
+                render_tab_content(df_bear, "Bearish")
