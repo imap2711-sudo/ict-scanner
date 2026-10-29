@@ -54,6 +54,42 @@ def get_post_mss_swing(df, mss_idx, direction='high'):
     except:
         return None, None, None
 
+def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
+    leg_df = df.loc[sweep_idx:peak_idx]
+    range_size = abs(peak - anchor)
+    
+    if direction == 'Bullish':
+        eq_50 = anchor + range_size * 0.5
+        fib_618 = peak - range_size * 0.618
+        
+        fvg_tops = []
+        for i in range(len(leg_df)-2):
+            if leg_df['Low'].iloc[i+2] > leg_df['High'].iloc[i]:
+                fvg_top = leg_df['Low'].iloc[i+2]
+                if fvg_top <= eq_50:
+                    fvg_tops.append(fvg_top)
+                    
+        if fvg_tops:
+            return max(fvg_tops), "Discount FVG"
+        else:
+            return fib_618, "61.8% Fib"
+            
+    else:
+        eq_50 = anchor - range_size * 0.5
+        fib_618 = peak + range_size * 0.618
+        
+        fvg_bottoms = []
+        for i in range(len(leg_df)-2):
+            if leg_df['High'].iloc[i+2] < leg_df['Low'].iloc[i]:
+                fvg_bot = leg_df['High'].iloc[i+2]
+                if fvg_bot >= eq_50:
+                    fvg_bottoms.append(fvg_bot)
+                    
+        if fvg_bottoms:
+            return min(fvg_bottoms), "Premium FVG"
+        else:
+            return fib_618, "61.8% Fib"
+
 def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, is_daily=False):
     setups = []
     df_index = df.index.tolist()
@@ -93,32 +129,33 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             "MSS time": mss_idx.strftime(time_fmt),
                             "MSS candles": mss_count,
                             "MSS price": round(sh_val, 2),
-                            "50% distance": "N/A"
+                            "Entry Distance": "N/A"
                         }
                         
                         if not post_sh_idx:
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            eq_50 = (sweep_low + post_sh_val) / 2
-                            gap_pct = round(((cmp - eq_50)/cmp)*100, 2)
+                            entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sh_idx, 'Bullish', sweep_low, post_sh_val)
+                            gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
                             
                             setup_data.update({
-                                "50% Level": round(eq_50, 2),
+                                "Entry Type": entry_type,
+                                "Entry Level": round(entry_price, 2),
                                 "Stop Loss": round(sweep_low, 2),
                                 "Target": round(post_sh_val, 2),
-                                "50% distance": f"{gap_pct}%"
+                                "Entry Distance": f"{gap_pct}%"
                             })
                             
                             confirm_pos = df_index.index(confirm_idx)
                             tracking_df = df.iloc[confirm_pos:]
-                            touched_50 = not tracking_df[tracking_df['Low'] <= eq_50].empty
+                            touched_entry = not tracking_df[tracking_df['Low'] <= entry_price].empty
                             
-                            if not touched_50 and scan_state == "2":
+                            if not touched_entry and scan_state == "2":
                                 setups.append(setup_data)
                                 
-                            elif touched_50 and scan_state == "3":
-                                entry_idx = tracking_df[tracking_df['Low'] <= eq_50].index[0]
+                            elif touched_entry and scan_state == "3":
+                                entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
                                 forward_df = df.loc[entry_idx:]
                                 is_active = True
                                 for idx, row in forward_df.iterrows():
@@ -126,13 +163,13 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         is_active = False
                                         break
                                 if is_active:
-                                    setup_data["50% distance"] = "Touched (Active)"
+                                    setup_data["Entry Distance"] = "Touched (Active)"
                                     setups.append(setup_data)
                                     
-                            elif touched_50 and scan_state == "4":
-                                entry_idx = tracking_df[tracking_df['Low'] <= eq_50].index[0]
+                            elif touched_entry and scan_state == "4":
+                                entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
                                 forward_df = df.loc[entry_idx:]
-                                outcome, highest_seen = "Still Open", eq_50
+                                outcome, highest_seen = "Still Open", entry_price
                                 for idx, row in forward_df.iterrows():
                                     if row['High'] > highest_seen: highest_seen = row['High']
                                     if row['Low'] <= sweep_low:
@@ -141,7 +178,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     elif row['High'] >= post_sh_val:
                                         outcome = "Target Hit"
                                         break
-                                setup_data["Max Move (%)"] = f"{round(((highest_seen - eq_50) / eq_50) * 100, 2)}%"
+                                setup_data["Max Move (%)"] = f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%"
                                 setup_data["Outcome"] = outcome
                                 setups.append(setup_data)
 
@@ -174,32 +211,33 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             "MSS time": mss_idx.strftime(time_fmt),
                             "MSS candles": mss_count,
                             "MSS price": round(sl_val, 2),
-                            "50% distance": "N/A"
+                            "Entry Distance": "N/A"
                         }
                         
                         if not post_sl_idx:
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            eq_50 = (sweep_high + post_sl_val) / 2
-                            gap_pct = round(((eq_50 - cmp)/cmp)*100, 2)
+                            entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sl_idx, 'Bearish', sweep_high, post_sl_val)
+                            gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
                             
                             setup_data.update({
-                                "50% Level": round(eq_50, 2),
+                                "Entry Type": entry_type,
+                                "Entry Level": round(entry_price, 2),
                                 "Stop Loss": round(sweep_high, 2),
                                 "Target": round(post_sl_val, 2),
-                                "50% distance": f"{gap_pct}%"
+                                "Entry Distance": f"{gap_pct}%"
                             })
                             
                             confirm_pos = df_index.index(confirm_idx)
                             tracking_df = df.iloc[confirm_pos:]
-                            touched_50 = not tracking_df[tracking_df['High'] >= eq_50].empty
+                            touched_entry = not tracking_df[tracking_df['High'] >= entry_price].empty
                             
-                            if not touched_50 and scan_state == "2":
+                            if not touched_entry and scan_state == "2":
                                 setups.append(setup_data)
                                 
-                            elif touched_50 and scan_state == "3":
-                                entry_idx = tracking_df[tracking_df['High'] >= eq_50].index[0]
+                            elif touched_entry and scan_state == "3":
+                                entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
                                 forward_df = df.loc[entry_idx:]
                                 is_active = True
                                 for idx, row in forward_df.iterrows():
@@ -207,13 +245,13 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         is_active = False
                                         break
                                 if is_active:
-                                    setup_data["50% distance"] = "Touched (Active)"
+                                    setup_data["Entry Distance"] = "Touched (Active)"
                                     setups.append(setup_data)
                                     
-                            elif touched_50 and scan_state == "4":
-                                entry_idx = tracking_df[tracking_df['High'] >= eq_50].index[0]
+                            elif touched_entry and scan_state == "4":
+                                entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
                                 forward_df = df.loc[entry_idx:]
-                                outcome, lowest_seen = "Still Open", eq_50
+                                outcome, lowest_seen = "Still Open", entry_price
                                 for idx, row in forward_df.iterrows():
                                     if row['Low'] < lowest_seen: lowest_seen = row['Low']
                                     if row['High'] >= sweep_high:
@@ -222,7 +260,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     elif row['Low'] <= post_sl_val:
                                         outcome = "Target Hit"
                                         break
-                                setup_data["Max Move (%)"] = f"{round(((eq_50 - lowest_seen) / eq_50) * 100, 2)}%"
+                                setup_data["Max Move (%)"] = f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%"
                                 setup_data["Outcome"] = outcome
                                 setups.append(setup_data)
     return setups
@@ -257,7 +295,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str, stric
                 valid_res_yest = [r for r in (res_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < target_date]
                 res = (res_today or []) + valid_res_yest
 
-            else: # Backtest Loop
+            else: 
                 month_start = target_date.replace(day=1)
                 month_end = month_start + pd.offsets.MonthEnd(0)
                 days_in_month = daily_df.loc[(daily_df.index >= month_start) & (daily_df.index <= month_end)].index
@@ -280,7 +318,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str, stric
                     all_res.extend(v_res_yest)
                 res = all_res
                 
-        else: # Daily Timeframe
+        else: 
             df = t.history(period="2y", interval="1d", auto_adjust=False)
             if df.empty: return None
             df.index = df.index.tz_localize(None)
@@ -315,8 +353,8 @@ with st.sidebar:
         "Select Market State", 
         [
             "1. MSS done (Swing high not yet formed)", 
-            "2. Awaiting entry (Price has not yet touched 50% line)", 
-            "3. Trade open (Price has touched 50% line, SL/Target not hit)", 
+            "2. Awaiting entry (Price has not yet touched FVG/61%)", 
+            "3. Trade open (Price has touched Entry, SL/Target not hit)", 
             "4. Previous reports (Monthly Backtest Mode)"
         ]
     )
@@ -355,23 +393,24 @@ if st.button("🚀 Execute Master Scan", type="primary"):
         else:
             df_all = pd.DataFrame(results)
             
-            # P&L Base Calculation (if in State 4)
             if state_code == "4":
                 def calculate_pnl(row):
                     risk = risk_per_trade
-                    risk_dist = abs(row['50% Level'] - row['Stop Loss'])
+                    risk_dist = abs(row['Entry Level'] - row['Stop Loss'])
                     if risk_dist == 0: return 0
                     qty = risk / risk_dist
+                    reward_dist = abs(row['Target'] - row['Entry Level'])
+                    reward_ratio = reward_dist / risk_dist
                     
                     if row['Outcome'] == 'Target Hit':
-                        return risk 
+                        return risk * reward_ratio
                     elif row['Outcome'] == 'SL Hit':
                         return -risk
                     else: 
                         if row['Direction'] == 'Bullish':
-                            return qty * (row['CMP'] - row['50% Level'])
+                            return qty * (row['CMP'] - row['Entry Level'])
                         else:
-                            return qty * (row['50% Level'] - row['CMP'])
+                            return qty * (row['Entry Level'] - row['CMP'])
                             
                 df_all['Trade P&L (₹)'] = df_all.apply(calculate_pnl, axis=1).round(2)
             
