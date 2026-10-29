@@ -13,7 +13,7 @@ ist = pytz.timezone('Asia/Kolkata')
 @st.cache_data(ttl=3600)
 def get_nifty500_symbols():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    headers = {"User-Agent": "Mozilla/5.0"}
     for _ in range(3):
         try:
             response = requests.get(url, headers=headers, timeout=10)
@@ -22,16 +22,7 @@ def get_nifty500_symbols():
                 return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
         except Exception:
             pass
-    # Robust Fallback if NSE blocks the cloud server
-    return [
-        'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'BHARTIARTL.NS', 'SBIN.NS', 
-        'INFY.NS', 'LICI.NS', 'ITC.NS', 'HINDUNILVR.NS', 'LT.NS', 'BAJFINANCE.NS', 'HCLTECH.NS', 
-        'MARUTI.NS', 'SUNPHARMA.NS', 'TATAMOTORS.NS', 'M&M.NS', 'ASIANPAINT.NS', 'ULTRACEMCO.NS', 
-        'TITAN.NS', 'NTPC.NS', 'BAJAJFINSV.NS', 'KOTAKBANK.NS', 'AXISBANK.NS', 'ONGC.NS', 
-        'ADANIENT.NS', 'POWERGRID.NS', 'COALINDIA.NS', 'WIPRO.NS', 'TATASTEEL.NS', 'BAJAJ-AUTO.NS',
-        'GRASIM.NS', 'HDFCLIFE.NS', 'TECHM.NS', 'HINDALCO.NS', 'ADANIPORTS.NS', 'DRREDDY.NS', 
-        'BRITANNIA.NS', 'CIPLA.NS', 'INDUSINDBK.NS'
-    ]
+    return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS']
 
 def get_recent_swing(df, current_idx, direction='high'):
     try:
@@ -287,67 +278,50 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
 
 def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite):
     try:
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-        t = yf.Ticker(ticker, session=session)
-        
+        t = yf.Ticker(ticker)
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         
         if timeframe == "15 Minute":
+            # Fetch reliable 1-Day Data purely to build HTF levels (immune to 60-day limit)
+            daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
             df = t.history(period="60d", interval="15m", auto_adjust=False)
-            if df.empty: return None
-            df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
             
-            # Use 15m resampled data to strictly align High/Low levels
-            daily_df = df.resample('D').agg({'High':'max', 'Low':'min'}).dropna()
+            if df.empty or daily_htf.empty: return None
+            df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
+            daily_htf.index = daily_htf.index.tz_localize(None)
+            
+            available_dates = pd.Series(df.index.date).drop_duplicates().apply(lambda x: pd.to_datetime(x))
             
             if scan_state != "4":
-                if start_date not in daily_df.index: 
-                    start_date = daily_df.index[-1] 
+                # Current Day states (1, 2, 3)
+                if start_date not in available_dates.values:
+                    start_date = available_dates.iloc[-1] # Fallback to latest available intraday session
                 
-                past_days = daily_df.loc[daily_df.index < start_date]
-                if len(past_days) < 2: return None
+                past_htf = daily_htf.loc[daily_htf.index < start_date]
+                if len(past_htf) < 1: return None
                 
-                pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
-                pdl_yest, pdh_yest = past_days['Low'].iloc[-2], past_days['High'].iloc[-2]
-                
+                pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
                 day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                 
-                res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
+                res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
                 
-                # Restore the Yesterday Afternoon sweep search
-                t_minus_1 = past_days.index[-1]
-                eval_start_yest = t_minus_1 + pd.Timedelta(hours=12)
-                res_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, eval_start_yest, day_end, strict_opposite, is_daily=False)
-                valid_res_yest = [r for r in (res_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < start_date]
-                
-                res = (res_today or []) + valid_res_yest
-
             else: 
-                days_in_range = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)].index
-                all_res = []
+                # Backtest Engine (Iterating specific dates)
+                days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
+                res = []
                 for d in days_in_range:
-                    past_days = daily_df.loc[daily_df.index < d]
-                    if len(past_days) < 2: continue
+                    past_htf = daily_htf.loc[daily_htf.index < d]
+                    if len(past_htf) < 1: continue
                     
-                    pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
-                    pdl_yest, pdh_yest = past_days['Low'].iloc[-2], past_days['High'].iloc[-2]
-                    
+                    pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
                     day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                    t_minus_1 = past_days.index[-1]
                     
                     r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, is_daily=False)
-                    
-                    e_start_yest = t_minus_1 + pd.Timedelta(hours=12)
-                    r_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, e_start_yest, day_end, strict_opposite, is_daily=False)
-                    v_res_yest = [r for r in (r_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < d]
-                    
-                    if r_today: all_res.extend(r_today)
-                    all_res.extend(v_res_yest)
-                res = all_res
+                    if r_today: res.extend(r_today)
                 
         else: 
+            # Daily Timeframe
             df = t.history(period="2y", interval="1d", auto_adjust=False)
             if df.empty: return None
             df.index = df.index.tz_localize(None)
@@ -365,7 +339,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                 res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, is_daily=True)
             else:
                 months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
-                all_res = []
+                res = []
                 for m_start in months_in_range:
                     m_end = m_start + pd.offsets.MonthEnd(0)
                     hist_df = monthly_hist.loc[monthly_hist.index < m_start]
@@ -373,8 +347,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                     pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
                     
                     r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, is_daily=True)
-                    if r_month: all_res.extend(r_month)
-                res = all_res
+                    if r_month: res.extend(r_month)
 
         if res:
             for r in res: r['Stock name'] = ticker.replace('.NS', '')
@@ -417,10 +390,7 @@ with st.sidebar:
             min_date = (today - pd.Timedelta(days=59)).date()
             max_date = today.date()
             
-            # Default to scanning the last 7 days automatically
-            default_start = max(min_date, (today - pd.Timedelta(days=7)).date())
-            
-            start_date_input = st.date_input("From Date", default_start, min_value=min_date, max_value=max_date)
+            start_date_input = st.date_input("From Date", min_date, min_value=min_date, max_value=max_date)
             end_date_input = st.date_input("To Date", max_date, min_value=min_date, max_value=max_date)
             
             start_date = pd.to_datetime(start_date_input)
@@ -448,8 +418,7 @@ if st.button("🚀 Execute Master Scan", type="primary"):
             tickers = get_nifty500_symbols()
             results = []
             
-            # Maintain safe concurrency (10 max workers)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
                 futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite) for tick in tickers]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
@@ -492,10 +461,8 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                     else:
                         if state_code == "4":
                             total_pnl = df['Trade P&L (₹)'].sum()
-                            
-                            closed_trades = df[df['Outcome'] != 'Still Open']
-                            wins = len(closed_trades[closed_trades['Trade P&L (₹)'] > 0])
-                            losses = len(closed_trades[closed_trades['Trade P&L (₹)'] <= 0])
+                            wins = len(df[df['Outcome'] == 'Target Hit'])
+                            losses = len(df[df['Outcome'] == 'SL Hit'])
                             open_t = len(df[df['Outcome'] == 'Still Open'])
                             win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
                             
