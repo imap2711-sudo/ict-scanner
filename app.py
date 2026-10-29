@@ -1,13 +1,14 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import requests
 import io
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 
-st.set_page_config(page_title="ICT 15m Scanner (Advanced)", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
 
 @st.cache_data(ttl=3600)
@@ -22,224 +23,303 @@ def get_nifty500_symbols():
                 return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
         except Exception:
             pass
-    return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS', 'LT.NS']
+    return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS']
 
-def process_setup_logic(df, daily_df, day_start, ticker, cmp):
-    hist_daily = daily_df.loc[daily_df.index < day_start]
-    if hist_daily.empty: return []
-        
-    pdh = hist_daily['High'].iloc[-1]
-    pdl = hist_daily['Low'].iloc[-1]
-            
-    today_df = df.loc[df.index >= day_start]
-    if today_df.empty: return []
-    
+def get_recent_swing(df, current_idx, direction='high'):
+    """Finds the most recent 15m/1d untested swing point prior to the sweep."""
+    try:
+        loc = df.index.get_loc(current_idx)
+        for i in range(loc - 1, 1, -1):
+            if direction == 'high':
+                if df['High'].iloc[i] > df['High'].iloc[i-1] and df['High'].iloc[i] > df['High'].iloc[i+1]:
+                    # Ensure it is untested between formation and sweep
+                    if df['High'].iloc[i:loc].max() <= df['High'].iloc[i]:
+                        return df.index[i], df['High'].iloc[i]
+            else:
+                if df['Low'].iloc[i] < df['Low'].iloc[i-1] and df['Low'].iloc[i] < df['Low'].iloc[i+1]:
+                    if df['Low'].iloc[i:loc].min() >= df['Low'].iloc[i]:
+                        return df.index[i], df['Low'].iloc[i]
+        return None, None
+    except:
+        return None, None
+
+def get_post_mss_swing(df, mss_idx, direction='high'):
+    """Finds the first swing point formed AFTER the MSS breakout."""
+    try:
+        loc = df.index.get_loc(mss_idx)
+        for i in range(loc, len(df)-1):
+            if direction == 'high':
+                if df['High'].iloc[i] > df['High'].iloc[i-1] and df['High'].iloc[i] > df['High'].iloc[i+1]:
+                    return df.index[i], df['High'].iloc[i], df.index[i+1] # Returns confirmation candle idx too
+            else:
+                if df['Low'].iloc[i] < df['Low'].iloc[i-1] and df['Low'].iloc[i] < df['Low'].iloc[i+1]:
+                    return df.index[i], df['Low'].iloc[i], df.index[i+1]
+        return None, None, None
+    except:
+        return None, None, None
+
+def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, is_daily=False):
     setups = []
-    df_index_list = today_df.index.tolist()
+    df_index = df.index.tolist()
+    cmp = df['Close'].iloc[-1]
     
-    # Check absolute daily extremes to ensure opposite boundary is NOT touched
-    day_high = today_df['High'].max()
-    day_low = today_df['Low'].min()
-    
-    # ==========================
-    # BULLISH SETUP (PDL Sweep)
-    # ==========================
-    # Condition: If it swept PDL, it MUST NOT have touched PDH today.
-    bull_sweeps = today_df[today_df['Low'] <= pdl]
-    if not bull_sweeps.empty and day_high < pdh: 
-        sweep_idx = bull_sweeps.index[0]
-        sweep_pos = df_index_list.index(sweep_idx)
-        sweep_low = today_df.loc[sweep_idx, 'Low']
+    # -----------------------
+    # BULLISH LOGIC
+    # -----------------------
+    bull_sweeps = df[df['Low'] <= htf_low]
+    if not bull_sweeps.empty:
+        sweep_idx = bull_sweeps.index[0] # First sweep
+        sweep_pos = df_index.index(sweep_idx)
+        sweep_low = df.loc[sweep_idx, 'Low']
         
-        hist_df = df.loc[:sweep_idx].iloc[-40:-1]
-        if len(hist_df) >= 3:
-            shs = [hist_df['High'].iloc[i] for i in range(1, len(hist_df)-1) 
-                   if hist_df['High'].iloc[i] > hist_df['High'].iloc[i-1] and hist_df['High'].iloc[i] > hist_df['High'].iloc[i+1]]
+        # Rule: Must not touch opposite liquidity (HTF High) AFTER sweep
+        post_sweep_df = df.iloc[sweep_pos:]
+        if post_sweep_df['High'].max() < htf_high:
             
-            if shs:
-                recent_swing_high = shs[-1]
-                
-                # MSS check (max 6 candles)
-                post_sweep = today_df.iloc[sweep_pos+1 : sweep_pos+7] 
-                mss_cands = post_sweep[post_sweep['Close'] > recent_swing_high]
-                
+            # Find Untested Swing High Prior to Sweep
+            sh_idx, sh_val = get_recent_swing(df, sweep_idx, 'high')
+            if sh_idx:
+                # Find MSS with displacement limit
+                mss_cands = post_sweep_df[post_sweep_df['Close'] > sh_val]
                 if not mss_cands.empty:
                     mss_idx = mss_cands.index[0]
-                    mss_pos = df_index_list.index(mss_idx)
+                    mss_pos = df_index.index(mss_idx)
                     
-                    leg_df = today_df.iloc[sweep_pos : mss_pos+2]
-                    leg_high = leg_df['High'].max()
-                    leg_high_pos = df_index_list.index(leg_df['High'].idxmax())
-                    
-                    eq_50 = (sweep_low + leg_high) / 2
-                    
-                    post_leg_df = today_df.iloc[leg_high_pos+1:]
-                    touched_50 = False
-                    if not post_leg_df.empty:
-                        if post_leg_df['Low'].min() <= eq_50:
-                            touched_50 = True
-                    
-                    category = "Already Touched 50%" if touched_50 else "MSS Done (Untouched)"
-                    
-                    setups.append({
-                        "Direction": "Bullish",
-                        "Category": category,
-                        "Symbol": ticker.replace('.NS', ''),
-                        "Time of Sweep": sweep_idx.strftime('%H:%M'),
-                        "Time of MSS": mss_idx.strftime('%H:%M'),
-                        "PDL Swept (₹)": round(pdl, 2),
-                        "Sweep Low (₹)": round(sweep_low, 2),
-                        "Leg High (₹)": round(leg_high, 2),
-                        "50% Level (₹)": round(eq_50, 2),
-                        "Live Price (₹)": round(cmp, 2),
-                        "Distance from 50% (%)": round(((cmp - eq_50) / cmp) * 100, 2)
-                    })
-
-    # ==========================
-    # BEARISH SETUP (PDH Sweep)
-    # ==========================
-    # Condition: If it swept PDH, it MUST NOT have touched PDL today.
-    bear_sweeps = today_df[today_df['High'] >= pdh]
-    if not bear_sweeps.empty and day_low > pdl: 
-        sweep_idx = bear_sweeps.index[0]
-        sweep_pos = df_index_list.index(sweep_idx)
-        sweep_high = today_df.loc[sweep_idx, 'High']
-        
-        hist_df = df.loc[:sweep_idx].iloc[-40:-1]
-        if len(hist_df) >= 3:
-            sls = [hist_df['Low'].iloc[i] for i in range(1, len(hist_df)-1) 
-                   if hist_df['Low'].iloc[i] < hist_df['Low'].iloc[i-1] and hist_df['Low'].iloc[i] < hist_df['Low'].iloc[i+1]]
-            
-            if sls:
-                recent_swing_low = sls[-1]
-                
-                # MSS check (max 6 candles)
-                post_sweep = today_df.iloc[sweep_pos+1 : sweep_pos+7] 
-                mss_cands = post_sweep[post_sweep['Close'] < recent_swing_low]
-                
-                if not mss_cands.empty:
-                    mss_idx = mss_cands.index[0]
-                    mss_pos = df_index_list.index(mss_idx)
-                    
-                    leg_df = today_df.iloc[sweep_pos : mss_pos+2]
-                    leg_low = leg_df['Low'].min()
-                    leg_low_pos = df_index_list.index(leg_df['Low'].idxmin())
-                    
-                    eq_50 = (sweep_high + leg_low) / 2
-                    
-                    post_leg_df = today_df.iloc[leg_low_pos+1:]
-                    touched_50 = False
-                    if not post_leg_df.empty:
-                        if post_leg_df['High'].max() >= eq_50:
-                            touched_50 = True
-                    
-                    category = "Already Touched 50%" if touched_50 else "MSS Done (Untouched)"
-                    
-                    setups.append({
-                        "Direction": "Bearish",
-                        "Category": category,
-                        "Symbol": ticker.replace('.NS', ''),
-                        "Time of Sweep": sweep_idx.strftime('%H:%M'),
-                        "Time of MSS": mss_idx.strftime('%H:%M'),
-                        "PDH Swept (₹)": round(pdh, 2),
-                        "Sweep High (₹)": round(sweep_high, 2),
-                        "Leg Low (₹)": round(leg_low, 2),
-                        "50% Level (₹)": round(eq_50, 2),
-                        "Live Price (₹)": round(cmp, 2),
-                        "Distance from 50% (%)": round(((eq_50 - cmp) / cmp) * 100, 2)
-                    })
+                    if (mss_pos - sweep_pos) <= mss_limit:
+                        # Post MSS Swing
+                        post_sh_idx, post_sh_val, confirm_idx = get_post_mss_swing(df, mss_idx, 'high')
                         
+                        setup_data = {
+                            "Direction": "Bullish",
+                            "Sweep Time": sweep_idx.strftime('%Y-%m-%d %H:%M'),
+                            "HTF Low Swept": round(htf_low, 2),
+                            "MSS Break Time": mss_idx.strftime('%Y-%m-%d %H:%M'),
+                            "Broken Swing High": round(sh_val, 2),
+                        }
+                        
+                        # State 1: MSS Done (Swing high not yet formed)
+                        if not post_sh_idx:
+                            if scan_state == "1":
+                                setups.append({**setup_data, "Status": "MSS Done, Building Leg"})
+                        
+                        else:
+                            eq_50 = (sweep_low + post_sh_val) / 2
+                            setup_data.update({
+                                "Momentum Peak": round(post_sh_val, 2),
+                                "50% Entry Level": round(eq_50, 2),
+                            })
+                            
+                            # Check 50% Touch
+                            confirm_pos = df_index.index(confirm_idx)
+                            tracking_df = df.iloc[confirm_pos:]
+                            touched_50 = not tracking_df[tracking_df['Low'] <= eq_50].empty
+                            
+                            # State 2: Awaiting Entry
+                            if not touched_50 and scan_state == "2":
+                                setups.append({**setup_data, "Status": "Awaiting Entry", "Live CMP": round(cmp, 2), "Gap to 50%": round(((cmp - eq_50)/cmp)*100, 2)})
+                                
+                            # State 3: Trade Open
+                            elif touched_50 and scan_state == "3":
+                                setups.append({**setup_data, "Status": "Trade Open", "Live CMP": round(cmp, 2)})
+                                
+                            # State 4: Previous Reports (Backtest)
+                            elif touched_50 and scan_state == "4":
+                                entry_idx = tracking_df[tracking_df['Low'] <= eq_50].index[0]
+                                forward_df = df.loc[entry_idx:]
+                                
+                                outcome = "Open"
+                                highest_seen = eq_50
+                                
+                                for idx, row in forward_df.iterrows():
+                                    if row['High'] > highest_seen: highest_seen = row['High']
+                                    
+                                    if row['Low'] <= sweep_low:
+                                        outcome = "SL Hit"
+                                        break
+                                    elif row['High'] >= post_sh_val:
+                                        outcome = "Target Hit (Successful)"
+                                        break
+                                
+                                max_move = ((highest_seen - eq_50) / eq_50) * 100
+                                setups.append({**setup_data, "Outcome": outcome, "Max Favorable Move (%)": round(max_move, 2)})
+
+    # -----------------------
+    # BEARISH LOGIC
+    # -----------------------
+    bear_sweeps = df[df['High'] >= htf_high]
+    if not bear_sweeps.empty:
+        sweep_idx = bear_sweeps.index[0] 
+        sweep_pos = df_index.index(sweep_idx)
+        sweep_high = df.loc[sweep_idx, 'High']
+        
+        post_sweep_df = df.iloc[sweep_pos:]
+        if post_sweep_df['Low'].min() > htf_low:
+            
+            sl_idx, sl_val = get_recent_swing(df, sweep_idx, 'low')
+            if sl_idx:
+                mss_cands = post_sweep_df[post_sweep_df['Close'] < sl_val]
+                if not mss_cands.empty:
+                    mss_idx = mss_cands.index[0]
+                    mss_pos = df_index.index(mss_idx)
+                    
+                    if (mss_pos - sweep_pos) <= mss_limit:
+                        post_sl_idx, post_sl_val, confirm_idx = get_post_mss_swing(df, mss_idx, 'low')
+                        
+                        setup_data = {
+                            "Direction": "Bearish",
+                            "Sweep Time": sweep_idx.strftime('%Y-%m-%d %H:%M'),
+                            "HTF High Swept": round(htf_high, 2),
+                            "MSS Break Time": mss_idx.strftime('%Y-%m-%d %H:%M'),
+                            "Broken Swing Low": round(sl_val, 2),
+                        }
+                        
+                        if not post_sl_idx:
+                            if scan_state == "1":
+                                setups.append({**setup_data, "Status": "MSS Done, Building Leg"})
+                        else:
+                            eq_50 = (sweep_high + post_sl_val) / 2
+                            setup_data.update({
+                                "Momentum Trough": round(post_sl_val, 2),
+                                "50% Entry Level": round(eq_50, 2),
+                            })
+                            
+                            confirm_pos = df_index.index(confirm_idx)
+                            tracking_df = df.iloc[confirm_pos:]
+                            touched_50 = not tracking_df[tracking_df['High'] >= eq_50].empty
+                            
+                            if not touched_50 and scan_state == "2":
+                                setups.append({**setup_data, "Status": "Awaiting Entry", "Live CMP": round(cmp, 2), "Gap to 50%": round(((eq_50 - cmp)/cmp)*100, 2)})
+                                
+                            elif touched_50 and scan_state == "3":
+                                setups.append({**setup_data, "Status": "Trade Open", "Live CMP": round(cmp, 2)})
+                                
+                            elif touched_50 and scan_state == "4":
+                                entry_idx = tracking_df[tracking_df['High'] >= eq_50].index[0]
+                                forward_df = df.loc[entry_idx:]
+                                
+                                outcome = "Open"
+                                lowest_seen = eq_50
+                                
+                                for idx, row in forward_df.iterrows():
+                                    if row['Low'] < lowest_seen: lowest_seen = row['Low']
+                                    
+                                    if row['High'] >= sweep_high:
+                                        outcome = "SL Hit"
+                                        break
+                                    elif row['Low'] <= post_sl_val:
+                                        outcome = "Target Hit (Successful)"
+                                        break
+                                
+                                max_move = ((eq_50 - lowest_seen) / eq_50) * 100
+                                setups.append({**setup_data, "Outcome": outcome, "Max Favorable Move (%)": round(max_move, 2)})
+
     return setups
 
-def scan_ticker(ticker):
+
+def scan_ticker(ticker, timeframe, mss_limit, scan_state, target_date_str):
     try:
         t = yf.Ticker(ticker)
-        df = t.history(period="10d", interval="15m", auto_adjust=False)
-        if df.empty or len(df) < 50: return None
+        
+        if timeframe == "15 Minute":
+            df = t.history(period="60d", interval="15m", auto_adjust=False)
+            if df.empty: return None
+            df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
             
-        if df.index.tz is not None:
-            df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
-        else:
+            daily_df = df.resample('D').agg({'High':'max', 'Low':'min'}).dropna()
+            target_date = pd.to_datetime(target_date_str).replace(hour=0, minute=0, second=0)
+            
+            if target_date not in daily_df.index: return None
+            
+            hist_daily = daily_df.loc[daily_df.index < target_date]
+            if hist_daily.empty: return None
+            
+            pdl, pdh = hist_daily['Low'].iloc[-1], hist_daily['High'].iloc[-1]
+            day_end = target_date + pd.Timedelta(days=1)
+            eval_window = df.loc[(df.index >= target_date) & (df.index < day_end)]
+            
+            if eval_window.empty: return None
+            
+            res = evaluate_setup(eval_window, pdh, pdl, mss_limit, scan_state, is_daily=False)
+            
+        else: # Daily Timeframe
+            df = t.history(period="2y", interval="1d", auto_adjust=False)
+            if df.empty: return None
             df.index = df.index.tz_localize(None)
             
-        df = df.dropna(subset=['Close', 'High', 'Low'])
-        
-        try: cmp = float(t.fast_info.last_price)
-        except: cmp = float(df['Close'].iloc[-1])
+            monthly_df = df.resample('M').agg({'High':'max', 'Low':'min'}).dropna()
+            target_date = pd.to_datetime(target_date_str)
+            target_month_end = target_date + pd.offsets.MonthEnd(0)
             
-        if pd.isna(cmp) or cmp <= 60: return None
+            hist_monthly = monthly_df.loc[monthly_df.index < target_month_end]
+            if hist_monthly.empty: return None
             
-        if cmp > df['High'].iloc[-1]: df.loc[df.index[-1], 'High'] = cmp
-        if cmp < df['Low'].iloc[-1]: df.loc[df.index[-1], 'Low'] = cmp
-        df.loc[df.index[-1], 'Close'] = cmp
-        
-        daily_df = df.resample('D').agg({'High':'max', 'Low':'min', 'Close':'last'}).dropna()
-        if len(daily_df) < 2: return None
+            pml, pmh = hist_monthly['Low'].iloc[-1], hist_monthly['High'].iloc[-1]
+            target_month_start = target_date.replace(day=1)
             
-        today_start = daily_df.index[-1].replace(hour=0, minute=0, second=0)
-        
-        return process_setup_logic(df, daily_df, today_start, ticker, cmp)
+            eval_window = df.loc[(df.index >= target_month_start) & (df.index <= target_month_end)]
+            if eval_window.empty: return None
+            
+            res = evaluate_setup(eval_window, pmh, pml, mss_limit, scan_state, is_daily=True)
+
+        if res:
+            for r in res: r['Symbol'] = ticker.replace('.NS', '')
+            return res
+        return None
     except:
         return None
 
-@st.cache_data(ttl=180, show_spinner=False)
-def run_full_scan():
-    tickers = get_nifty500_symbols()
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(scan_ticker, tick) for tick in tickers]
-        for f in concurrent.futures.as_completed(futures):
-            res = f.result()
-            if res:
-                results.extend(res)
-    return results
-
 # --- STREAMLIT UI ---
-st.title("🎯 Nifty 500 ICT 15m Precision Scanner")
-st.markdown("**Strict Rules:** First Sweep -> No Opposite Touch -> MSS in 6 Candles -> Sub-categorized by 50% Touch.")
-now_str = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S IST")
-st.markdown(f"**Last Scanned:** `{now_str}`")
+st.title("🎯 Ultimate ICT Precision Scanner")
+st.markdown("Scans strictly for Untested Prior Swing Breaks, 50% Pullbacks, and No Opposite Touch Invalidation.")
 
-if st.button("🚀 Fetch Live Market Data & Scan", type="primary"):
-    with st.spinner("Scanning 500 stocks with updated logic. Please wait..."):
-        st.session_state['scan_results'] = run_full_scan()
-
-if 'scan_results' in st.session_state:
-    all_data = st.session_state['scan_results']
+with st.sidebar:
+    st.header("⚙️ Scanner Configurations")
+    timeframe = st.selectbox("Execution Timeframe", ["15 Minute", "Daily"])
     
-    if not all_data:
-        st.warning("No stocks matched these strict conditions right now.")
+    scan_state = st.selectbox(
+        "Select Market State", 
+        [
+            "1. MSS done (Swing high not yet formed)", 
+            "2. Awaiting entry (Price has not yet touched 50% line)", 
+            "3. Trade open (Price has touched 50% line)", 
+            "4. Previous reports (Backtest Mode)"
+        ]
+    )
+    state_code = scan_state.split(".")[0]
+    
+    mss_limit = st.selectbox("Max Displacement Candles for MSS", list(range(1, 8)), index=6)
+    
+    st.divider()
+    if state_code == "4":
+        st.subheader("Backtest Settings")
+        target_date = st.date_input("Select Historical Date", datetime.today() - timedelta(days=1))
     else:
-        df_all = pd.DataFrame(all_data)
+        target_date = datetime.today()
+
+if st.button("🚀 Execute Master Scan", type="primary"):
+    with st.spinner(f"Scanning Nifty 500 | {timeframe} | State: {state_code}..."):
+        tickers = get_nifty500_symbols()
+        results = []
         
-        # Bullish Data
-        df_bull = df_all[df_all['Direction'] == 'Bullish']
-        df_bull_untouched = df_bull[df_bull['Category'] == 'MSS Done (Untouched)'].sort_values('Distance from 50% (%)')
-        df_bull_touched = df_bull[df_bull['Category'] == 'Already Touched 50%'].sort_values('Distance from 50% (%)')
-        
-        # Bearish Data
-        df_bear = df_all[df_all['Direction'] == 'Bearish']
-        df_bear_untouched = df_bear[df_bear['Category'] == 'MSS Done (Untouched)'].sort_values('Distance from 50% (%)')
-        df_bear_touched = df_bear[df_bear['Category'] == 'Already Touched 50%'].sort_values('Distance from 50% (%)')
-        
-        main_tab1, main_tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
-        
-        with main_tab1:
-            bull_sub1, bull_sub2 = st.tabs(["MSS Done (Untouched 50%)", "Already Touched 50%"])
-            with bull_sub1:
-                if df_bull_untouched.empty: st.info("No untouched Bullish setups.")
-                else: st.dataframe(df_bull_untouched.drop(columns=['Direction', 'Category']), use_container_width=True, hide_index=True)
-            with bull_sub2:
-                if df_bull_touched.empty: st.info("No Bullish setups have touched 50% yet.")
-                else: st.dataframe(df_bull_touched.drop(columns=['Direction', 'Category']), use_container_width=True, hide_index=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, target_date.strftime('%Y-%m-%d')) for tick in tickers]
+            for f in concurrent.futures.as_completed(futures):
+                res = f.result()
+                if res: results.extend(res)
                 
-        with main_tab2:
-            bear_sub1, bear_sub2 = st.tabs(["MSS Done (Untouched 50%)", "Already Touched 50%"])
-            with bear_sub1:
-                if df_bear_untouched.empty: st.info("No untouched Bearish setups.")
-                else: st.dataframe(df_bear_untouched.drop(columns=['Direction', 'Category']), use_container_width=True, hide_index=True)
-            with bear_sub2:
-                if df_bear_touched.empty: st.info("No Bearish setups have touched 50% yet.")
-                else: st.dataframe(df_bear_touched.drop(columns=['Direction', 'Category']), use_container_width=True, hide_index=True)
-else:
-    st.info("👆 Click the button above to run the scan for today's market data.")
+        if not results:
+            st.warning("No stocks matched these ultra-strict criteria for the selected date and state.")
+        else:
+            df_all = pd.DataFrame(results)
+            df_bull = df_all[df_all['Direction'] == 'Bullish']
+            df_bear = df_all[df_all['Direction'] == 'Bearish']
+            
+            tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
+            
+            with tab1:
+                if df_bull.empty: st.info("No Bullish Setups.")
+                else: st.dataframe(df_bull.drop(columns=['Direction']), use_container_width=True, hide_index=True)
+                
+            with tab2:
+                if df_bear.empty: st.info("No Bearish Setups.")
+                else: st.dataframe(df_bear.drop(columns=['Direction']), use_container_width=True, hide_index=True)
