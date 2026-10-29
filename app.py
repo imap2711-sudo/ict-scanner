@@ -10,19 +10,30 @@ import pytz
 st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)
 def get_nifty500_symbols():
-    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for _ in range(3):
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                df = pd.read_csv(io.StringIO(response.text))
-                return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
-        except Exception:
-            pass
-    return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS']
+    url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+    
+    try:
+        # Establish session to get cookies and bypass NSE anti-bot protection
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+        response = session.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            df = pd.read_csv(io.StringIO(response.text))
+            return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
+    except Exception as e:
+        pass
+        
+    st.sidebar.error("⚠️ NSE Website blocked the Nifty 500 download. Showing Top 10 fallback stocks.")
+    return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'BAJFINANCE.NS', 'KOTAKBANK.NS']
+
 
 @st.cache_data(ttl=3600)
 def get_valid_trading_dates():
@@ -33,7 +44,6 @@ def get_valid_trading_dates():
             return [d.date() for d in df.index]
     except Exception:
         pass
-    # Fallback to simple weekdays if the index fetch fails
     today = datetime.now(ist).date()
     dates = []
     for i in range(60):
