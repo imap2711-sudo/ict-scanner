@@ -121,7 +121,7 @@ def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
     else:
         return round(qty * (entry - cmp), 2)
 
-def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, entry_method, is_daily=False):
+def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, entry_method, target_method, is_daily=False):
     setups = []
     df_index = df.index.tolist()
     cmp = df['Close'].iloc[-1]
@@ -177,7 +177,14 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sh_idx, 'Bullish', sweep_low, post_sh_val)
                                 active_sl = sweep_low
                                 
-                            active_target = post_sh_val
+                            risk_dist = abs(entry_price - active_sl)
+                            
+                            # Target Strategy Toggle
+                            if target_method == "Fixed 1:2 Risk-to-Reward":
+                                active_target = entry_price + (2 * risk_dist)
+                            else:
+                                active_target = post_sh_val
+                                
                             gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
                             
                             setup_data.update({
@@ -270,7 +277,14 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sl_idx, 'Bearish', sweep_high, post_sl_val)
                                 active_sl = sweep_high
                                 
-                            active_target = post_sl_val
+                            risk_dist = abs(entry_price - active_sl)
+                            
+                            # Target Strategy Toggle
+                            if target_method == "Fixed 1:2 Risk-to-Reward":
+                                active_target = entry_price - (2 * risk_dist)
+                            else:
+                                active_target = post_sl_val
+                                
                             gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
                             
                             setup_data.update({
@@ -318,7 +332,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method):
+def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method):
     try:
         t = yf.Ticker(ticker)
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
@@ -344,7 +358,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                 pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
                 day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                 
-                res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, entry_method, is_daily=False)
+                res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, entry_method, target_method, is_daily=False)
                 
             else: 
                 days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
@@ -356,7 +370,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                     pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
                     day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                     
-                    r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, entry_method, is_daily=False)
+                    r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, entry_method, target_method, is_daily=False)
                     if r_today: res.extend(r_today)
                 
         else: 
@@ -373,7 +387,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                 if hist_df.empty: return None
                 pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
                 
-                res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, entry_method, is_daily=True)
+                res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, entry_method, target_method, is_daily=True)
             else:
                 months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
                 res = []
@@ -383,7 +397,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                     if hist_df.empty: continue
                     pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
                     
-                    r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, entry_method, is_daily=True)
+                    r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, entry_method, target_method, is_daily=True)
                     if r_month: res.extend(r_month)
 
         if res:
@@ -415,6 +429,12 @@ with st.sidebar:
         "Entry Trigger Logic",
         ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"],
         help="Dynamic Discount targets standard 50%-61.8% equilibrium. Breaker Block uses the fractured structural swing for high-momentum shallow retests."
+    )
+    
+    target_method = st.selectbox(
+        "Target Strategy",
+        ["Structural Anchor (Momentum Peak)", "Fixed 1:2 Risk-to-Reward"],
+        help="Structural Anchor maps the TP to the original Post-MSS swing. 1:2 RR sets an exact multiplier based on your Stop Loss distance."
     )
     
     mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
@@ -461,7 +481,7 @@ if st.button("🚀 Execute Master Scan", type="primary"):
             results = []
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method) for tick in tickers]
+                futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method) for tick in tickers]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res: results.extend(res)
