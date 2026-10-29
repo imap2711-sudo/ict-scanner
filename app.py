@@ -10,47 +10,19 @@ import pytz
 st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
 
-@st.cache_data(ttl=86400)
-def get_nifty500_symbols():
-    url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
-    
-    try:
-        # Establish session to get cookies and bypass NSE anti-bot protection
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        response = session.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            df = pd.read_csv(io.StringIO(response.text))
-            return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
-    except Exception as e:
-        pass
-        
-    st.sidebar.error("⚠️ NSE Website blocked the Nifty 500 download. Showing Top 10 fallback stocks.")
-    return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'BAJFINANCE.NS', 'KOTAKBANK.NS']
-
-
 @st.cache_data(ttl=3600)
-def get_valid_trading_dates():
-    """Fetches exact trading days from the Nifty 50 index to exclude weekends and holidays."""
-    try:
-        df = yf.Ticker('^NSEI').history(period="60d", interval="1d")
-        if not df.empty:
-            return [d.date() for d in df.index]
-    except Exception:
-        pass
-    today = datetime.now(ist).date()
-    dates = []
-    for i in range(60):
-        d = today - timedelta(days=i)
-        if d.weekday() < 5:
-            dates.append(d)
-    return dates[::-1]
+def get_nifty500_symbols():
+    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for _ in range(3):
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                df = pd.read_csv(io.StringIO(response.text))
+                return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
+        except Exception:
+            pass
+    return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS']
 
 def get_recent_swing(df, current_idx, direction='high'):
     try:
@@ -117,6 +89,15 @@ def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
             return min(fvg_bottoms), "Premium FVG"
         else:
             return fib_618, "61.8% Fib"
+
+def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
+    risk_dist = abs(entry - stop_loss)
+    if risk_dist == 0: return 0.0
+    qty = risk_amt / risk_dist
+    if direction == 'Bullish':
+        return round(qty * (cmp - entry), 2)
+    else:
+        return round(qty * (entry - cmp), 2)
 
 def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, is_daily=False):
     setups = []
@@ -192,15 +173,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
-                                    
-                                    # Calculate Floating P&L
-                                    risk_dist = abs(entry_price - sweep_low)
-                                    if risk_dist > 0:
-                                        qty = 1000 / risk_dist
-                                        setup_data["Floating P&L (₹)"] = round(qty * (cmp - entry_price), 2)
-                                    else:
-                                        setup_data["Floating P&L (₹)"] = 0.0
-                                        
+                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bullish", cmp, entry_price, sweep_low, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -283,15 +256,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
-                                    
-                                    # Calculate Floating P&L
-                                    risk_dist = abs(entry_price - sweep_high)
-                                    if risk_dist > 0:
-                                        qty = 1000 / risk_dist
-                                        setup_data["Floating P&L (₹)"] = round(qty * (entry_price - cmp), 2)
-                                    else:
-                                        setup_data["Floating P&L (₹)"] = 0.0
-                                        
+                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bearish", cmp, entry_price, sweep_high, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -318,7 +283,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         
         if timeframe == "15 Minute":
-            # Fetch reliable 1-Day Data purely to build HTF levels
+            # Fetch reliable 1-Day Data purely to build HTF levels (immune to 60-day limit)
             daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
             df = t.history(period="60d", interval="15m", auto_adjust=False)
             
@@ -329,8 +294,9 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
             available_dates = pd.Series(df.index.date).drop_duplicates().apply(lambda x: pd.to_datetime(x))
             
             if scan_state != "4":
+                # Current Day states (1, 2, 3)
                 if start_date not in available_dates.values:
-                    start_date = available_dates.iloc[-1] 
+                    start_date = available_dates.iloc[-1] # Fallback to latest available intraday session
                 
                 past_htf = daily_htf.loc[daily_htf.index < start_date]
                 if len(past_htf) < 1: return None
@@ -341,6 +307,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                 res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
                 
             else: 
+                # Backtest Engine (Iterating specific dates)
                 days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
                 res = []
                 for d in days_in_range:
@@ -354,6 +321,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                     if r_today: res.extend(r_today)
                 
         else: 
+            # Daily Timeframe
             df = t.history(period="2y", interval="1d", auto_adjust=False)
             if df.empty: return None
             df.index = df.index.tz_localize(None)
@@ -417,20 +385,16 @@ with st.sidebar:
         today = pd.to_datetime(datetime.now(ist).date())
         
         if timeframe == "15 Minute":
-            st.caption("Note: 15-minute historical data is restricted to the last 60 trading days.")
+            st.caption("Note: 15-minute historical data is restricted to the last 60 days by the data provider.")
             
-            valid_dates = get_valid_trading_dates()
-            valid_dates_rev = list(reversed(valid_dates))
+            min_date = (today - pd.Timedelta(days=59)).date()
+            max_date = today.date()
             
-            if valid_dates_rev:
-                from_date_str = st.selectbox("From Date", valid_dates_rev, index=len(valid_dates_rev)-1, format_func=lambda x: x.strftime('%d %b %Y'))
-                to_date_str = st.selectbox("To Date", valid_dates_rev, index=0, format_func=lambda x: x.strftime('%d %b %Y'))
-                
-                start_date = pd.to_datetime(from_date_str)
-                end_date = pd.to_datetime(to_date_str)
-            else:
-                st.error("Failed to load trading calendar.")
-                start_date, end_date = today, today
+            start_date_input = st.date_input("From Date", min_date, min_value=min_date, max_value=max_date)
+            end_date_input = st.date_input("To Date", max_date, min_value=min_date, max_value=max_date)
+            
+            start_date = pd.to_datetime(start_date_input)
+            end_date = pd.to_datetime(end_date_input)
             
         else:
             month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in range(24)]
@@ -448,7 +412,7 @@ with st.sidebar:
 
 if st.button("🚀 Execute Master Scan", type="primary"):
     if state_code == "4" and start_date > end_date:
-        st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
+        st.error("Error: 'From Date/Month' must be earlier than or equal to 'To Date/Month'.")
     else:
         with st.spinner(f"Scanning Nifty 500 | {timeframe} | State: {state_code}..."):
             tickers = get_nifty500_symbols()
