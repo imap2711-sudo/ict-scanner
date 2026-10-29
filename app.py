@@ -281,28 +281,21 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
             if scan_state != "4":
                 if start_date not in daily_df.index: return None
                 past_days = daily_df.loc[daily_df.index < start_date]
-                if len(past_days) < 2: return None
+                if len(past_days) < 1: return None
                 
-                t_minus_1 = past_days.index[-1]
                 pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
-                pdl_yest, pdh_yest = past_days['Low'].iloc[-2], past_days['High'].iloc[-2]
-                
                 day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                 
                 res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
-                eval_start_yest = t_minus_1 + pd.Timedelta(hours=12)
-                res_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, eval_start_yest, day_end, strict_opposite, is_daily=False)
-                
-                valid_res_yest = [r for r in (res_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < start_date]
-                res = (res_today or []) + valid_res_yest
+                res = res_today or []
 
             else: 
-                # Backtest Engine: Strictly Today's Setup ONLY (No yesterday afternoon carryovers)
+                # Backtest Engine: Strictly Today's Setup ONLY
                 days_in_range = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)].index
                 all_res = []
                 for d in days_in_range:
                     past_days = daily_df.loc[daily_df.index < d]
-                    if len(past_days) < 2: continue
+                    if len(past_days) < 1: continue
                     pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
                     day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                     
