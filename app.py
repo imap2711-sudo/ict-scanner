@@ -10,19 +10,41 @@ import pytz
 st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)
 def get_nifty500_symbols():
-    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for _ in range(3):
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                df = pd.read_csv(io.StringIO(response.text))
-                return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
-        except Exception:
-            pass
-    return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS']
+    url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+    try:
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers, timeout=10)
+        response = session.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            df = pd.read_csv(io.StringIO(response.text))
+            return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
+    except Exception as e:
+        pass
+    st.sidebar.error("⚠️ NSE Website blocked the Nifty 500 download. Showing Top 10 fallback stocks.")
+    return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'BAJFINANCE.NS', 'KOTAKBANK.NS']
+
+@st.cache_data(ttl=3600)
+def get_valid_trading_dates():
+    try:
+        df = yf.Ticker('^NSEI').history(period="60d", interval="1d")
+        if not df.empty:
+            return [d.date() for d in df.index]
+    except Exception:
+        pass
+    today = datetime.now(ist).date()
+    dates = []
+    for i in range(60):
+        d = today - timedelta(days=i)
+        if d.weekday() < 5:
+            dates.append(d)
+    return dates[::-1]
 
 def get_recent_swing(df, current_idx, direction='high'):
     try:
@@ -90,16 +112,7 @@ def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
         else:
             return fib_618, "61.8% Fib"
 
-def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
-    risk_dist = abs(entry - stop_loss)
-    if risk_dist == 0: return 0.0
-    qty = risk_amt / risk_dist
-    if direction == 'Bullish':
-        return round(qty * (cmp - entry), 2)
-    else:
-        return round(qty * (entry - cmp), 2)
-
-def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, is_daily=False):
+def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, entry_method, is_daily=False):
     setups = []
     df_index = df.index.tolist()
     cmp = df['Close'].iloc[-1]
@@ -119,7 +132,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
         post_sweep_df = window_df.loc[sweep_idx:]
         
         if not strict_opposite or post_sweep_df['High'].max() < htf_high:
-            sh_idx, sh_val = get_recent_swing(df, sweep_idx, 'high')
+            sh_idx, sh_val = get_recent_swing(df, sweep_idx, 'high') # sh_val is the Breaker Block
             if sh_idx:
                 mss_cands = post_sweep_df[post_sweep_df['Close'] > sh_val]
                 if not mss_cands.empty:
@@ -137,7 +150,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             "Liq. Sweep time": sweep_idx.strftime(time_fmt),
                             "MSS time": mss_idx.strftime(time_fmt),
                             "MSS candles": mss_count,
-                            "MSS price": round(sh_val, 2),
+                            "MSS price (Breaker)": round(sh_val, 2),
                             "Entry Distance": "N/A"
                         }
                         
@@ -145,7 +158,13 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sh_idx, 'Bullish', sweep_low, post_sh_val)
+                            # Select Entry Logic
+                            if entry_method == "Breaker Block (Shallow Pullback)":
+                                entry_price = sh_val
+                                entry_type = "Breaker Block"
+                            else:
+                                entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sh_idx, 'Bullish', sweep_low, post_sh_val)
+                                
                             gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
                             
                             setup_data.update({
@@ -173,7 +192,12 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
-                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bullish", cmp, entry_price, sweep_low, 1000)
+                                    risk_dist = abs(entry_price - sweep_low)
+                                    if risk_dist > 0:
+                                        qty = 1000 / risk_dist
+                                        setup_data["Floating P&L (₹)"] = round(qty * (cmp - entry_price), 2)
+                                    else:
+                                        setup_data["Floating P&L (₹)"] = 0.0
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -202,7 +226,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
         post_sweep_df = window_df.loc[sweep_idx:]
         
         if not strict_opposite or post_sweep_df['Low'].min() > htf_low:
-            sl_idx, sl_val = get_recent_swing(df, sweep_idx, 'low')
+            sl_idx, sl_val = get_recent_swing(df, sweep_idx, 'low') # sl_val is the Breaker Block
             if sl_idx:
                 mss_cands = post_sweep_df[post_sweep_df['Close'] < sl_val]
                 if not mss_cands.empty:
@@ -220,7 +244,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             "Liq. Sweep time": sweep_idx.strftime(time_fmt),
                             "MSS time": mss_idx.strftime(time_fmt),
                             "MSS candles": mss_count,
-                            "MSS price": round(sl_val, 2),
+                            "MSS price (Breaker)": round(sl_val, 2),
                             "Entry Distance": "N/A"
                         }
                         
@@ -228,7 +252,13 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sl_idx, 'Bearish', sweep_high, post_sl_val)
+                            # Select Entry Logic
+                            if entry_method == "Breaker Block (Shallow Pullback)":
+                                entry_price = sl_val
+                                entry_type = "Breaker Block"
+                            else:
+                                entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sl_idx, 'Bearish', sweep_high, post_sl_val)
+                                
                             gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
                             
                             setup_data.update({
@@ -256,7 +286,12 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
-                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bearish", cmp, entry_price, sweep_high, 1000)
+                                    risk_dist = abs(entry_price - sweep_high)
+                                    if risk_dist > 0:
+                                        qty = 1000 / risk_dist
+                                        setup_data["Floating P&L (₹)"] = round(qty * (entry_price - cmp), 2)
+                                    else:
+                                        setup_data["Floating P&L (₹)"] = 0.0
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -276,14 +311,13 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite):
+def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method):
     try:
         t = yf.Ticker(ticker)
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         
         if timeframe == "15 Minute":
-            # Fetch reliable 1-Day Data purely to build HTF levels (immune to 60-day limit)
             daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
             df = t.history(period="60d", interval="15m", auto_adjust=False)
             
@@ -294,9 +328,8 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
             available_dates = pd.Series(df.index.date).drop_duplicates().apply(lambda x: pd.to_datetime(x))
             
             if scan_state != "4":
-                # Current Day states (1, 2, 3)
                 if start_date not in available_dates.values:
-                    start_date = available_dates.iloc[-1] # Fallback to latest available intraday session
+                    start_date = available_dates.iloc[-1] 
                 
                 past_htf = daily_htf.loc[daily_htf.index < start_date]
                 if len(past_htf) < 1: return None
@@ -304,10 +337,9 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                 pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
                 day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                 
-                res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
+                res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, entry_method, is_daily=False)
                 
             else: 
-                # Backtest Engine (Iterating specific dates)
                 days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
                 res = []
                 for d in days_in_range:
@@ -317,15 +349,13 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                     pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
                     day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                     
-                    r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, is_daily=False)
+                    r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, entry_method, is_daily=False)
                     if r_today: res.extend(r_today)
                 
         else: 
-            # Daily Timeframe
             df = t.history(period="2y", interval="1d", auto_adjust=False)
             if df.empty: return None
             df.index = df.index.tz_localize(None)
-            
             monthly_hist = df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
             
             if scan_state != "4":
@@ -336,7 +366,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                 if hist_df.empty: return None
                 pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
                 
-                res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, is_daily=True)
+                res = evaluate_setup(df, pmh, pml, mss_limit, scan_state, target_month_start, target_month_end, strict_opposite, entry_method, is_daily=True)
             else:
                 months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
                 res = []
@@ -346,7 +376,7 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
                     if hist_df.empty: continue
                     pml, pmh = hist_df['Low'].iloc[-1], hist_df['High'].iloc[-1]
                     
-                    r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, is_daily=True)
+                    r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, entry_method, is_daily=True)
                     if r_month: res.extend(r_month)
 
         if res:
@@ -367,12 +397,18 @@ with st.sidebar:
         "Select Market State", 
         [
             "1. MSS done (Swing high not yet formed)", 
-            "2. Awaiting entry (Price has not yet touched FVG/61%)", 
+            "2. Awaiting entry (Price has not touched Entry Level)", 
             "3. Trade open (Price has touched Entry, SL/Target not hit)", 
             "4. Previous reports (Date Range Backtest Mode)"
         ]
     )
     state_code = scan_state.split(".")[0]
+    
+    entry_method = st.selectbox(
+        "Entry Trigger Logic",
+        ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"],
+        help="Dynamic Discount targets standard 50%-61.8% equilibrium. Breaker Block uses the fractured structural swing for high-momentum shallow retests."
+    )
     
     mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
     mss_limit = st.selectbox("Max Displacement Candles for MSS", mss_options, index=6)
@@ -385,23 +421,22 @@ with st.sidebar:
         today = pd.to_datetime(datetime.now(ist).date())
         
         if timeframe == "15 Minute":
-            st.caption("Note: 15-minute historical data is restricted to the last 60 days by the data provider.")
+            st.caption("Note: 15-minute historical data is restricted to the last 60 trading days.")
+            valid_dates = get_valid_trading_dates()
+            valid_dates_rev = list(reversed(valid_dates))
             
-            min_date = (today - pd.Timedelta(days=59)).date()
-            max_date = today.date()
-            
-            start_date_input = st.date_input("From Date", min_date, min_value=min_date, max_value=max_date)
-            end_date_input = st.date_input("To Date", max_date, min_value=min_date, max_value=max_date)
-            
-            start_date = pd.to_datetime(start_date_input)
-            end_date = pd.to_datetime(end_date_input)
-            
+            if valid_dates_rev:
+                from_date_str = st.selectbox("From Date", valid_dates_rev, index=len(valid_dates_rev)-1, format_func=lambda x: x.strftime('%d %b %Y'))
+                to_date_str = st.selectbox("To Date", valid_dates_rev, index=0, format_func=lambda x: x.strftime('%d %b %Y'))
+                start_date = pd.to_datetime(from_date_str)
+                end_date = pd.to_datetime(to_date_str)
+            else:
+                st.error("Failed to load trading calendar.")
+                start_date, end_date = today, today
         else:
             month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in range(24)]
-            
             from_month_str = st.selectbox("From Month", reversed(month_opts), format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
             to_month_str = st.selectbox("To Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
-            
             start_date = pd.to_datetime(from_month_str)
             end_date = pd.to_datetime(to_month_str) + pd.offsets.MonthEnd(0)
         
@@ -412,14 +447,14 @@ with st.sidebar:
 
 if st.button("🚀 Execute Master Scan", type="primary"):
     if state_code == "4" and start_date > end_date:
-        st.error("Error: 'From Date/Month' must be earlier than or equal to 'To Date/Month'.")
+        st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
     else:
         with st.spinner(f"Scanning Nifty 500 | {timeframe} | State: {state_code}..."):
             tickers = get_nifty500_symbols()
             results = []
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite) for tick in tickers]
+                futures = [executor.submit(scan_ticker, tick, timeframe, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method) for tick in tickers]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res: results.extend(res)
