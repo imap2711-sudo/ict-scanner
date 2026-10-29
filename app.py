@@ -90,6 +90,15 @@ def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
         else:
             return fib_618, "61.8% Fib"
 
+def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
+    risk_dist = abs(entry - stop_loss)
+    if risk_dist == 0: return 0.0
+    qty = risk_amt / risk_dist
+    if direction == 'Bullish':
+        return round(qty * (cmp - entry), 2)
+    else:
+        return round(qty * (entry - cmp), 2)
+
 def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, is_daily=False):
     setups = []
     df_index = df.index.tolist()
@@ -164,6 +173,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
+                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bullish", cmp, entry_price, sweep_low, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -246,6 +256,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
+                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bearish", cmp, entry_price, sweep_high, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -281,27 +292,39 @@ def scan_ticker(ticker, timeframe, mss_limit, scan_state, start_date_str, end_da
             if scan_state != "4":
                 if start_date not in daily_df.index: return None
                 past_days = daily_df.loc[daily_df.index < start_date]
-                if len(past_days) < 1: return None
+                if len(past_days) < 2: return None
                 
+                t_minus_1 = past_days.index[-1]
                 pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
+                pdl_yest, pdh_yest = past_days['Low'].iloc[-2], past_days['High'].iloc[-2]
+                
                 day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                 
                 res_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, is_daily=False)
-                res = res_today or []
+                eval_start_yest = t_minus_1 + pd.Timedelta(hours=12)
+                res_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, eval_start_yest, day_end, strict_opposite, is_daily=False)
+                
+                valid_res_yest = [r for r in (res_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < start_date]
+                res = (res_today or []) + valid_res_yest
 
             else: 
-                # Backtest Engine: Strictly Today's Setup ONLY
                 days_in_range = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)].index
                 all_res = []
                 for d in days_in_range:
                     past_days = daily_df.loc[daily_df.index < d]
-                    if len(past_days) < 1: continue
+                    if len(past_days) < 2: continue
+                    t_minus_1 = past_days.index[-1]
                     pdl_today, pdh_today = past_days['Low'].iloc[-1], past_days['High'].iloc[-1]
+                    pdl_yest, pdh_yest = past_days['Low'].iloc[-2], past_days['High'].iloc[-2]
                     day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                     
                     r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, is_daily=False)
+                    e_start_yest = t_minus_1 + pd.Timedelta(hours=12)
+                    r_yest = evaluate_setup(df, pdh_yest, pdl_yest, mss_limit, scan_state, e_start_yest, day_end, strict_opposite, is_daily=False)
                     
+                    v_res_yest = [r for r in (r_yest or []) if pd.to_datetime(r["Liq. Sweep time"]) < d]
                     if r_today: all_res.extend(r_today)
+                    all_res.extend(v_res_yest)
                 res = all_res
                 
         else: 
