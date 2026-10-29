@@ -112,6 +112,15 @@ def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
         else:
             return fib_618, "61.8% Fib"
 
+def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
+    risk_dist = abs(entry - stop_loss)
+    if risk_dist == 0: return 0.0
+    qty = risk_amt / risk_dist
+    if direction == 'Bullish':
+        return round(qty * (cmp - entry), 2)
+    else:
+        return round(qty * (entry - cmp), 2)
+
 def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, entry_method, is_daily=False):
     setups = []
     df_index = df.index.tolist()
@@ -132,7 +141,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
         post_sweep_df = window_df.loc[sweep_idx:]
         
         if not strict_opposite or post_sweep_df['High'].max() < htf_high:
-            sh_idx, sh_val = get_recent_swing(df, sweep_idx, 'high') # sh_val is the Breaker Block
+            sh_idx, sh_val = get_recent_swing(df, sweep_idx, 'high') 
             if sh_idx:
                 mss_cands = post_sweep_df[post_sweep_df['Close'] > sh_val]
                 if not mss_cands.empty:
@@ -158,20 +167,24 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            # Select Entry Logic
+                            # Dynamic SL & Target Evaluation
                             if entry_method == "Breaker Block (Shallow Pullback)":
                                 entry_price = sh_val
                                 entry_type = "Breaker Block"
+                                breaker_low = df.loc[sh_idx, 'Low']
+                                active_sl = breaker_low * 0.99
                             else:
                                 entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sh_idx, 'Bullish', sweep_low, post_sh_val)
+                                active_sl = sweep_low
                                 
+                            active_target = post_sh_val
                             gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
                             
                             setup_data.update({
                                 "Entry Type": entry_type,
                                 "Entry Level": round(entry_price, 2),
-                                "Stop Loss": round(sweep_low, 2),
-                                "Target": round(post_sh_val, 2),
+                                "Stop Loss": round(active_sl, 2),
+                                "Target": round(active_target, 2),
                                 "Entry Distance": f"{gap_pct}%"
                             })
                             
@@ -187,17 +200,12 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 forward_df = df.loc[entry_idx:]
                                 is_active = True
                                 for idx, row in forward_df.iterrows():
-                                    if row['Low'] <= sweep_low or row['High'] >= post_sh_val:
+                                    if row['Low'] <= active_sl or row['High'] >= active_target:
                                         is_active = False
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
-                                    risk_dist = abs(entry_price - sweep_low)
-                                    if risk_dist > 0:
-                                        qty = 1000 / risk_dist
-                                        setup_data["Floating P&L (₹)"] = round(qty * (cmp - entry_price), 2)
-                                    else:
-                                        setup_data["Floating P&L (₹)"] = 0.0
+                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -206,10 +214,10 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 outcome, highest_seen = "Still Open", entry_price
                                 for idx, row in forward_df.iterrows():
                                     if row['High'] > highest_seen: highest_seen = row['High']
-                                    if row['Low'] <= sweep_low:
+                                    if row['Low'] <= active_sl:
                                         outcome = "SL Hit"
                                         break
-                                    elif row['High'] >= post_sh_val:
+                                    elif row['High'] >= active_target:
                                         outcome = "Target Hit"
                                         break
                                 setup_data["Max Move (%)"] = f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%"
@@ -226,7 +234,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
         post_sweep_df = window_df.loc[sweep_idx:]
         
         if not strict_opposite or post_sweep_df['Low'].min() > htf_low:
-            sl_idx, sl_val = get_recent_swing(df, sweep_idx, 'low') # sl_val is the Breaker Block
+            sl_idx, sl_val = get_recent_swing(df, sweep_idx, 'low')
             if sl_idx:
                 mss_cands = post_sweep_df[post_sweep_df['Close'] < sl_val]
                 if not mss_cands.empty:
@@ -252,20 +260,24 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                             if scan_state == "1":
                                 setups.append(setup_data)
                         else:
-                            # Select Entry Logic
+                            # Dynamic SL & Target Evaluation
                             if entry_method == "Breaker Block (Shallow Pullback)":
                                 entry_price = sl_val
                                 entry_type = "Breaker Block"
+                                breaker_high = df.loc[sl_idx, 'High']
+                                active_sl = breaker_high * 1.01
                             else:
                                 entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sl_idx, 'Bearish', sweep_high, post_sl_val)
+                                active_sl = sweep_high
                                 
+                            active_target = post_sl_val
                             gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
                             
                             setup_data.update({
                                 "Entry Type": entry_type,
                                 "Entry Level": round(entry_price, 2),
-                                "Stop Loss": round(sweep_high, 2),
-                                "Target": round(post_sl_val, 2),
+                                "Stop Loss": round(active_sl, 2),
+                                "Target": round(active_target, 2),
                                 "Entry Distance": f"{gap_pct}%"
                             })
                             
@@ -281,17 +293,12 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 forward_df = df.loc[entry_idx:]
                                 is_active = True
                                 for idx, row in forward_df.iterrows():
-                                    if row['High'] >= sweep_high or row['Low'] <= post_sl_val:
+                                    if row['High'] >= active_sl or row['Low'] <= active_target:
                                         is_active = False
                                         break
                                 if is_active:
                                     setup_data["Entry Distance"] = "Touched (Active)"
-                                    risk_dist = abs(entry_price - sweep_high)
-                                    if risk_dist > 0:
-                                        qty = 1000 / risk_dist
-                                        setup_data["Floating P&L (₹)"] = round(qty * (entry_price - cmp), 2)
-                                    else:
-                                        setup_data["Floating P&L (₹)"] = 0.0
+                                    setup_data["Floating P&L (₹)"] = calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)
                                     setups.append(setup_data)
                                     
                             elif touched_entry and scan_state == "4":
@@ -300,10 +307,10 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 outcome, lowest_seen = "Still Open", entry_price
                                 for idx, row in forward_df.iterrows():
                                     if row['Low'] < lowest_seen: lowest_seen = row['Low']
-                                    if row['High'] >= sweep_high:
+                                    if row['High'] >= active_sl:
                                         outcome = "SL Hit"
                                         break
-                                    elif row['Low'] <= post_sl_val:
+                                    elif row['Low'] <= active_target:
                                         outcome = "Target Hit"
                                         break
                                 setup_data["Max Move (%)"] = f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%"
