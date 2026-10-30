@@ -7,45 +7,42 @@ import concurrent.futures
 from datetime import datetime, timedelta
 import pytz
 import numpy as np
+import os
+import shutil
 
 st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
 
+# --- LOCAL CACHE DIRECTORY SETUP ---
+CACHE_DIR = "nifty500_data_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 @st.cache_data(ttl=86400)
 def get_nifty500_symbols():
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     }
-    
-    # 1. Attempt Official NSE Site
     try:
-        url_nse = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
         session = requests.Session()
         session.get("https://www.nseindia.com", headers=headers, timeout=5)
-        response = session.get(url_nse, headers=headers, timeout=5)
+        response = session.get("https://archives.nseindia.com/content/indices/ind_nifty500list.csv", headers=headers, timeout=5)
         if response.status_code == 200:
             df = pd.read_csv(io.StringIO(response.text))
             return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
-    except Exception:
-        pass
+    except: pass
         
-    # 2. Attempt Reliable GitHub Mirror
     try:
-        url_mirror = "https://raw.githubusercontent.com/dineshkarthik/india-stock-market-data/master/nifty500.csv"
-        df = pd.read_csv(url_mirror)
+        df = pd.read_csv("https://raw.githubusercontent.com/dineshkarthik/india-stock-market-data/master/nifty500.csv")
         if 'Symbol' in df.columns:
             return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
-    except Exception:
-        pass
+    except: pass
         
-    # 3. Local File Fail-Safe
     try:
         df = pd.read_csv("ind_nifty500list.csv")
-        st.sidebar.success("✅ Loaded Nifty 500 from local CSV file.")
         return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
-    except Exception:
-        st.sidebar.error("⚠️ All network fetches failed. Please download 'ind_nifty500list.csv' from NSE and place it in the same folder as app.py.")
+    except:
+        st.sidebar.error("⚠️ Network blocked. Using Top 10 fallback stocks.")
         return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'ITC.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'BAJFINANCE.NS', 'KOTAKBANK.NS']
 
 @st.cache_data(ttl=3600)
@@ -54,10 +51,59 @@ def get_valid_trading_dates():
         df = yf.Ticker('^NSEI').history(period="60d", interval="1d")
         if not df.empty:
             return [d.date() for d in df.index]
-    except Exception:
-        pass
+    except: pass
     today = datetime.now(ist).date()
     return [today - timedelta(days=i) for i in range(60) if (today - timedelta(days=i)).weekday() < 5][::-1]
+
+# --- SMART DELTA CACHING ENGINE ---
+def fetch_market_data(ticker, period, interval):
+    """Loads local CSV if exists, fetches missing recent data, and appends."""
+    file_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}.csv")
+    t = yf.Ticker(ticker)
+    
+    if os.path.exists(file_path):
+        try:
+            local_df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+            if not local_df.empty:
+                last_date = local_df.index[-1]
+                now = datetime.now().replace(tzinfo=None)
+                
+                # If data is stale, fetch a small chunk and append
+                if interval == '15m' and (now - last_date) > timedelta(minutes=15):
+                    recent_df = t.history(period="5d", interval="15m", auto_adjust=False)
+                    if not recent_df.empty:
+                        recent_df.index = recent_df.index.tz_convert('Asia/Kolkata').tz_localize(None) if recent_df.index.tz else recent_df.index.tz_localize(None)
+                        combined = pd.concat([local_df, recent_df])
+                        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+                        
+                        # Keep only the last 60 days to manage file size
+                        sixty_days_ago = combined.index[-1] - pd.Timedelta(days=60)
+                        combined = combined[combined.index >= sixty_days_ago]
+                        combined.to_csv(file_path)
+                        return combined
+                elif interval == '1d' and (now - last_date) > timedelta(hours=24):
+                    recent_df = t.history(period="1mo", interval="1d", auto_adjust=False)
+                    if not recent_df.empty:
+                        recent_df.index = recent_df.index.tz_localize(None)
+                        combined = pd.concat([local_df, recent_df])
+                        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+                        combined.to_csv(file_path)
+                        return combined
+                
+                # If not stale, just return local cache
+                return local_df
+        except Exception:
+            pass # Fall back to full download if local file is corrupted
+
+    # Full fresh download
+    df = t.history(period=period, interval=interval, auto_adjust=False)
+    if not df.empty:
+        if interval == '15m':
+            df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
+        else:
+            df.index = df.index.tz_localize(None)
+        df.to_csv(file_path)
+    return df
 
 def get_recent_swing(df, current_idx, direction='high'):
     try:
@@ -124,7 +170,6 @@ def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
     return round(qty * (cmp - entry), 2) if direction == 'Bullish' else round(qty * (entry - cmp), 2)
 
 def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
-    """Strictly Identifies Base + Leg-out candles nearest to the MSS line"""
     try:
         leg_df = df_15m.loc[sweep_time:mss_time]
         if len(leg_df) < 2: return None, None, 0
@@ -132,8 +177,6 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
         leg_df = leg_df.copy()
         leg_df['Body'] = abs(leg_df['Open'] - leg_df['Close'])
         leg_df['Range'] = leg_df['High'] - leg_df['Low']
-        
-        # Base: Body is less than 50% of the wick-to-wick range
         leg_df['Is_Base'] = (leg_df['Body'] / leg_df['Range'].replace(0, 0.001)) < 0.5
         
         base_candles = leg_df[leg_df['Is_Base']].copy()
@@ -182,7 +225,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
     if window_df.empty: return setups
     time_fmt = '%Y-%m-%d' if is_daily else '%Y-%m-%d %H:%M'
 
-    # Bullish Classic
     bull_sweeps = window_df[window_df['Low'] <= htf_low]
     if not bull_sweeps.empty:
         sweep_idx = bull_sweeps.index[0] 
@@ -247,7 +289,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome})
                                         setups.append(setup_data)
 
-    # Bearish Classic
     bear_sweeps = window_df[window_df['High'] >= htf_high]
     if not bear_sweeps.empty:
         sweep_idx = bear_sweeps.index[0] 
@@ -313,7 +354,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         setups.append(setup_data)
     return setups
 
-# --- ADVANCED MTF (Weekly Sweep -> Daily Confirm -> Unbounded 75m MSS -> 15m Base) ---
+# --- ADVANCED MTF ---
 def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method):
     setups = []
     if d not in daily_htf.index: return setups
@@ -342,7 +383,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
             if not bull_sweeps.empty:
                 sweep_idx_75m = bull_sweeps.index[0]
                 
-                # EXACT DATE DEDUPLICATION: Process only if the 75m sweep originated on the tested daily loop
                 if sweep_idx_75m.date() == d.date():
                     post_sweep_75m = future_75m.loc[sweep_idx_75m:]
                     
@@ -403,7 +443,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
             if not bear_sweeps.empty:
                 sweep_idx_75m = bear_sweeps.index[0]
                 
-                # EXACT DATE DEDUPLICATION: Process only if the 75m sweep originated on the tested daily loop
                 if sweep_idx_75m.date() == d.date():
                     post_sweep_75m = future_75m.loc[sweep_idx_75m:]
                     
@@ -459,7 +498,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
 
 def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method):
     try:
-        t = yf.Ticker(ticker)
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         res = []
@@ -467,12 +505,10 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
         # --- 15 MINUTE ROUTER ---
         if timeframe == "15 Minute":
             if sweep_type == "Daily Liquidity Sweep":
-                daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
-                df = t.history(period="60d", interval="15m", auto_adjust=False)
+                daily_htf = fetch_market_data(ticker, "2y", "1d")
+                df = fetch_market_data(ticker, "60d", "15m")
                 if df.empty or daily_htf.empty: return None
                 
-                df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
-                daily_htf.index = daily_htf.index.tz_localize(None)
                 available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
                 
                 if scan_state != "4":
@@ -493,12 +529,9 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                             r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, entry_method, target_method, is_daily=False)
                             if r_today: res.extend(r_today)
             else:
-                df_15m = t.history(period="60d", interval="15m", auto_adjust=False)
-                daily_htf = t.history(period="2y", interval="1d", auto_adjust=False)
+                df_15m = fetch_market_data(ticker, "60d", "15m")
+                daily_htf = fetch_market_data(ticker, "2y", "1d")
                 if df_15m.empty or daily_htf.empty: return None
-                
-                df_15m.index = df_15m.index.tz_convert('Asia/Kolkata').tz_localize(None) if df_15m.index.tz else df_15m.index.tz_localize(None)
-                daily_htf.index = daily_htf.index.tz_localize(None)
                 
                 resampled = []
                 for date, group in df_15m.groupby(df_15m.index.date):
@@ -513,29 +546,14 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                 days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
                 
                 for d in days_in_range:
-                    current_monday = d - pd.Timedelta(days=d.weekday())
-                    past_htf = weekly_hist.loc[weekly_hist.index < current_monday]
-                    if len(past_htf) < 2: continue
-                    
-                    if sweep_type == "Previous Weekly Candle Liquidity Sweep":
-                        pwl, pwh = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
-                    elif sweep_type == "Weekly Swing High/Low Liquidity Sweep":
-                        _, pwh = get_recent_swing(weekly_hist, current_monday, 'high')
-                        _, pwl = get_recent_swing(weekly_hist, current_monday, 'low')
-                        if not pwh or not pwl: continue
-                    else: continue
-                        
                     r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method)
                     if r_today: res.extend(r_today)
                 
         # --- 75M / 125M ROUTER ---
         elif timeframe in ["75 Minute", "125 Minute"]:
-            df_15m = t.history(period="60d", interval="15m", auto_adjust=False)
-            daily_htf = t.history(period="2y", interval="1d", auto_adjust=False)
+            df_15m = fetch_market_data(ticker, "60d", "15m")
+            daily_htf = fetch_market_data(ticker, "2y", "1d")
             if df_15m.empty or daily_htf.empty: return None
-            
-            df_15m.index = df_15m.index.tz_convert('Asia/Kolkata').tz_localize(None) if df_15m.index.tz else df_15m.index.tz_localize(None)
-            daily_htf.index = daily_htf.index.tz_localize(None)
             
             chunk_size = 5 if timeframe == "75 Minute" else 8
             resampled = []
@@ -551,25 +569,13 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
             days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
             
             for d in days_in_range:
-                current_monday = d - pd.Timedelta(days=d.weekday())
-                past_htf = weekly_hist.loc[weekly_hist.index < current_monday]
-                if len(past_htf) < 2: continue
-                
-                if sweep_type == "Previous Weekly Candle Liquidity Sweep":
-                    pwl, pwh = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
-                else:
-                    _, pwh = get_recent_swing(weekly_hist, current_monday, 'high')
-                    _, pwl = get_recent_swing(weekly_hist, current_monday, 'low')
-                    if not pwh or not pwl: continue
-                    
                 r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method)
                 if r_today: res.extend(r_today)
             
         # --- DAILY ROUTER ---
         else: 
-            df = t.history(period="5y", interval="1d", auto_adjust=False)
+            df = fetch_market_data(ticker, "5y", "1d")
             if df.empty: return None
-            df.index = df.index.tz_localize(None)
             monthly_hist = df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
             
             if scan_state != "4":
@@ -598,7 +604,6 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                     r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
                     if r_month: res.extend(r_month)
 
-        # EXACT DUPLICATE TRADE FILTER (Global Merge based on MSS Time)
         if res:
             unique_res = []
             seen_trades = set()
@@ -622,6 +627,12 @@ st.title("🎯 Ultimate ICT Precision Scanner")
 with st.sidebar:
     st.header("⚙️ Scanner Configurations")
     
+    if st.button("🗑️ Clear Local Disk Cache", type="secondary"):
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+            os.makedirs(CACHE_DIR)
+            st.success("Local cache cleared! Next scan will download fresh data.")
+
     timeframe = st.selectbox("Execution Timeframe", ["15 Minute", "75 Minute", "125 Minute", "Daily"])
     
     scan_state = st.selectbox(
@@ -700,7 +711,7 @@ if st.button("🚀 Execute Master Scan", type="primary"):
     if state_code == "4" and start_date > end_date:
         st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
     else:
-        with st.spinner(f"Scanning Nifty 500 | {timeframe} | State: {state_code}..."):
+        with st.spinner(f"Scanning Nifty 500 | Smart Delta Cache Enabled | State: {state_code}..."):
             tickers = get_nifty500_symbols()
             results = []
             
