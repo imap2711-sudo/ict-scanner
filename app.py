@@ -90,12 +90,10 @@ def fetch_market_data(ticker, period, interval):
                         combined.to_csv(file_path)
                         return combined
                 
-                # If not stale, just return local cache
                 return local_df
         except Exception:
-            pass # Fall back to full download if local file is corrupted
+            pass 
 
-    # Full fresh download
     df = t.history(period=period, interval=interval, auto_adjust=False)
     if not df.empty:
         if interval == '15m':
@@ -170,6 +168,7 @@ def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
     return round(qty * (cmp - entry), 2) if direction == 'Bullish' else round(qty * (entry - cmp), 2)
 
 def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
+    """Strictly Identifies Base + Leg-out candles closest to the MSS line"""
     try:
         leg_df = df_15m.loc[sweep_time:mss_time]
         if len(leg_df) < 2: return None, None, 0
@@ -183,6 +182,7 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
         if base_candles.empty: 
             return None, None, 0
             
+        # Target the base closest to the MSS line
         base_candles['Dist_to_MSS'] = abs(((base_candles['High'] + base_candles['Low']) / 2) - mss_price)
         closest_base_idx = base_candles['Dist_to_MSS'].idxmin()
         
@@ -225,6 +225,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
     if window_df.empty: return setups
     time_fmt = '%Y-%m-%d' if is_daily else '%Y-%m-%d %H:%M'
 
+    # Bullish Classic
     bull_sweeps = window_df[window_df['Low'] <= htf_low]
     if not bull_sweeps.empty:
         sweep_idx = bull_sweeps.index[0] 
@@ -289,6 +290,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome})
                                         setups.append(setup_data)
 
+    # Bearish Classic
     bear_sweeps = window_df[window_df['High'] >= htf_high]
     if not bear_sweeps.empty:
         sweep_idx = bear_sweeps.index[0] 
@@ -354,7 +356,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         setups.append(setup_data)
     return setups
 
-# --- ADVANCED MTF ---
+# --- ADVANCED MTF (Weekly Sweep -> Daily Confirm -> Unbounded 75m MSS -> 15m Base) ---
 def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method):
     setups = []
     if d not in daily_htf.index: return setups
@@ -409,7 +411,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                 setup_data = {
                                                     "Direction": "Bullish", "Stock name": ticker, "CMP": round(cmp, 2),
                                                     "Liq. Sweep Date": sweep_idx_75m.strftime(time_fmt), "MSS Time": mss_idx_75m.strftime(time_fmt),
-                                                    "MSS Line": round(sh_val_75m, 2),
+                                                    "MSS Line (75m/125m)": round(sh_val_75m, 2),
                                                     "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
                                                     "Entry": round(entry_price, 2), "SL": round(active_sl, 2),
                                                     "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
@@ -469,7 +471,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                 setup_data = {
                                                     "Direction": "Bearish", "Stock name": ticker, "CMP": round(cmp, 2),
                                                     "Liq. Sweep Date": sweep_idx_75m.strftime(time_fmt), "MSS Time": mss_idx_75m.strftime(time_fmt),
-                                                    "MSS Line": round(sl_val_75m, 2),
+                                                    "MSS Line (75m/125m)": round(sl_val_75m, 2),
                                                     "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
                                                     "Entry": round(entry_price, 2), "SL": round(active_sl, 2),
                                                     "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
@@ -604,16 +606,26 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                     r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
                     if r_month: res.extend(r_month)
 
+        # EXACT DUPLICATE TRADE FILTER (Strict Price Geometry Merge)
         if res:
             unique_res = []
-            seen_trades = set()
+            seen_mss_lines = set()
+            seen_entries = set()
             for r in res: 
                 if 'Stock name' not in r or r['Stock name'] is None:
                     r['Stock name'] = ticker.replace('.NS', '')
                 
-                trade_signature = (r['Direction'], r.get('MSS Time', ''))
-                if trade_signature not in seen_trades:
-                    seen_trades.add(trade_signature)
+                # Extract strict structural prices for deduplication
+                mss_val = r.get('MSS Line (75m/125m)', r.get('MSS Line', r.get('MSS price (Breaker)', None)))
+                entry_val = r.get('Entry', r.get('Entry Level', None))
+                
+                sig_mss = (r['Direction'], mss_val)
+                sig_entry = (r['Direction'], entry_val)
+                
+                # If either the exact MSS line or exact Entry level was already logged, discard the overlapping setup
+                if sig_mss not in seen_mss_lines and sig_entry not in seen_entries:
+                    seen_mss_lines.add(sig_mss)
+                    seen_entries.add(sig_entry)
                     unique_res.append(r)
             return unique_res
         return None
