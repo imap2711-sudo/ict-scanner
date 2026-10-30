@@ -180,7 +180,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 
                             risk_dist = abs(entry_price - active_sl)
                             
-                            # TARGET RESOLUTION
                             if target_method == "Fixed 1:2 Risk-to-Reward":
                                 active_target = entry_price + (2 * risk_dist)
                             elif target_method == "Monthly Untested Swing":
@@ -246,7 +245,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 
                             risk_dist = abs(entry_price - active_sl)
                             
-                            # TARGET RESOLUTION
                             if target_method == "Fixed 1:2 Risk-to-Reward":
                                 active_target = entry_price - (2 * risk_dist)
                             elif target_method == "Monthly Untested Swing":
@@ -285,6 +283,7 @@ def evaluate_mtf_setup(df_15m, df_htf, htf_high, htf_low, mss_limit, scan_state,
     if window_htf.empty: return setups
     time_fmt = '%Y-%m-%d %H:%M'
 
+    # Bullish MTF
     bull_sweeps = window_htf[window_htf['Low'] <= htf_low]
     if not bull_sweeps.empty:
         sweep_idx_htf = bull_sweeps.index[0]
@@ -309,7 +308,7 @@ def evaluate_mtf_setup(df_15m, df_htf, htf_high, htf_low, mss_limit, scan_state,
                             
                             setup_data = {
                                 "Direction": "Bullish", "Stock name": None, "CMP": round(cmp, 2),
-                                "Sweep Time": sweep_idx_htf.strftime(time_fmt), "MSS Line": round(sh_val_htf, 2),
+                                "Sweep Time": sweep_idx_htf.strftime(time_fmt), "MSS Line (75m/125m)": round(sh_val_htf, 2),
                                 "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
                                 "Entry Level": round(entry_price, 2), "Stop Loss": round(active_sl, 2),
                                 "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
@@ -333,6 +332,7 @@ def evaluate_mtf_setup(df_15m, df_htf, htf_high, htf_low, mss_limit, scan_state,
                                 setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome})
                                 setups.append(setup_data)
 
+    # Bearish MTF
     bear_sweeps = window_htf[window_htf['High'] >= htf_high]
     if not bear_sweeps.empty:
         sweep_idx_htf = bear_sweeps.index[0]
@@ -357,7 +357,7 @@ def evaluate_mtf_setup(df_15m, df_htf, htf_high, htf_low, mss_limit, scan_state,
                             
                             setup_data = {
                                 "Direction": "Bearish", "Stock name": None, "CMP": round(cmp, 2),
-                                "Sweep Time": sweep_idx_htf.strftime(time_fmt), "MSS Line": round(sl_val_htf, 2),
+                                "Sweep Time": sweep_idx_htf.strftime(time_fmt), "MSS Line (75m/125m)": round(sl_val_htf, 2),
                                 "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
                                 "Entry Level": round(entry_price, 2), "Stop Loss": round(active_sl, 2),
                                 "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
@@ -389,7 +389,80 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         
-        if timeframe in ["75 Minute", "125 Minute"]:
+        # --- 15 MINUTE ROUTER ---
+        if timeframe == "15 Minute":
+            if sweep_type == "Daily Liquidity Sweep":
+                # CLASSIC 15m Engine
+                daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
+                df = t.history(period="60d", interval="15m", auto_adjust=False)
+                if df.empty or daily_htf.empty: return None
+                
+                df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
+                daily_htf.index = daily_htf.index.tz_localize(None)
+                available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
+                
+                if scan_state != "4":
+                    if start_date not in available_dates.values: start_date = available_dates.iloc[-1] 
+                    past_htf = daily_htf.loc[daily_htf.index < start_date]
+                    if len(past_htf) < 1: return None
+                    pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                    day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                    res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, entry_method, target_method, is_daily=False)
+                else: 
+                    days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
+                    res = []
+                    for d in days_in_range:
+                        past_htf = daily_htf.loc[daily_htf.index < d]
+                        if len(past_htf) < 1: continue
+                        pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                        day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                        r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, entry_method, target_method, is_daily=False)
+                        if r_today: res.extend(r_today)
+                return res if res else None
+            
+            else:
+                # ADVANCED MTF Engine for 15m (Using 75m MSS Confirmation)
+                df_15m = t.history(period="60d", interval="15m", auto_adjust=False)
+                daily_htf = t.history(period="2y", interval="1d", auto_adjust=False)
+                if df_15m.empty or daily_htf.empty: return None
+                
+                df_15m.index = df_15m.index.tz_convert('Asia/Kolkata').tz_localize(None) if df_15m.index.tz else df_15m.index.tz_localize(None)
+                daily_htf.index = daily_htf.index.tz_localize(None)
+                
+                # Chunk into 75m candles
+                resampled = []
+                for date, group in df_15m.groupby(df_15m.index.date):
+                    for i in range(0, len(group), 5):
+                        chunk = group.iloc[i:i+5]
+                        if len(chunk) > 0:
+                            resampled.append({'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]})
+                df_htf = pd.DataFrame(resampled).set_index('Datetime')
+                
+                weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
+                available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
+                days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
+                
+                res = []
+                for d in days_in_range:
+                    current_monday = d - pd.Timedelta(days=d.weekday())
+                    past_htf = weekly_hist.loc[weekly_hist.index < current_monday]
+                    if len(past_htf) < 2: continue
+                    
+                    if sweep_type == "Previous Weekly Candle Liquidity Sweep":
+                        pwl, pwh = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                    elif sweep_type == "Weekly Swing High/Low Liquidity Sweep":
+                        _, pwh = get_recent_swing(weekly_hist, current_monday, 'high')
+                        _, pwl = get_recent_swing(weekly_hist, current_monday, 'low')
+                        if not pwh or not pwl: continue
+                    else: continue
+                        
+                    day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                    r_today = evaluate_mtf_setup(df_15m, df_htf, pwh, pwl, mss_limit, scan_state, d, day_end, strict_opposite, target_method)
+                    if r_today: res.extend(r_today)
+                return res if res else None
+                
+        # --- 75M / 125M ROUTER ---
+        elif timeframe in ["75 Minute", "125 Minute"]:
             df_15m = t.history(period="60d", interval="15m", auto_adjust=False)
             daily_htf = t.history(period="2y", interval="1d", auto_adjust=False)
             if df_15m.empty or daily_htf.empty: return None
@@ -416,7 +489,7 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                 past_htf = weekly_hist.loc[weekly_hist.index < current_monday]
                 if len(past_htf) < 2: continue
                 
-                if sweep_type == "Previous Week Candle":
+                if sweep_type == "Previous Weekly Candle Liquidity Sweep":
                     pwl, pwh = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
                 else:
                     _, pwh = get_recent_swing(weekly_hist, current_monday, 'high')
@@ -426,34 +499,9 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                 day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
                 r_today = evaluate_mtf_setup(df_15m, df_htf, pwh, pwl, mss_limit, scan_state, d, day_end, strict_opposite, target_method)
                 if r_today: res.extend(r_today)
-                
-        elif timeframe == "15 Minute":
-            daily_htf = t.history(period="1y", interval="1d", auto_adjust=False)
-            df = t.history(period="60d", interval="15m", auto_adjust=False)
-            if df.empty or daily_htf.empty: return None
+            return res if res else None
             
-            df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
-            daily_htf.index = daily_htf.index.tz_localize(None)
-            
-            available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
-            if scan_state != "4":
-                if start_date not in available_dates.values: start_date = available_dates.iloc[-1] 
-                past_htf = daily_htf.loc[daily_htf.index < start_date]
-                if len(past_htf) < 1: return None
-                pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
-                day_end = start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                res = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, day_end, strict_opposite, entry_method, target_method, is_daily=False)
-            else: 
-                days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
-                res = []
-                for d in days_in_range:
-                    past_htf = daily_htf.loc[daily_htf.index < d]
-                    if len(past_htf) < 1: continue
-                    pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
-                    day_end = d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                    r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, d, day_end, strict_opposite, entry_method, target_method, is_daily=False)
-                    if r_today: res.extend(r_today)
-                
+        # --- DAILY ROUTER ---
         else: 
             df = t.history(period="5y", interval="1d", auto_adjust=False)
             if df.empty: return None
@@ -485,11 +533,8 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                     
                     r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
                     if r_month: res.extend(r_month)
+            return res if res else None
 
-        if res:
-            for r in res: r['Stock name'] = ticker.replace('.NS', '')
-            return res
-        return None
     except:
         return None
 
@@ -512,12 +557,24 @@ with st.sidebar:
     )
     state_code = scan_state.split(".")[0]
     
-    # --- UI COMPARTMENTALIZATION ---
-    if timeframe in ["75 Minute", "125 Minute"]:
+    # --- UI DYNAMIC ROUTING ---
+    if timeframe == "15 Minute":
+        sweep_type = st.selectbox(
+            "HTF Liquidity Sweep Level",
+            ["Daily Liquidity Sweep", "Previous Weekly Candle Liquidity Sweep", "Weekly Swing High/Low Liquidity Sweep"]
+        )
+        if sweep_type == "Daily Liquidity Sweep":
+            entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
+            target_method = st.selectbox("Target Strategy", ["Structural Anchor (Momentum Peak)", "Fixed 1:2 Risk-to-Reward"])
+        else:
+            entry_method = "15m S/D Base"
+            st.info("💡 Entry locked to **15m S/D Base** (75m MSS Confirmation) for Weekly Sweeps.")
+            target_method = st.selectbox("Target Strategy", ["Recent Untested 15m Swing", "Fixed 1:2 Risk-to-Reward"])
+
+    elif timeframe in ["75 Minute", "125 Minute"]:
         sweep_type = st.selectbox(
             "HTF Liquidity Sweep Level (Weekly)",
-            ["Previous Week Candle", "Weekly Swing High/Low"],
-            help="For MTF logic, define the Weekly sweep criteria."
+            ["Previous Weekly Candle Liquidity Sweep", "Weekly Swing High/Low Liquidity Sweep"]
         )
         entry_method = "15m S/D Base"
         st.info("💡 Entry locked to **15m S/D Base** for advanced MTF execution.")
@@ -525,25 +582,10 @@ with st.sidebar:
         
     elif timeframe == "Daily":
         sweep_type = None
-        entry_method = st.selectbox(
-            "Entry Trigger Logic",
-            ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"]
-        )
-        target_method = st.selectbox(
-            "Target Strategy",
-            ["Daily Anchor Swing (Momentum Peak)", "Monthly Untested Swing", "Fixed 1:2 Risk-to-Reward"]
-        )
-    else: # 15 Minute
-        sweep_type = None
-        entry_method = st.selectbox(
-            "Entry Trigger Logic",
-            ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"]
-        )
-        target_method = st.selectbox(
-            "Target Strategy",
-            ["Structural Anchor (Momentum Peak)", "Fixed 1:2 Risk-to-Reward"]
-        )
+        entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
+        target_method = st.selectbox("Target Strategy", ["Daily Anchor Swing (Momentum Peak)", "Monthly Untested Swing", "Fixed 1:2 Risk-to-Reward"])
     
+    # Common Options
     mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
     mss_limit = st.selectbox("Max Displacement Candles for MSS", mss_options, index=6)
     strict_opposite = st.checkbox("Reject if Opposite Liquidity Touched", value=False)
