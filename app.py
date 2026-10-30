@@ -68,7 +68,6 @@ def fetch_market_data(ticker, period, interval):
                 last_date = local_df.index[-1]
                 now = datetime.now().replace(tzinfo=None)
                 
-                # If data is stale, fetch a small chunk and append
                 if interval == '15m' and (now - last_date) > timedelta(minutes=15):
                     recent_df = t.history(period="5d", interval="15m", auto_adjust=False)
                     if not recent_df.empty:
@@ -76,7 +75,6 @@ def fetch_market_data(ticker, period, interval):
                         combined = pd.concat([local_df, recent_df])
                         combined = combined[~combined.index.duplicated(keep='last')].sort_index()
                         
-                        # Keep only the last 60 days to manage file size
                         sixty_days_ago = combined.index[-1] - pd.Timedelta(days=60)
                         combined = combined[combined.index >= sixty_days_ago]
                         combined.to_csv(file_path)
@@ -168,7 +166,7 @@ def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
     return round(qty * (cmp - entry), 2) if direction == 'Bullish' else round(qty * (entry - cmp), 2)
 
 def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
-    """Strictly Identifies Base + Leg-out candles closest to the MSS line"""
+    """Strictly Identifies Base + Leg-out candles nearest to the MSS line"""
     try:
         leg_df = df_15m.loc[sweep_time:mss_time]
         if len(leg_df) < 2: return None, None, 0
@@ -182,7 +180,6 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
         if base_candles.empty: 
             return None, None, 0
             
-        # Target the base closest to the MSS line
         base_candles['Dist_to_MSS'] = abs(((base_candles['High'] + base_candles['Low']) / 2) - mss_price)
         closest_base_idx = base_candles['Dist_to_MSS'].idxmin()
         
@@ -269,26 +266,30 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     active_target = post_sh_val
                                     
                                 if active_target > entry_price and active_sl < entry_price:
-                                    gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
-                                    setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"})
-                                    tracking_df = df.iloc[df_index.index(confirm_idx):]
-                                    touched_entry = not tracking_df[tracking_df['Low'] <= entry_price].empty
-                                    
-                                    if not touched_entry and scan_state == "2": setups.append(setup_data)
-                                    elif touched_entry and scan_state == "3":
-                                        entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
-                                        is_active = not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in df.loc[entry_idx:].iterrows())
-                                        if is_active:
-                                            setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
+                                    # 1:1 RR Minimum Validation for Structural Targets
+                                    if target_method != "Fixed 1:2 Risk-to-Reward" and (active_target - entry_price) < risk_dist:
+                                        pass
+                                    else:
+                                        gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
+                                        setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"})
+                                        tracking_df = df.iloc[df_index.index(confirm_idx):]
+                                        touched_entry = not tracking_df[tracking_df['Low'] <= entry_price].empty
+                                        
+                                        if not touched_entry and scan_state == "2": setups.append(setup_data)
+                                        elif touched_entry and scan_state == "3":
+                                            entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
+                                            is_active = not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in df.loc[entry_idx:].iterrows())
+                                            if is_active:
+                                                setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
+                                                setups.append(setup_data)
+                                        elif touched_entry and scan_state == "4":
+                                            outcome, highest_seen = "Still Open", entry_price
+                                            for _, row in df.loc[tracking_df[tracking_df['Low'] <= entry_price].index[0]:].iterrows():
+                                                highest_seen = max(highest_seen, row['High'])
+                                                if row['Low'] <= active_sl: outcome = "SL Hit"; break
+                                                elif row['High'] >= active_target: outcome = "Target Hit"; break
+                                            setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome})
                                             setups.append(setup_data)
-                                    elif touched_entry and scan_state == "4":
-                                        outcome, highest_seen = "Still Open", entry_price
-                                        for _, row in df.loc[tracking_df[tracking_df['Low'] <= entry_price].index[0]:].iterrows():
-                                            highest_seen = max(highest_seen, row['High'])
-                                            if row['Low'] <= active_sl: outcome = "SL Hit"; break
-                                            elif row['High'] >= active_target: outcome = "Target Hit"; break
-                                        setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome})
-                                        setups.append(setup_data)
 
     # Bearish Classic
     bear_sweeps = window_df[window_df['High'] >= htf_high]
@@ -334,26 +335,30 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     active_target = post_sl_val
                                     
                                 if active_target < entry_price and active_sl > entry_price:
-                                    gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
-                                    setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"})
-                                    tracking_df = df.iloc[df_index.index(confirm_idx):]
-                                    touched_entry = not tracking_df[tracking_df['High'] >= entry_price].empty
-                                    
-                                    if not touched_entry and scan_state == "2": setups.append(setup_data)
-                                    elif touched_entry and scan_state == "3":
-                                        entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
-                                        is_active = not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in df.loc[entry_idx:].iterrows())
-                                        if is_active:
-                                            setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
+                                    # 1:1 RR Minimum Validation for Structural Targets
+                                    if target_method != "Fixed 1:2 Risk-to-Reward" and (entry_price - active_target) < risk_dist:
+                                        pass
+                                    else:
+                                        gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
+                                        setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"})
+                                        tracking_df = df.iloc[df_index.index(confirm_idx):]
+                                        touched_entry = not tracking_df[tracking_df['High'] >= entry_price].empty
+                                        
+                                        if not touched_entry and scan_state == "2": setups.append(setup_data)
+                                        elif touched_entry and scan_state == "3":
+                                            entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
+                                            is_active = not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in df.loc[entry_idx:].iterrows())
+                                            if is_active:
+                                                setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
+                                                setups.append(setup_data)
+                                        elif touched_entry and scan_state == "4":
+                                            outcome, lowest_seen = "Still Open", entry_price
+                                            for _, row in df.loc[tracking_df[tracking_df['High'] >= entry_price].index[0]:].iterrows():
+                                                lowest_seen = min(lowest_seen, row['Low'])
+                                                if row['High'] >= active_sl: outcome = "SL Hit"; break
+                                                elif row['Low'] <= active_target: outcome = "Target Hit"; break
+                                            setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome})
                                             setups.append(setup_data)
-                                    elif touched_entry and scan_state == "4":
-                                        outcome, lowest_seen = "Still Open", entry_price
-                                        for _, row in df.loc[tracking_df[tracking_df['High'] >= entry_price].index[0]:].iterrows():
-                                            lowest_seen = min(lowest_seen, row['Low'])
-                                            if row['High'] >= active_sl: outcome = "SL Hit"; break
-                                            elif row['Low'] <= active_target: outcome = "Target Hit"; break
-                                        setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome})
-                                        setups.append(setup_data)
     return setups
 
 # --- ADVANCED MTF (Weekly Sweep -> Daily Confirm -> Unbounded 75m MSS -> 15m Base) ---
@@ -407,35 +412,39 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                             active_target = entry_price + (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
                                             
                                             if active_target > entry_price and active_sl < entry_price:
-                                                gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
-                                                setup_data = {
-                                                    "Direction": "Bullish", "Stock name": ticker, "CMP": round(cmp, 2),
-                                                    "Liq. Sweep Date": sweep_idx_75m.strftime(time_fmt), "MSS Time": mss_idx_75m.strftime(time_fmt),
-                                                    "MSS Line (75m/125m)": round(sh_val_75m, 2),
-                                                    "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
-                                                    "Entry": round(entry_price, 2), "SL": round(active_sl, 2),
-                                                    "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
-                                                }
-                                                
-                                                tracking_df = df_15m.loc[mss_idx_75m:]
-                                                touched_entry = not tracking_df[tracking_df['Low'] <= entry_price].empty
-                                                
-                                                if not touched_entry and scan_state == "2": setups.append(setup_data)
-                                                elif touched_entry and scan_state == "3":
-                                                    entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
-                                                    is_active = not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in df_15m.loc[entry_idx:].iterrows())
-                                                    if is_active:
-                                                        setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
+                                                # 1:1 RR Minimum Validation for Structural Targets
+                                                if target_method != "Fixed 1:2 Risk-to-Reward" and (active_target - entry_price) < risk_dist:
+                                                    pass
+                                                else:
+                                                    gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
+                                                    setup_data = {
+                                                        "Direction": "Bullish", "Stock name": ticker, "CMP": round(cmp, 2),
+                                                        "Liq. Sweep Date": sweep_idx_75m.strftime(time_fmt), "MSS Time": mss_idx_75m.strftime(time_fmt),
+                                                        "MSS Line": round(sh_val_75m, 2),
+                                                        "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
+                                                        "Entry": round(entry_price, 2), "SL": round(active_sl, 2),
+                                                        "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
+                                                    }
+                                                    
+                                                    tracking_df = df_15m.loc[mss_idx_75m:]
+                                                    touched_entry = not tracking_df[tracking_df['Low'] <= entry_price].empty
+                                                    
+                                                    if not touched_entry and scan_state == "2": setups.append(setup_data)
+                                                    elif touched_entry and scan_state == "3":
+                                                        entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
+                                                        is_active = not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in df_15m.loc[entry_idx:].iterrows())
+                                                        if is_active:
+                                                            setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
+                                                            setups.append(setup_data)
+                                                    elif touched_entry and scan_state == "4":
+                                                        entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
+                                                        outcome, highest_seen = "Still Open", entry_price
+                                                        for _, row in df_15m.loc[entry_idx:].iterrows():
+                                                            highest_seen = max(highest_seen, row['High'])
+                                                            if row['Low'] <= active_sl: outcome = "SL Hit"; break
+                                                            elif row['High'] >= active_target: outcome = "Target Hit"; break
+                                                        setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome})
                                                         setups.append(setup_data)
-                                                elif touched_entry and scan_state == "4":
-                                                    entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
-                                                    outcome, highest_seen = "Still Open", entry_price
-                                                    for _, row in df_15m.loc[entry_idx:].iterrows():
-                                                        highest_seen = max(highest_seen, row['High'])
-                                                        if row['Low'] <= active_sl: outcome = "SL Hit"; break
-                                                        elif row['High'] >= active_target: outcome = "Target Hit"; break
-                                                    setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome})
-                                                    setups.append(setup_data)
 
     # Bearish Logic
     if daily_candle['High'] >= pwh:
@@ -467,35 +476,39 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                             active_target = entry_price - (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
                                             
                                             if active_target < entry_price and active_sl > entry_price:
-                                                gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
-                                                setup_data = {
-                                                    "Direction": "Bearish", "Stock name": ticker, "CMP": round(cmp, 2),
-                                                    "Liq. Sweep Date": sweep_idx_75m.strftime(time_fmt), "MSS Time": mss_idx_75m.strftime(time_fmt),
-                                                    "MSS Line (75m/125m)": round(sl_val_75m, 2),
-                                                    "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
-                                                    "Entry": round(entry_price, 2), "SL": round(active_sl, 2),
-                                                    "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
-                                                }
-                                                
-                                                tracking_df = df_15m.loc[mss_idx_75m:]
-                                                touched_entry = not tracking_df[tracking_df['High'] >= entry_price].empty
-                                                
-                                                if not touched_entry and scan_state == "2": setups.append(setup_data)
-                                                elif touched_entry and scan_state == "3":
-                                                    entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
-                                                    is_active = not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in df_15m.loc[entry_idx:].iterrows())
-                                                    if is_active:
-                                                        setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
+                                                # 1:1 RR Minimum Validation for Structural Targets
+                                                if target_method != "Fixed 1:2 Risk-to-Reward" and (entry_price - active_target) < risk_dist:
+                                                    pass
+                                                else:
+                                                    gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
+                                                    setup_data = {
+                                                        "Direction": "Bearish", "Stock name": ticker, "CMP": round(cmp, 2),
+                                                        "Liq. Sweep Date": sweep_idx_75m.strftime(time_fmt), "MSS Time": mss_idx_75m.strftime(time_fmt),
+                                                        "MSS Line (75m/125m)": round(sl_val_75m, 2),
+                                                        "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
+                                                        "Entry": round(entry_price, 2), "SL": round(active_sl, 2),
+                                                        "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
+                                                    }
+                                                    
+                                                    tracking_df = df_15m.loc[mss_idx_75m:]
+                                                    touched_entry = not tracking_df[tracking_df['High'] >= entry_price].empty
+                                                    
+                                                    if not touched_entry and scan_state == "2": setups.append(setup_data)
+                                                    elif touched_entry and scan_state == "3":
+                                                        entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
+                                                        is_active = not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in df_15m.loc[entry_idx:].iterrows())
+                                                        if is_active:
+                                                            setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
+                                                            setups.append(setup_data)
+                                                    elif touched_entry and scan_state == "4":
+                                                        entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
+                                                        outcome, lowest_seen = "Still Open", entry_price
+                                                        for _, row in df_15m.loc[entry_idx:].iterrows():
+                                                            lowest_seen = min(lowest_seen, row['Low'])
+                                                            if row['High'] >= active_sl: outcome = "SL Hit"; break
+                                                            elif row['Low'] <= active_target: outcome = "Target Hit"; break
+                                                        setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome})
                                                         setups.append(setup_data)
-                                                elif touched_entry and scan_state == "4":
-                                                    entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
-                                                    outcome, lowest_seen = "Still Open", entry_price
-                                                    for _, row in df_15m.loc[entry_idx:].iterrows():
-                                                        lowest_seen = min(lowest_seen, row['Low'])
-                                                        if row['High'] >= active_sl: outcome = "SL Hit"; break
-                                                        elif row['Low'] <= active_target: outcome = "Target Hit"; break
-                                                    setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome})
-                                                    setups.append(setup_data)
     return setups
 
 def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method):
@@ -606,7 +619,6 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                     r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
                     if r_month: res.extend(r_month)
 
-        # EXACT DUPLICATE TRADE FILTER (Strict Price Geometry Merge)
         if res:
             unique_res = []
             seen_mss_lines = set()
@@ -615,14 +627,12 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                 if 'Stock name' not in r or r['Stock name'] is None:
                     r['Stock name'] = ticker.replace('.NS', '')
                 
-                # Extract strict structural prices for deduplication
                 mss_val = r.get('MSS Line (75m/125m)', r.get('MSS Line', r.get('MSS price (Breaker)', None)))
                 entry_val = r.get('Entry', r.get('Entry Level', None))
                 
                 sig_mss = (r['Direction'], mss_val)
                 sig_entry = (r['Direction'], entry_val)
                 
-                # If either the exact MSS line or exact Entry level was already logged, discard the overlapping setup
                 if sig_mss not in seen_mss_lines and sig_entry not in seen_entries:
                     seen_mss_lines.add(sig_mss)
                     seen_entries.add(sig_entry)
