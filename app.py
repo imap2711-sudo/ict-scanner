@@ -162,7 +162,7 @@ def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
 def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
     risk_dist = abs(entry - stop_loss)
     if risk_dist == 0: return 0.0
-    qty = risk_amt / risk_dist
+    qty = int(risk_amt / risk_dist)
     return round(qty * (cmp - entry), 2) if direction == 'Bullish' else round(qty * (entry - cmp), 2)
 
 def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
@@ -206,7 +206,6 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
             proximal = zone_candles['Low'].min()
             legout_count = len(post_base[(post_base['Close'] < post_base['Open']) & (~post_base['Is_Base'])])
             
-        # STRICT 1 to 3 LEGOUT CANDLE LIMIT
         if not (1 <= legout_count <= 3):
             return None, None, 0
             
@@ -279,7 +278,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                             entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
                                             is_active = not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in df.loc[entry_idx:].iterrows())
                                             if is_active:
-                                                setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
+                                                setup_data.update({"Entry Distance": "Touched (Active)", "Floating P&L (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
                                                 setups.append(setup_data)
                                         elif touched_entry and scan_state == "4":
                                             outcome, highest_seen = "Still Open", entry_price
@@ -346,7 +345,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                             entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
                                             is_active = not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in df.loc[entry_idx:].iterrows())
                                             if is_active:
-                                                setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
+                                                setup_data.update({"Entry Distance": "Touched (Active)", "Floating P&L (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
                                                 setups.append(setup_data)
                                         elif touched_entry and scan_state == "4":
                                             outcome, lowest_seen = "Still Open", entry_price
@@ -430,7 +429,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                         entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
                                                         is_active = not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in df_15m.loc[entry_idx:].iterrows())
                                                         if is_active:
-                                                            setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
+                                                            setup_data.update({"Entry Distance": "Touched (Active)", "Floating P&L (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
                                                             setups.append(setup_data)
                                                     elif touched_entry and scan_state == "4":
                                                         entry_idx = tracking_df[tracking_df['Low'] <= entry_price].index[0]
@@ -493,7 +492,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                         entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
                                                         is_active = not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in df_15m.loc[entry_idx:].iterrows())
                                                         if is_active:
-                                                            setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
+                                                            setup_data.update({"Entry Distance": "Touched (Active)", "Floating P&L (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
                                                             setups.append(setup_data)
                                                     elif touched_entry and scan_state == "4":
                                                         entry_idx = tracking_df[tracking_df['High'] >= entry_price].index[0]
@@ -744,24 +743,32 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                 df_all = pd.DataFrame(results)
                 
                 if state_code == "4":
-                    def calculate_pnl(row):
+                    def calculate_metrics(row):
                         entry_key, sl_key = 'Entry', 'SL'
-                            
                         risk = risk_per_trade
                         risk_dist = abs(row[entry_key] - row[sl_key])
-                        if risk_dist == 0: return 0
-                        qty = risk / risk_dist
+                        if risk_dist == 0: 
+                            return pd.Series([0.0, 0.0], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
+                        
+                        qty = int(risk / risk_dist)
+                        funds_needed = round(qty * row[entry_key], 2)
                         
                         reward_dist = abs(row['Target'] - row[entry_key])
                         reward_ratio = reward_dist / risk_dist
                         
-                        if row['Outcome'] == 'Target Hit': return risk * reward_ratio
-                        elif row['Outcome'] == 'SL Hit': return -risk
+                        if row['Outcome'] == 'Target Hit': 
+                            pnl = risk * reward_ratio
+                        elif row['Outcome'] == 'SL Hit': 
+                            pnl = -risk
                         else: 
-                            if row['Direction'] == 'Bullish': return qty * (row['CMP'] - row[entry_key])
-                            else: return qty * (row[entry_key] - row['CMP'])
+                            if row['Direction'] == 'Bullish': 
+                                pnl = qty * (row['CMP'] - row[entry_key])
+                            else: 
+                                pnl = qty * (row[entry_key] - row['CMP'])
                                 
-                    df_all['Profit/Loss (₹)'] = df_all.apply(calculate_pnl, axis=1).round(2)
+                        return pd.Series([round(pnl, 2), funds_needed], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
+                                
+                    df_all[['Profit/Loss (₹)', 'Funds Needed (₹)']] = df_all.apply(calculate_metrics, axis=1)
                 
                 df_bull = df_all[df_all['Direction'] == 'Bullish']
                 df_bear = df_all[df_all['Direction'] == 'Bearish']
@@ -779,17 +786,19 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                             
                         if state_code == "4":
                             total_pnl = df['Profit/Loss (₹)'].sum()
+                            total_funds = df['Funds Needed (₹)'].sum()
                             wins = len(df[df['Outcome'] == 'Target Hit'])
                             losses = len(df[df['Outcome'] == 'SL Hit'])
                             open_t = len(df[df['Outcome'] == 'Still Open'])
                             win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
                             
                             st.subheader(f"📊 {title} Backtest Results (Risk: ₹{risk_per_trade}/trade)")
-                            c1, c2, c3, c4 = st.columns(4)
-                            c1.metric("Total Range P&L", f"₹ {total_pnl:,.2f}")
-                            c2.metric("Win Rate (Closed)", f"{win_rate:.1f}%")
-                            c3.metric("Closed Trades", f"{wins}W / {losses}L")
-                            c4.metric("Open Floating Trades", open_t)
+                            c1, c2, c3, c4, c5 = st.columns(5)
+                            c1.metric("Total P&L", f"₹ {total_pnl:,.2f}")
+                            c2.metric("Total Funds Reqd", f"₹ {total_funds:,.2f}")
+                            c3.metric("Win Rate", f"{win_rate:.1f}%")
+                            c4.metric("Closed Trades", f"{wins}W / {losses}L")
+                            c5.metric("Open Trades", open_t)
                             st.divider()
                             
                         st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
