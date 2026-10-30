@@ -174,8 +174,8 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
         leg_df = leg_df.copy()
         leg_df['Body'] = abs(leg_df['Open'] - leg_df['Close'])
         leg_df['Range'] = leg_df['High'] - leg_df['Low']
-        leg_df['Is_Base'] = (leg_df['Body'] / leg_df['Range'].replace(0, 0.001)) < 0.5
         
+        leg_df['Is_Base'] = (leg_df['Body'] / leg_df['Range'].replace(0, 0.001)) < 0.5
         base_candles = leg_df[leg_df['Is_Base']].copy()
         if base_candles.empty: 
             return None, None, 0
@@ -206,7 +206,8 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
             proximal = zone_candles['Low'].min()
             legout_count = len(post_base[(post_base['Close'] < post_base['Open']) & (~post_base['Is_Base'])])
             
-        if legout_count == 0:
+        # STRICT 1 to 3 LEGOUT CANDLE LIMIT
+        if not (1 <= legout_count <= 3):
             return None, None, 0
             
         return proximal, distal, legout_count
@@ -222,7 +223,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
     if window_df.empty: return setups
     time_fmt = '%Y-%m-%d' if is_daily else '%Y-%m-%d %H:%M'
 
-    # Bullish Classic
     bull_sweeps = window_df[window_df['Low'] <= htf_low]
     if not bull_sweeps.empty:
         sweep_idx = bull_sweeps.index[0] 
@@ -266,7 +266,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     active_target = post_sh_val
                                     
                                 if active_target > entry_price and active_sl < entry_price:
-                                    # 1:1 RR Minimum Validation for Structural Targets
                                     if target_method != "Fixed 1:2 Risk-to-Reward" and (active_target - entry_price) < risk_dist:
                                         pass
                                     else:
@@ -291,7 +290,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                             setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome})
                                             setups.append(setup_data)
 
-    # Bearish Classic
     bear_sweeps = window_df[window_df['High'] >= htf_high]
     if not bear_sweeps.empty:
         sweep_idx = bear_sweeps.index[0] 
@@ -335,7 +333,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     active_target = post_sl_val
                                     
                                 if active_target < entry_price and active_sl > entry_price:
-                                    # 1:1 RR Minimum Validation for Structural Targets
                                     if target_method != "Fixed 1:2 Risk-to-Reward" and (entry_price - active_target) < risk_dist:
                                         pass
                                     else:
@@ -361,7 +358,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                             setups.append(setup_data)
     return setups
 
-# --- ADVANCED MTF (Weekly Sweep -> Daily Confirm -> Unbounded 75m MSS -> 15m Base) ---
+# --- ADVANCED MTF ---
 def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method):
     setups = []
     if d not in daily_htf.index: return setups
@@ -401,7 +398,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                 mss_idx_75m = mss_cands.index[0]
                                 proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sh_val_75m, 'Bullish')
                                 
-                                if proximal and distal and legout_count >= 1:
+                                if proximal and distal and 1 <= legout_count <= 3:
                                     _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'high')
                                     if target_val:
                                         entry_price = proximal
@@ -412,7 +409,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                             active_target = entry_price + (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
                                             
                                             if active_target > entry_price and active_sl < entry_price:
-                                                # 1:1 RR Minimum Validation for Structural Targets
                                                 if target_method != "Fixed 1:2 Risk-to-Reward" and (active_target - entry_price) < risk_dist:
                                                     pass
                                                 else:
@@ -420,7 +416,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                     setup_data = {
                                                         "Direction": "Bullish", "Stock name": ticker, "CMP": round(cmp, 2),
                                                         "Liq. Sweep Date": sweep_idx_75m.strftime(time_fmt), "MSS Time": mss_idx_75m.strftime(time_fmt),
-                                                        "MSS Line": round(sh_val_75m, 2),
+                                                        "MSS Line (75m/125m)": round(sh_val_75m, 2),
                                                         "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
                                                         "Entry": round(entry_price, 2), "SL": round(active_sl, 2),
                                                         "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
@@ -465,7 +461,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                 mss_idx_75m = mss_cands.index[0]
                                 proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sl_val_75m, 'Bearish')
                                 
-                                if proximal and distal and legout_count >= 1:
+                                if proximal and distal and 1 <= legout_count <= 3:
                                     _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'low')
                                     if target_val:
                                         entry_price = proximal
@@ -476,7 +472,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                             active_target = entry_price - (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
                                             
                                             if active_target < entry_price and active_sl > entry_price:
-                                                # 1:1 RR Minimum Validation for Structural Targets
                                                 if target_method != "Fixed 1:2 Risk-to-Reward" and (entry_price - active_target) < risk_dist:
                                                     pass
                                                 else:
