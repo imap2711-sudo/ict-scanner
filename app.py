@@ -107,6 +107,7 @@ def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
     return round(qty * (cmp - entry), 2) if direction == 'Bullish' else round(qty * (entry - cmp), 2)
 
 def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
+    """Strictly Identifies Base + Leg-out candles for 75m/125m MTF Engine"""
     try:
         leg_df = df_15m.loc[sweep_time:mss_time]
         if len(leg_df) < 2: return None, None, 0
@@ -114,21 +115,34 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
         leg_df = leg_df.copy()
         leg_df['Body'] = abs(leg_df['Open'] - leg_df['Close'])
         leg_df['Range'] = leg_df['High'] - leg_df['Low']
+        
+        # Base: Body is less than 50% of the wick-to-wick range
         leg_df['Is_Base'] = (leg_df['Body'] / leg_df['Range'].replace(0, 0.001)) < 0.5
         
         base_candles = leg_df[leg_df['Is_Base']]
-        if base_candles.empty: base_candles = leg_df.iloc[0:1]
+        if base_candles.empty: 
+            return None, None, 0
+            
+        last_base_idx = base_candles.index[-1]
+        post_base = leg_df.loc[last_base_idx:]
+        
+        # Exclude the base candle itself from the leg-out count
+        if len(post_base) > 1:
+            post_base = post_base.iloc[1:]
+        else:
+            return None, None, 0
             
         if direction == 'Bullish':
             distal = base_candles['Low'].min()
             proximal = base_candles['High'].max()
-            post_base = leg_df.loc[base_candles.index[-1]:]
             legout_count = len(post_base[(post_base['Close'] > post_base['Open']) & (~post_base['Is_Base'])])
         else:
             distal = base_candles['High'].max()
             proximal = base_candles['Low'].min()
-            post_base = leg_df.loc[base_candles.index[-1]:]
             legout_count = len(post_base[(post_base['Close'] < post_base['Open']) & (~post_base['Is_Base'])])
+            
+        if legout_count == 0:
+            return None, None, 0
             
         return proximal, distal, legout_count
     except:
@@ -162,7 +176,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                         post_sh_idx, post_sh_val, confirm_idx = get_post_mss_swing(df, mss_idx, 'high')
                         setup_data = {
                             "Direction": "Bullish", "Stock name": None, "CMP": round(cmp, 2),
-                            "Liq. Sweep time": sweep_idx.strftime(time_fmt), "MSS time": mss_idx.strftime(time_fmt),
+                            "Liq. Sweep Date": sweep_idx.strftime(time_fmt), "MSS time": mss_idx.strftime(time_fmt),
                             "MSS candles": mss_count, "MSS price (Breaker)": round(sh_val, 2), "Entry Distance": "N/A"
                         }
                         
@@ -187,10 +201,9 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 else:
                                     active_target = post_sh_val
                                     
-                                # Strict Geometry Validation
                                 if active_target > entry_price and active_sl < entry_price:
                                     gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
-                                    setup_data.update({"Entry Type": entry_type, "Entry Level": round(entry_price, 2), "Stop Loss": round(active_sl, 2), "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"})
+                                    setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"})
                                     tracking_df = df.iloc[df_index.index(confirm_idx):]
                                     touched_entry = not tracking_df[tracking_df['Low'] <= entry_price].empty
                                     
@@ -229,7 +242,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                         post_sl_idx, post_sl_val, confirm_idx = get_post_mss_swing(df, mss_idx, 'low')
                         setup_data = {
                             "Direction": "Bearish", "Stock name": None, "CMP": round(cmp, 2),
-                            "Liq. Sweep time": sweep_idx.strftime(time_fmt), "MSS time": mss_idx.strftime(time_fmt),
+                            "Liq. Sweep Date": sweep_idx.strftime(time_fmt), "MSS time": mss_idx.strftime(time_fmt),
                             "MSS candles": mss_count, "MSS price (Breaker)": round(sl_val, 2), "Entry Distance": "N/A"
                         }
                         
@@ -254,10 +267,9 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                 else:
                                     active_target = post_sl_val
                                     
-                                # Strict Geometry Validation
                                 if active_target < entry_price and active_sl > entry_price:
                                     gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
-                                    setup_data.update({"Entry Type": entry_type, "Entry Level": round(entry_price, 2), "Stop Loss": round(active_sl, 2), "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"})
+                                    setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"})
                                     tracking_df = df.iloc[df_index.index(confirm_idx):]
                                     touched_entry = not tracking_df[tracking_df['High'] >= entry_price].empty
                                     
@@ -278,7 +290,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                         setups.append(setup_data)
     return setups
 
-# --- ADVANCED MTF (75M / 125M) ENGINE ---
+# --- ADVANCED MTF (75M / 125M / Weekly) ENGINE ---
 def evaluate_mtf_setup(df_15m, df_htf, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, target_method):
     setups = []
     cmp = df_15m['Close'].iloc[-1]
@@ -298,11 +310,12 @@ def evaluate_mtf_setup(df_15m, df_htf, htf_high, htf_low, mss_limit, scan_state,
                 mss_cands = post_sweep_htf[post_sweep_htf['Close'] > sh_val_htf]
                 if not mss_cands.empty:
                     mss_idx_htf = mss_cands.index[0]
-                    proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_htf, mss_idx_htf, sh_val_htf, 'Bullish')
+                    target_idx, target_val, _ = get_post_mss_swing(df_15m, mss_idx_htf, 'high')
                     
-                    if proximal and distal:
-                        _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_htf, 'high')
-                        if target_val:
+                    if target_idx:
+                        proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_htf, target_idx, sh_val_htf, 'Bullish')
+                        
+                        if proximal and distal and legout_count > 0:
                             entry_price = proximal
                             active_sl = distal * 0.999 
                             risk_dist = abs(entry_price - active_sl)
@@ -310,15 +323,14 @@ def evaluate_mtf_setup(df_15m, df_htf, htf_high, htf_low, mss_limit, scan_state,
                             if risk_dist > 0:
                                 active_target = entry_price + (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
                                 
-                                # Strict Geometry Validation
                                 if active_target > entry_price and active_sl < entry_price:
                                     gap_pct = round(((cmp - entry_price)/cmp)*100, 2)
                                     
                                     setup_data = {
                                         "Direction": "Bullish", "Stock name": None, "CMP": round(cmp, 2),
-                                        "Sweep Time": sweep_idx_htf.strftime(time_fmt), "MSS Line (75m/125m)": round(sh_val_htf, 2),
+                                        "Liq. Sweep Date": sweep_idx_htf.strftime(time_fmt), "MSS Line (75m/125m)": round(sh_val_htf, 2),
                                         "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
-                                        "Entry Level": round(entry_price, 2), "Stop Loss": round(active_sl, 2),
+                                        "Entry": round(entry_price, 2), "SL": round(active_sl, 2),
                                         "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
                                     }
                                     
@@ -352,11 +364,12 @@ def evaluate_mtf_setup(df_15m, df_htf, htf_high, htf_low, mss_limit, scan_state,
                 mss_cands = post_sweep_htf[post_sweep_htf['Close'] < sl_val_htf]
                 if not mss_cands.empty:
                     mss_idx_htf = mss_cands.index[0]
-                    proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_htf, mss_idx_htf, sl_val_htf, 'Bearish')
+                    target_idx, target_val, _ = get_post_mss_swing(df_15m, mss_idx_htf, 'low')
                     
-                    if proximal and distal:
-                        _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_htf, 'low')
-                        if target_val:
+                    if target_idx:
+                        proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_htf, target_idx, sl_val_htf, 'Bearish')
+                        
+                        if proximal and distal and legout_count > 0:
                             entry_price = proximal
                             active_sl = distal * 1.001 
                             risk_dist = abs(entry_price - active_sl)
@@ -364,15 +377,14 @@ def evaluate_mtf_setup(df_15m, df_htf, htf_high, htf_low, mss_limit, scan_state,
                             if risk_dist > 0:
                                 active_target = entry_price - (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
                                 
-                                # Strict Geometry Validation
                                 if active_target < entry_price and active_sl > entry_price:
                                     gap_pct = round(((entry_price - cmp)/cmp)*100, 2)
                                     
                                     setup_data = {
                                         "Direction": "Bearish", "Stock name": None, "CMP": round(cmp, 2),
-                                        "Sweep Time": sweep_idx_htf.strftime(time_fmt), "MSS Line (75m/125m)": round(sl_val_htf, 2),
+                                        "Liq. Sweep Date": sweep_idx_htf.strftime(time_fmt), "MSS Line (75m/125m)": round(sl_val_htf, 2),
                                         "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base",
-                                        "Entry Level": round(entry_price, 2), "Stop Loss": round(active_sl, 2),
+                                        "Entry": round(entry_price, 2), "SL": round(active_sl, 2),
                                         "Target": round(active_target, 2), "Entry Distance": f"{gap_pct}%"
                                     }
                                     
@@ -539,7 +551,6 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                     r_month = evaluate_setup(df, pmh, pml, mss_limit, scan_state, m_start, m_end, strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
                     if r_month: res.extend(r_month)
 
-        # Inject the missing Ticker Symbol here before returning
         if res:
             for r in res: 
                 r['Stock name'] = ticker.replace('.NS', '')
@@ -596,7 +607,6 @@ with st.sidebar:
         entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
         target_method = st.selectbox("Target Strategy", ["Daily Anchor Swing (Momentum Peak)", "Monthly Untested Swing", "Fixed 1:2 Risk-to-Reward"])
     
-    # Common Options
     mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
     mss_limit = st.selectbox("Max Displacement Candles for MSS", mss_options, index=6)
     strict_opposite = st.checkbox("Reject if Opposite Liquidity Touched", value=False)
@@ -652,27 +662,21 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                 
                 if state_code == "4":
                     def calculate_pnl(row):
-                        if 'Entry Level' in row:
-                            entry_key, sl_key = 'Entry Level', 'Stop Loss'
-                        else:
-                            entry_key, sl_key = 'Entry Level (Proximal)', 'Stop Loss (Distal)'
-                            
                         risk = risk_per_trade
-                        risk_dist = abs(row[entry_key] - row[sl_key])
+                        risk_dist = abs(row['Entry'] - row['SL'])
                         if risk_dist == 0: return 0
                         qty = risk / risk_dist
                         
-                        target_key = 'Target' if 'Target' in row else 'Target (15m Swing)'
-                        reward_dist = abs(row[target_key] - row[entry_key])
+                        reward_dist = abs(row['Target'] - row['Entry'])
                         reward_ratio = reward_dist / risk_dist
                         
                         if row['Outcome'] == 'Target Hit': return risk * reward_ratio
                         elif row['Outcome'] == 'SL Hit': return -risk
                         else: 
-                            if row['Direction'] == 'Bullish': return qty * (row['CMP'] - row[entry_key])
-                            else: return qty * (row[entry_key] - row['CMP'])
+                            if row['Direction'] == 'Bullish': return qty * (row['CMP'] - row['Entry'])
+                            else: return qty * (row['Entry'] - row['CMP'])
                                 
-                    df_all['Trade P&L (₹)'] = df_all.apply(calculate_pnl, axis=1).round(2)
+                    df_all['Profit/Loss (₹)'] = df_all.apply(calculate_pnl, axis=1).round(2)
                 
                 df_bull = df_all[df_all['Direction'] == 'Bullish']
                 df_bear = df_all[df_all['Direction'] == 'Bearish']
@@ -683,14 +687,13 @@ if st.button("🚀 Execute Master Scan", type="primary"):
                     if df.empty:
                         st.info(f"No {title} Setups.")
                     else:
-                        # Move the stock name to the front for better UX
                         cols = df.columns.tolist()
                         if 'Stock name' in cols:
                             cols.insert(0, cols.pop(cols.index('Stock name')))
                             df = df[cols]
                             
                         if state_code == "4":
-                            total_pnl = df['Trade P&L (₹)'].sum()
+                            total_pnl = df['Profit/Loss (₹)'].sum()
                             wins = len(df[df['Outcome'] == 'Target Hit'])
                             losses = len(df[df['Outcome'] == 'SL Hit'])
                             open_t = len(df[df['Outcome'] == 'Still Open'])
