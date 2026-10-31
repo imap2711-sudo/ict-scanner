@@ -492,7 +492,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                                     setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method, weekly_touch_limit, selected_intraday_time):
+def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method, weekly_touch_limit, selected_sim_date, selected_intraday_time):
     try:
         target_entry_start = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         target_entry_end = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
@@ -505,10 +505,10 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
             if df_15m.empty or daily_htf.empty: return None
             
             if scan_state in ["1", "2", "3"] and selected_intraday_time != "Current Time (Live)":
-                latest_date = df_15m.index[-1].date()
-                target_dt = pd.to_datetime(f"{latest_date} {selected_intraday_time}")
+                target_dt = pd.to_datetime(f"{selected_sim_date} {selected_intraday_time}")
                 df_15m = df_15m[df_15m.index <= target_dt]
-                if df_15m.empty: return None
+                daily_htf = daily_htf[daily_htf.index <= pd.to_datetime(selected_sim_date)]
+                if df_15m.empty or daily_htf.empty: return None
 
         if timeframe == "15 Minute":
             if sweep_type == "Daily Liquidity Sweep":
@@ -606,14 +606,19 @@ with st.container():
         state_code = scan_state.split(".")[0]
         
         if state_code in ["1", "2", "3"] and timeframe != "Daily":
-            time_opts = ["Current Time (Live)"]
-            for h in range(9, 16):
-                for m in (0, 15, 30, 45):
-                    if h == 9 and m < 15: continue
-                    if h == 15 and m > 30: continue
-                    time_opts.append(f"{h:02d}:{m:02d}")
-            selected_intraday_time = st.selectbox("Simulate Specific Time Today", time_opts)
+            sim_c1, sim_c2 = st.columns(2)
+            with sim_c1:
+                selected_sim_date = st.date_input("Simulation Date", value=datetime.now(ist).date())
+            with sim_c2:
+                time_opts = ["Current Time (Live)"]
+                for h in range(9, 16):
+                    for m in (0, 15, 30, 45):
+                        if h == 9 and m < 15: continue
+                        if h == 15 and m > 30: continue
+                        time_opts.append(f"{h:02d}:{m:02d}")
+                selected_intraday_time = st.selectbox("Specific Time", time_opts)
         else:
+            selected_sim_date = datetime.now(ist).date()
             selected_intraday_time = "Current Time (Live)"
 
 with st.container():
@@ -673,7 +678,8 @@ if state_code == "4":
             start_date, end_date = pd.to_datetime(from_month_str), pd.to_datetime(to_month_str) + pd.offsets.MonthEnd(0)
         risk_per_trade = st.number_input("Risk per Trade (₹)", min_value=100, value=1000, step=100)
 else:
-    start_date = end_date = pd.to_datetime(datetime.now(ist).date())
+    start_date = pd.to_datetime(selected_sim_date)
+    end_date = pd.to_datetime(selected_sim_date)
     risk_per_trade = 1000
 
 st.write("")
@@ -700,7 +706,7 @@ if execute_scan:
             results = []
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                futures = {executor.submit(scan_ticker, tick, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit, selected_intraday_time): tick for tick in tickers}
+                futures = {executor.submit(scan_ticker, tick, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit, selected_sim_date, selected_intraday_time): tick for tick in tickers}
                 
                 completed = 0
                 for f in concurrent.futures.as_completed(futures):
@@ -767,5 +773,5 @@ if st.session_state.get('scan_run', False):
                     st.write("")
                 st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
 
-        with tab1: render_tab_content(df_bull, "Bullish")
-        with tab2: render_tab_content(df_bear, "Bearish")
+        with tab1: render_tab_content(df_bull, "Demand")
+        with tab2: render_tab_content(df_bear, "Supply")
