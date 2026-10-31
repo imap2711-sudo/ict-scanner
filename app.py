@@ -1,13 +1,125 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import requests
+import io
 import concurrent.futures
 from datetime import datetime, timedelta
 import pytz
 import numpy as np
+import os
+import shutil
 
-st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
+# --- PAGE SETUP & CUSTOM CSS ---
+st.set_page_config(page_title="ICT Precision Scanner", layout="centered", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
+
+custom_css = """
+<style>
+    /* Main Backgrounds */
+    .stApp {
+        background-color: #0B1121;
+        color: #E2E8F0;
+    }
+    
+    /* Header & Typography */
+    h1, h2, h3, p, label {
+        color: #E2E8F0 !important;
+        font-family: 'Inter', sans-serif !important;
+    }
+    
+    /* Hide Default Streamlit Chrome */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    
+    /* Card Containers */
+    div[data-testid="stVerticalBlock"] > div[style*="flex-direction: column;"] > div[data-testid="stVerticalBlock"] {
+        background-color: #161E2E;
+        padding: 20px;
+        border-radius: 12px;
+        border: 1px solid #1E293B;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    }
+    
+    /* Input Fields & Dropdowns */
+    .stSelectbox div[data-baseweb="select"] > div, .stNumberInput input, .stDateInput input {
+        background-color: #0F172A !important;
+        color: white !important;
+        border: 1px solid #334155 !important;
+        border-radius: 8px !important;
+    }
+    
+    /* Sliders */
+    .stSlider div[data-baseweb="slider"] div[data-testid="stTickBar"] > div {
+        background-color: #10B981 !important;
+    }
+    
+    /* Primary Execute Button */
+    button[kind="primary"] {
+        background-color: #EF4444 !important;
+        color: white !important;
+        font-weight: 600 !important;
+        border-radius: 8px !important;
+        border: none !important;
+        padding: 10px !important;
+        width: 100%;
+    }
+    button[kind="primary"]:hover {
+        background-color: #DC2626 !important;
+    }
+    
+    /* Secondary Action Button */
+    button[kind="secondary"] {
+        background-color: #3B82F6 !important;
+        color: white !important;
+        border-radius: 8px !important;
+        border: none !important;
+        font-weight: 500 !important;
+    }
+    button[kind="secondary"]:hover {
+        background-color: #2563EB !important;
+    }
+    
+    /* Custom Tabs (Demand/Supply Style) */
+    div[data-baseweb="tab-list"] {
+        gap: 10px;
+        background-color: transparent;
+    }
+    div[data-baseweb="tab"] {
+        background-color: #1E293B;
+        border-radius: 8px !important;
+        padding: 10px 20px !important;
+        border: 1px solid #334155;
+        color: white !important;
+        font-weight: 600;
+        margin: 0 !important;
+        flex: 1;
+        justify-content: center;
+    }
+    /* Active Bullish Tab */
+    div[data-baseweb="tab"][aria-selected="true"]:nth-child(1) {
+        background-color: #10B981 !important;
+        border-color: #059669 !important;
+    }
+    /* Active Bearish Tab */
+    div[data-baseweb="tab"][aria-selected="true"]:nth-child(2) {
+        background-color: #EF4444 !important;
+        border-color: #DC2626 !important;
+    }
+    
+    /* Dataframes */
+    [data-testid="stDataFrame"] {
+        background-color: #0F172A;
+        border-radius: 8px;
+    }
+</style>
+"""
+st.markdown(custom_css, unsafe_allow_html=True)
+
+# --- CORE LOGIC & CACHE (HIGH PRECISION VERSION) ---
+CACHE_DIR = "nifty500_data_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 @st.cache_data(ttl=86400)
 def get_nifty500_symbols():
@@ -23,33 +135,41 @@ def get_valid_trading_dates():
     today = datetime.now(ist).date()
     return [today - timedelta(days=i) for i in range(60) if (today - timedelta(days=i)).weekday() < 5][::-1]
 
-# --- LIGHTNING FAST BULK DATA ENGINE ---
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_bulk_data(tickers, tf_category):
-    """Downloads all 500 stocks in a single vectorized network call."""
-    if tf_category == "intraday":
-        d15 = yf.download(tickers, period="60d", interval="15m", group_by="ticker", threads=True, auto_adjust=False, progress=False)
-        d1 = yf.download(tickers, period="2y", interval="1d", group_by="ticker", threads=True, auto_adjust=False, progress=False)
-        return d15, d1
-    else:
-        d1 = yf.download(tickers, period="5y", interval="1d", group_by="ticker", threads=True, auto_adjust=False, progress=False)
-        return None, d1
-
-def get_ticker_data(bulk_df, ticker, interval):
-    """Extracts lightning-fast preloaded data for a specific ticker."""
-    try:
-        if isinstance(bulk_df.columns, pd.MultiIndex):
-            if ticker in bulk_df.columns.levels[0]:
-                df = bulk_df[ticker].copy().dropna(how='all')
-            else: return pd.DataFrame()
-        else:
-            df = bulk_df.copy().dropna(how='all')
-            
-        if not df.empty:
-            if interval == '15m': df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
-            else: df.index = df.index.tz_localize(None)
-        return df
-    except: return pd.DataFrame()
+def fetch_market_data(ticker, period, interval):
+    file_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}.csv")
+    t = yf.Ticker(ticker)
+    if os.path.exists(file_path):
+        try:
+            local_df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+            if not local_df.empty:
+                last_date = local_df.index[-1]
+                now = datetime.now().replace(tzinfo=None)
+                if interval == '15m' and (now - last_date) > timedelta(minutes=15):
+                    recent_df = t.history(period="5d", interval="15m", auto_adjust=False)
+                    if not recent_df.empty:
+                        recent_df.index = recent_df.index.tz_convert('Asia/Kolkata').tz_localize(None) if recent_df.index.tz else recent_df.index.tz_localize(None)
+                        combined = pd.concat([local_df, recent_df])
+                        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+                        sixty_days_ago = combined.index[-1] - pd.Timedelta(days=60)
+                        combined = combined[combined.index >= sixty_days_ago]
+                        combined.to_csv(file_path)
+                        return combined
+                elif interval == '1d' and (now - last_date) > timedelta(hours=24):
+                    recent_df = t.history(period="1mo", interval="1d", auto_adjust=False)
+                    if not recent_df.empty:
+                        recent_df.index = recent_df.index.tz_localize(None)
+                        combined = pd.concat([local_df, recent_df])
+                        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+                        combined.to_csv(file_path)
+                        return combined
+                return local_df
+        except: pass 
+    df = t.history(period=period, interval=interval, auto_adjust=False)
+    if not df.empty:
+        if interval == '15m': df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
+        else: df.index = df.index.tz_localize(None)
+        df.to_csv(file_path)
+    return df
 
 def get_recent_swing(df, current_idx, direction='high'):
     try:
@@ -175,32 +295,24 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                             tracking_df = df.iloc[start_tracking_idx + 1:]
                                             touched_entry_df = tracking_df[tracking_df['Low'] <= entry_price]
                                             
-                                            if touched_entry_df.empty and scan_state == "2": 
-                                                setups.append(setup_data)
+                                            if touched_entry_df.empty and scan_state == "2": setups.append(setup_data)
                                             elif not touched_entry_df.empty:
                                                 entry_idx = touched_entry_df.index[0]
                                                 setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                 if scan_state == "3":
                                                     end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                     entry_day_df = df.loc[entry_idx : end_of_day]
-                                                    
-                                                    # FAST C-OPTIMIZED LOOP
-                                                    is_active = not any((row.Low <= active_sl or row.High >= active_target) for row in entry_day_df.itertuples())
-                                                    if is_active:
+                                                    if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
                                                         setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
                                                         setups.append(setup_data)
                                                 elif scan_state == "4":
                                                     end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                     entry_day_df = df.loc[entry_idx:end_of_day]
-                                                    
                                                     outcome, exit_price, highest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                    
-                                                    # FAST C-OPTIMIZED LOOP
-                                                    for row in entry_day_df.itertuples():
-                                                        highest_seen = max(highest_seen, row.High)
-                                                        if row.Low <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                        elif row.High >= active_target: outcome, exit_price = "Target Hit", active_target; break
-                                                        
+                                                    for idx, row in entry_day_df.iterrows():
+                                                        highest_seen = max(highest_seen, row['High'])
+                                                        if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                        elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
                                                     setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
                                                     setups.append(setup_data)
 
@@ -247,23 +359,17 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                                 if scan_state == "3":
                                                     end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                     entry_day_df = df.loc[entry_idx : end_of_day]
-                                                    
-                                                    # FAST C-OPTIMIZED LOOP
-                                                    is_active = not any((row.High >= active_sl or row.Low <= active_target) for row in entry_day_df.itertuples())
-                                                    if is_active:
+                                                    if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
                                                         setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
                                                         setups.append(setup_data)
                                                 elif scan_state == "4":
                                                     end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                     entry_day_df = df.loc[entry_idx:end_of_day]
-                                                    
                                                     outcome, exit_price, lowest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                    
-                                                    # FAST C-OPTIMIZED LOOP
-                                                    for row in entry_day_df.itertuples():
-                                                        lowest_seen = min(lowest_seen, row.Low)
-                                                        if row.High >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                        elif row.Low <= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                    for idx, row in entry_day_df.iterrows():
+                                                        lowest_seen = min(lowest_seen, row['Low'])
+                                                        if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                        elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
                                                     setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
                                                     setups.append(setup_data)
     return setups
@@ -338,24 +444,17 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                             if scan_state == "3":
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx : end_of_day]
-                                                                
-                                                                # FAST C-OPTIMIZED LOOP
-                                                                is_active = not any((row.Low <= active_sl or row.High >= active_target) for row in entry_day_df.itertuples())
-                                                                if is_active:
+                                                                if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
                                                                     setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
                                                                     setups.append(setup_data)
                                                             elif scan_state == "4":
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx:end_of_day]
-                                                                
                                                                 outcome, exit_price, highest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                                
-                                                                # FAST C-OPTIMIZED LOOP
-                                                                for row in entry_day_df.itertuples():
-                                                                    highest_seen = max(highest_seen, row.High)
-                                                                    if row.Low <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                                    elif row.High >= active_target: outcome, exit_price = "Target Hit", active_target; break
-                                                                    
+                                                                for idx, row in entry_day_df.iterrows():
+                                                                    highest_seen = max(highest_seen, row['High'])
+                                                                    if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                                    elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
                                                                 setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
                                                                 setups.append(setup_data)
 
@@ -401,68 +500,75 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                             if scan_state == "3":
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx : end_of_day]
-                                                                
-                                                                # FAST C-OPTIMIZED LOOP
-                                                                is_active = not any((row.High >= active_sl or row.Low <= active_target) for row in entry_day_df.itertuples())
-                                                                if is_active:
+                                                                if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
                                                                     setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
                                                                     setups.append(setup_data)
                                                             elif scan_state == "4":
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx:end_of_day]
-                                                                
                                                                 outcome, exit_price, lowest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                                
-                                                                # FAST C-OPTIMIZED LOOP
-                                                                for row in entry_day_df.itertuples():
-                                                                    lowest_seen = min(lowest_seen, row.Low)
-                                                                    if row.High >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                                    elif row.Low <= active_target: outcome, exit_price = "Target Hit", active_target; break
-                                                                    
+                                                                for idx, row in entry_day_df.iterrows():
+                                                                    lowest_seen = min(lowest_seen, row['Low'])
+                                                                    if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                                    elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
                                                                 setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
                                                                 setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, df_15m_all, daily_htf_all, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method, weekly_touch_limit):
+def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method, weekly_touch_limit):
     try:
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         res = []
-        
-        df = get_ticker_data(df_15m_all, ticker, "15m") if df_15m_all is not None else pd.DataFrame()
-        daily_htf = get_ticker_data(daily_htf_all, ticker, "1d")
-        if daily_htf.empty: return None
-
         if timeframe == "15 Minute":
-            if df.empty: return None
-            available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
-            if scan_state != "4":
-                if start_date not in available_dates.values: start_date = available_dates.iloc[-1] 
-                past_htf = daily_htf.loc[daily_htf.index < start_date]
-                if len(past_htf) >= 1:
-                    pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
-                    r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), strict_opposite, entry_method, target_method, is_daily=False)
-                    if r_today: res.extend(r_today)
-            else: 
+            if sweep_type == "Daily Liquidity Sweep":
+                daily_htf = fetch_market_data(ticker, "2y", "1d")
+                df = fetch_market_data(ticker, "60d", "15m")
+                if df.empty or daily_htf.empty: return None
+                available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
+                if scan_state != "4":
+                    if start_date not in available_dates.values: start_date = available_dates.iloc[-1] 
+                    past_htf = daily_htf.loc[daily_htf.index < start_date]
+                    if len(past_htf) >= 1:
+                        pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                        r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), strict_opposite, entry_method, target_method, is_daily=False)
+                        if r_today: res.extend(r_today)
+                else: 
+                    days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
+                    for d in days_in_range:
+                        past_htf = daily_htf.loc[daily_htf.index < d]
+                        if len(past_htf) >= 1:
+                            r_today = evaluate_setup(df, past_htf['High'].iloc[-1], past_htf['Low'].iloc[-1], mss_limit, scan_state, d, d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), strict_opposite, entry_method, target_method, is_daily=False)
+                            if r_today: res.extend(r_today)
+            else:
+                df_15m = fetch_market_data(ticker, "60d", "15m")
+                daily_htf = fetch_market_data(ticker, "2y", "1d")
+                if df_15m.empty or daily_htf.empty: return None
+                resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df_15m.groupby(df_15m.index.date) for i in range(0, len(group), 5) if len(chunk := group.iloc[i:i+5]) > 0]
+                df_htf = pd.DataFrame(resampled).set_index('Datetime')
+                weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
+                available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
                 days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
                 for d in days_in_range:
-                    past_htf = daily_htf.loc[daily_htf.index < d]
-                    if len(past_htf) >= 1:
-                        r_today = evaluate_setup(df, past_htf['High'].iloc[-1], past_htf['Low'].iloc[-1], mss_limit, scan_state, d, d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), strict_opposite, entry_method, target_method, is_daily=False)
-                        if r_today: res.extend(r_today)
+                    r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit)
+                    if r_today: res.extend(r_today)
         elif timeframe in ["75 Minute", "125 Minute"]:
-            if df.empty: return None
+            df_15m = fetch_market_data(ticker, "60d", "15m")
+            daily_htf = fetch_market_data(ticker, "2y", "1d")
+            if df_15m.empty or daily_htf.empty: return None
             chunk_size = 5 if timeframe == "75 Minute" else 8
-            resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df.groupby(df.index.date) for i in range(0, len(group), chunk_size) if len(chunk := group.iloc[i:i+chunk_size]) > 0]
+            resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df_15m.groupby(df_15m.index.date) for i in range(0, len(group), chunk_size) if len(chunk := group.iloc[i:i+chunk_size]) > 0]
             df_htf = pd.DataFrame(resampled).set_index('Datetime')
             weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
-            available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
+            available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
             days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
             for d in days_in_range:
-                r_today = evaluate_mtf_weekly_setup(ticker, df, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit)
+                r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit)
                 if r_today: res.extend(r_today)
         else: 
-            monthly_hist = daily_htf.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
+            df = fetch_market_data(ticker, "5y", "1d")
+            if df.empty: return None
+            monthly_hist = df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
             if scan_state != "4":
                 target_month_start = start_date.replace(day=1)
                 hist_df = monthly_hist.loc[monthly_hist.index < target_month_start]
@@ -470,7 +576,7 @@ def scan_ticker(ticker, df_15m_all, daily_htf_all, timeframe, sweep_type, mss_li
                 m_idx = hist_df.index[-1]
                 _, monthly_sh_val = get_recent_swing(monthly_hist, m_idx, 'high')
                 _, monthly_sl_val = get_recent_swing(monthly_hist, m_idx, 'low')
-                r_today = evaluate_setup(daily_htf, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, target_month_start, target_month_start + pd.offsets.MonthEnd(0), strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
+                r_today = evaluate_setup(df, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, target_month_start, target_month_start + pd.offsets.MonthEnd(0), strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
                 if r_today: res.extend(r_today)
             else:
                 months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
@@ -480,7 +586,7 @@ def scan_ticker(ticker, df_15m_all, daily_htf_all, timeframe, sweep_type, mss_li
                     m_idx = hist_df.index[-1]
                     _, monthly_sh_val = get_recent_swing(monthly_hist, m_idx, 'high')
                     _, monthly_sl_val = get_recent_swing(monthly_hist, m_idx, 'low')
-                    r_month = evaluate_setup(daily_htf, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, m_start, m_start + pd.offsets.MonthEnd(0), strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
+                    r_month = evaluate_setup(df, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, m_start, m_start + pd.offsets.MonthEnd(0), strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
                     if r_month: res.extend(r_month)
 
         if res:
@@ -495,125 +601,154 @@ def scan_ticker(ticker, df_15m_all, daily_htf_all, timeframe, sweep_type, mss_li
         return None
     except: return None
 
-# --- STREAMLIT UI ---
-st.title("🎯 Ultimate ICT Precision Scanner")
 
-with st.sidebar:
-    st.header("⚙️ Scanner Configurations")
-    
-    timeframe = st.selectbox("Execution Timeframe", ["15 Minute", "75 Minute", "125 Minute", "Daily"])
-    scan_state = st.selectbox(
-        "Select Market State", 
-        ["1. MSS done (Swing high not yet formed)", "2. Awaiting entry (Price has not touched Entry Level)", "3. Trade open (Price has touched Entry, SL/Target not hit)", "4. Previous reports (Date Range Backtest Mode)"]
-    )
-    state_code = scan_state.split(".")[0]
-    
+# --- MAIN UI LAYOUT ---
+st.markdown("<h2>⚡ Ultimate ICT Precision Screener</h2>", unsafe_allow_html=True)
+st.caption("Locate Institutional Supply & Demand Zones")
+
+# Custom Control Grid
+with st.container():
+    c1, c2 = st.columns(2)
+    with c1:
+        timeframe = st.selectbox("Execution Timeframe", ["15 Minute", "75 Minute", "125 Minute", "Daily"])
+    with c2:
+        scan_state = st.selectbox(
+            "Select Market State", 
+            ["1. MSS done (Swing high not yet formed)", "2. Awaiting entry (Price has not touched Entry Level)", "3. Trade open (Price has touched Entry, SL/Target not hit)", "4. Previous reports (Date Range Backtest Mode)"]
+        )
+        state_code = scan_state.split(".")[0]
+
+with st.container():
     if timeframe == "15 Minute":
         sweep_type = st.selectbox("HTF Liquidity Sweep Level", ["Daily Liquidity Sweep", "Previous Weekly Candle Liquidity Sweep", "Weekly Swing High/Low Liquidity Sweep"])
         if sweep_type == "Daily Liquidity Sweep":
-            entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
-            target_method = st.selectbox("Target Strategy", ["Structural Anchor (Momentum Peak)", "Fixed 1:2 Risk-to-Reward"])
+            c3, c4 = st.columns(2)
+            with c3: entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
+            with c4: target_method = st.selectbox("Target Strategy", ["Structural Anchor (Momentum Peak)", "Fixed 1:2 Risk-to-Reward"])
             weekly_touch_limit = "Multiple touches allowed"
         else:
             entry_method = "15m S/D Base"
-            st.info("💡 MTF Sequence Active: Weekly Sweep -> Daily Sweep -> Unbounded 75m MSS -> 15m S/D Base.")
-            target_method = st.selectbox("Target Strategy", ["Nearest 15 min swing point", "Fixed 1:2 Risk-to-Reward"])
-            weekly_touch_limit = st.radio("Weekly Sweep Touch Rule", ["Multiple touches allowed", "Only single touch allowed (First sweep only)"])
+            c3, c4 = st.columns(2)
+            with c3: target_method = st.selectbox("Target Strategy", ["Nearest 15 min swing point", "Fixed 1:2 Risk-to-Reward"])
+            with c4: weekly_touch_limit = st.selectbox("Weekly Sweep Touch Rule", ["Multiple touches allowed", "Only single touch allowed (First sweep only)"])
     elif timeframe in ["75 Minute", "125 Minute"]:
         sweep_type = st.selectbox("HTF Liquidity Sweep Level (Weekly)", ["Previous Weekly Candle Liquidity Sweep", "Weekly Swing High/Low Liquidity Sweep"])
         entry_method = "15m S/D Base"
-        st.info("💡 Entry locked to **15m S/D Base** for advanced MTF execution.")
-        target_method = st.selectbox("Target Strategy", ["Nearest 15 min swing point", "Fixed 1:2 Risk-to-Reward"])
-        weekly_touch_limit = st.radio("Weekly Sweep Touch Rule", ["Multiple touches allowed", "Only single touch allowed (First sweep only)"])
+        c3, c4 = st.columns(2)
+        with c3: target_method = st.selectbox("Target Strategy", ["Nearest 15 min swing point", "Fixed 1:2 Risk-to-Reward"])
+        with c4: weekly_touch_limit = st.selectbox("Weekly Sweep Touch Rule", ["Multiple touches allowed", "Only single touch allowed (First sweep only)"])
     elif timeframe == "Daily":
         sweep_type = None
-        entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
-        target_method = st.selectbox("Target Strategy", ["Daily Anchor Swing (Momentum Peak)", "Monthly Untested Swing", "Fixed 1:2 Risk-to-Reward"])
+        c3, c4 = st.columns(2)
+        with c3: entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
+        with c4: target_method = st.selectbox("Target Strategy", ["Daily Anchor Swing (Momentum Peak)", "Monthly Untested Swing", "Fixed 1:2 Risk-to-Reward"])
         weekly_touch_limit = "Multiple touches allowed"
-    
-    mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
-    mss_limit = st.selectbox("Max Displacement Candles for MSS", mss_options, index=6)
-    strict_opposite = st.checkbox("Reject if Opposite Liquidity Touched", value=False)
-    
-    st.divider()
-    if state_code == "4":
-        st.subheader("Backtest Date Range")
+
+with st.container():
+    c5, c6 = st.columns(2)
+    with c5:
+        mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
+        mss_limit = st.select_slider("Max Displacement Candles for MSS", options=mss_options, value=6)
+    with c6:
+        st.write("")
+        st.write("")
+        strict_opposite = st.checkbox("Reject if Opposite Liq Touched", value=False)
+
+if state_code == "4":
+    with st.container():
+        st.markdown("<p style='color:#E2E8F0;font-weight:600;'>Backtest Parameters</p>", unsafe_allow_html=True)
         today = pd.to_datetime(datetime.now(ist).date())
+        c7, c8 = st.columns(2)
         if timeframe in ["15 Minute", "75 Minute", "125 Minute"]:
             valid_dates = get_valid_trading_dates()
             valid_dates_rev = list(reversed(valid_dates))
             if valid_dates_rev:
-                from_date_str = st.selectbox("From Date", valid_dates_rev, index=len(valid_dates_rev)-1, format_func=lambda x: x.strftime('%d %b %Y'))
-                to_date_str = st.selectbox("To Date", valid_dates_rev, index=0, format_func=lambda x: x.strftime('%d %b %Y'))
+                with c7: from_date_str = st.selectbox("From Date", valid_dates_rev, index=len(valid_dates_rev)-1, format_func=lambda x: x.strftime('%d %b %Y'))
+                with c8: to_date_str = st.selectbox("To Date", valid_dates_rev, index=0, format_func=lambda x: x.strftime('%d %b %Y'))
                 start_date, end_date = pd.to_datetime(from_date_str), pd.to_datetime(to_date_str)
             else:
-                st.error("Failed to load trading calendar.")
                 start_date, end_date = today, today
         else:
             month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in range(24)]
-            from_month_str = st.selectbox("From Month", reversed(month_opts), format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
-            to_month_str = st.selectbox("To Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
+            with c7: from_month_str = st.selectbox("From Month", reversed(month_opts), format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
+            with c8: to_month_str = st.selectbox("To Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
             start_date, end_date = pd.to_datetime(from_month_str), pd.to_datetime(to_month_str) + pd.offsets.MonthEnd(0)
         risk_per_trade = st.number_input("Risk per Trade (₹)", min_value=100, value=1000, step=100)
-    else:
-        start_date = end_date = pd.to_datetime(datetime.now(ist).date())
+else:
+    start_date = end_date = pd.to_datetime(datetime.now(ist).date())
 
-if st.button("🚀 Execute Master Scan", type="primary"):
+st.write("")
+col_btn1, col_btn2 = st.columns([3,1])
+with col_btn1:
+    execute_scan = st.button("🚀 Execute Master Scan", type="primary")
+with col_btn2:
+    if st.button("🗑️ Clear Cache", type="secondary"):
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+            os.makedirs(CACHE_DIR)
+        st.rerun()
+
+if execute_scan:
     if state_code == "4" and start_date > end_date: st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
     else:
+        progress_bar = st.progress(0, text="Downloading Daily History... 0 / 500 assets (0%)")
         tickers = get_nifty500_symbols()
+        results = []
         
-        # BULK NETWORK FETCHING (Runs once, caches in RAM)
-        with st.spinner("Downloading Nifty 500 Bulk Data (Vectorized API)..."):
-            tf_cat = "intraday" if timeframe in ["15 Minute", "75 Minute", "125 Minute"] else "daily"
-            df_15m_all, df_1d_all = fetch_bulk_data(tickers, tf_cat)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = {executor.submit(scan_ticker, tick, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit): tick for tick in tickers}
             
-        with st.spinner(f"Computing Algorithmic Setups | Lightning Cache Enabled | State: {state_code}..."):
-            results = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
-                futures = [executor.submit(scan_ticker, tick, df_15m_all, df_1d_all, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit) for tick in tickers]
-                for f in concurrent.futures.as_completed(futures):
-                    res = f.result()
-                    if res: results.extend(res)
+            completed = 0
+            for f in concurrent.futures.as_completed(futures):
+                res = f.result()
+                if res: results.extend(res)
+                completed += 1
+                progress_bar.progress(completed / 500, text=f"Downloading History... {completed} / 500 assets ({int((completed/500)*100)}%)")
+                
+        progress_bar.empty()
+        
+        if not results: st.warning("No stocks matched these criteria. (Try expanding the date range).")
+        else:
+            df_all = pd.DataFrame(results)
+            if state_code == "4":
+                def calculate_metrics(row):
+                    entry_key, sl_key, risk = 'Entry', 'SL', risk_per_trade
+                    risk_dist = abs(row[entry_key] - row[sl_key])
+                    if risk_dist == 0: return pd.Series([0.0, 0.0], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
+                    qty = int(risk / risk_dist)
+                    funds_needed = round(qty * row[entry_key], 2)
+                    reward_dist = abs(row['Target'] - row[entry_key])
+                    reward_ratio = reward_dist / risk_dist
                     
-            if not results: st.warning("No stocks matched these criteria. (Try unchecking 'Reject if Opposite Liquidity Touched' or expanding the date range).")
-            else:
-                df_all = pd.DataFrame(results)
-                if state_code == "4":
-                    def calculate_metrics(row):
-                        entry_key, sl_key, risk = 'Entry', 'SL', risk_per_trade
-                        risk_dist = abs(row[entry_key] - row[sl_key])
-                        if risk_dist == 0: return pd.Series([0.0, 0.0], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
-                        qty = int(risk / risk_dist)
-                        funds_needed = round(qty * row[entry_key], 2)
-                        reward_dist = abs(row['Target'] - row[entry_key])
-                        reward_ratio = reward_dist / risk_dist
-                        
-                        if row['Outcome'] == 'Target Hit': pnl = risk * reward_ratio
-                        elif row['Outcome'] == 'SL Hit': pnl = -risk
-                        elif row['Outcome'] == 'Time Square Off': pnl = qty * (row['Exit Price'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['Exit Price'])
-                        else: pnl = qty * (row['CMP'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['CMP'])
-                        return pd.Series([round(pnl, 2), funds_needed], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
-                    df_all[['Profit/Loss (₹)', 'Funds Needed (₹)']] = df_all.apply(calculate_metrics, axis=1)
-                
-                df_bull, df_bear = df_all[df_all['Direction'] == 'Bullish'], df_all[df_all['Direction'] == 'Bearish']
-                tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
-                
-                def render_tab_content(df, title):
-                    if df.empty: st.info(f"No {title} Setups.")
-                    else:
-                        cols = df.columns.tolist()
-                        if 'Stock name' in cols: cols.insert(0, cols.pop(cols.index('Stock name')))
-                        df = df[cols]
-                        if state_code == "4":
-                            total_pnl, total_funds = df['Profit/Loss (₹)'].sum(), df['Funds Needed (₹)'].sum()
-                            wins, losses = len(df[df['Profit/Loss (₹)'] > 0]), len(df[df['Profit/Loss (₹)'] <= 0])
-                            win_rate = (wins / len(df) * 100) if len(df) > 0 else 0
-                            st.subheader(f"📊 {title} MIS Backtest Results (Risk: ₹{risk_per_trade}/trade)")
-                            c1, c2, c3, c4, c5 = st.columns(5)
-                            c1.metric("Total P&L", f"₹ {total_pnl:,.2f}"); c2.metric("Total Funds Reqd", f"₹ {total_funds:,.2f}"); c3.metric("True Win Rate", f"{win_rate:.1f}%"); c4.metric("Closed Trades", f"{wins}W / {losses}L"); c5.metric("Open Trades", len(df[df['Outcome'] == 'Still Open']))
-                            st.divider()
-                        st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
+                    if row['Outcome'] == 'Target Hit': pnl = risk * reward_ratio
+                    elif row['Outcome'] == 'SL Hit': pnl = -risk
+                    elif row['Outcome'] == 'Time Square Off': pnl = qty * (row['Exit Price'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['Exit Price'])
+                    else: pnl = qty * (row['CMP'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['CMP'])
+                    return pd.Series([round(pnl, 2), funds_needed], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
+                df_all[['Profit/Loss (₹)', 'Funds Needed (₹)']] = df_all.apply(calculate_metrics, axis=1)
+            
+            df_bull, df_bear = df_all[df_all['Direction'] == 'Bullish'], df_all[df_all['Direction'] == 'Bearish']
+            
+            tab1, tab2 = st.tabs(["🟢 Fresh Demand Zones (Buy)", "🔴 Fresh Supply Zones (Short)"])
+            
+            def render_tab_content(df, title):
+                st.markdown(f"<p style='color:#E2E8F0;'>Qualified Zones: <b>{len(df)}</b></p>", unsafe_allow_html=True)
+                if df.empty: st.info(f"No {title} Setups.")
+                else:
+                    cols = df.columns.tolist()
+                    if 'Stock name' in cols: cols.insert(0, cols.pop(cols.index('Stock name')))
+                    df = df[cols]
+                    if state_code == "4":
+                        total_pnl, total_funds = df['Profit/Loss (₹)'].sum(), df['Funds Needed (₹)'].sum()
+                        wins, losses = len(df[df['Profit/Loss (₹)'] > 0]), len(df[df['Profit/Loss (₹)'] <= 0])
+                        win_rate = (wins / len(df) * 100) if len(df) > 0 else 0
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Total P&L", f"₹ {total_pnl:,.2f}")
+                        c2.metric("Funds Reqd", f"₹ {total_funds:,.2f}")
+                        c3.metric("Win Rate", f"{win_rate:.1f}%")
+                        c4.metric("Trades", f"{wins}W/{losses}L")
+                        st.write("")
+                    st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
 
-                with tab1: render_tab_content(df_bull, "Bullish")
-                with tab2: render_tab_content(df_bear, "Bearish")
+            with tab1: render_tab_content(df_bull, "Demand")
+            with tab2: render_tab_content(df_bear, "Supply")
