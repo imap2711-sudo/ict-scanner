@@ -200,8 +200,8 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, ms
                         mss_cands = post_sweep_75m[post_sweep_75m['Close'] > sh_val_75m]
                         if not mss_cands.empty:
                             mss_idx_75m = mss_cands.index[0]
-                            # RULE 8 ENFORCEMENT: Sweep and MSS MUST be on the exact same day
-                            if sweep_idx_75m.date() == mss_idx_75m.date():
+                            # RELAXED RULE 8: Sweep and MSS can span up to 2 trading days (Same day or next day)
+                            if len(np.unique(df_75m.loc[sweep_idx_75m:mss_idx_75m].index.date)) <= 2:
                                 proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sh_val_75m, 'Bullish')
                                 
                                 if proximal and distal and 1 <= legout_count <= 3:
@@ -293,8 +293,8 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, ms
                         mss_cands = post_sweep_75m[post_sweep_75m['Close'] < sl_val_75m]
                         if not mss_cands.empty:
                             mss_idx_75m = mss_cands.index[0]
-                            # RULE 8 ENFORCEMENT: Sweep and MSS MUST be on the exact same day
-                            if sweep_idx_75m.date() == mss_idx_75m.date():
+                            # RELAXED RULE 8: Sweep and MSS can span up to 2 trading days (Same day or next day)
+                            if len(np.unique(df_75m.loc[sweep_idx_75m:mss_idx_75m].index.date)) <= 2:
                                 proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sl_val_75m, 'Bearish')
                                 
                                 if proximal and distal and 1 <= legout_count <= 3:
