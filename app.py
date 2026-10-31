@@ -226,19 +226,22 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, ms
                                                     tracking_df = df_15m.iloc[start_tracking_idx + 1:]
                                                     touched_entry_df = tracking_df[tracking_df['Low'] <= entry_price]
                                                     
-                                                    if touched_entry_df.empty and scan_state == "2": setups.append(setup_data)
+                                                    # State 1: MSS completed, Entry awaited
+                                                    if touched_entry_df.empty and scan_state == "1": setups.append(setup_data)
                                                     elif not touched_entry_df.empty:
                                                         entry_idx = touched_entry_df.index[0]
                                                         setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                         
-                                                        if scan_state == "3" and entry_idx.date() == target_entry_end.date():
+                                                        # State 2: Running trades
+                                                        if scan_state == "2" and entry_idx.date() == target_entry_end.date():
                                                             end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                             entry_day_df = df_15m.loc[entry_idx : end_of_day]
                                                             if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
                                                                 setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
                                                                 setups.append(setup_data)
                                                         
-                                                        elif scan_state == "4":
+                                                        # State 3: Backtester
+                                                        elif scan_state == "3":
                                                             if target_entry_start <= entry_idx <= target_entry_end:
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx:end_of_day]
@@ -283,19 +286,22 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, ms
                                                     tracking_df = df_15m.iloc[start_tracking_idx + 1:]
                                                     touched_entry_df = tracking_df[tracking_df['High'] >= entry_price]
                                                     
-                                                    if touched_entry_df.empty and scan_state == "2": setups.append(setup_data)
+                                                    # State 1: MSS completed, Entry awaited
+                                                    if touched_entry_df.empty and scan_state == "1": setups.append(setup_data)
                                                     elif not touched_entry_df.empty:
                                                         entry_idx = touched_entry_df.index[0]
                                                         setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                         
-                                                        if scan_state == "3" and entry_idx.date() == target_entry_end.date():
+                                                        # State 2: Running trades
+                                                        if scan_state == "2" and entry_idx.date() == target_entry_end.date():
                                                             end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                             entry_day_df = df_15m.loc[entry_idx : end_of_day]
                                                             if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
                                                                 setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
                                                                 setups.append(setup_data)
                                                         
-                                                        elif scan_state == "4":
+                                                        # State 3: Backtester
+                                                        elif scan_state == "3":
                                                             if target_entry_start <= entry_idx <= target_entry_end:
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx:end_of_day]
@@ -323,7 +329,7 @@ def scan_ticker(ticker, mss_limit, scan_state, start_date_str, end_date_str, str
         weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
         available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
         
-        expanded_start = target_entry_start - pd.Timedelta(days=15) if scan_state != "4" else target_entry_start - pd.Timedelta(days=60)
+        expanded_start = target_entry_start - pd.Timedelta(days=15) if scan_state != "3" else target_entry_start - pd.Timedelta(days=60)
         expanded_days = available_dates[(available_dates >= expanded_start) & (available_dates <= target_entry_end)]
         
         for d in expanded_days:
@@ -351,7 +357,7 @@ with st.container():
     with c1:
         scan_state = st.selectbox(
             "Select Market State", 
-            ["1. MSS done (Swing high not yet formed)", "2. Awaiting entry (Price has not touched Entry Level)", "3. Trade open (Price has touched Entry, SL/Target not hit)", "4. Previous reports (Date Range Backtest Mode)"]
+            ["1. MSS completed, Entry awaited", "2. Running trades", "3. Backtester"]
         )
         state_code = scan_state.split(".")[0]
     with c2:
@@ -366,7 +372,7 @@ with st.container():
         st.write("")
         strict_opposite = st.checkbox("Reject if Opposite Liq Touched", value=False)
 
-if state_code == "4":
+if state_code == "3":
     with st.container():
         st.markdown("<p style='color:#E2E8F0;font-weight:600;'>Backtest Parameters</p>", unsafe_allow_html=True)
         today = pd.to_datetime(datetime.now(ist).date())
@@ -395,7 +401,7 @@ with col_btn2:
         st.rerun()
 
 if execute_scan:
-    if state_code == "4" and start_date > end_date: st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
+    if state_code == "3" and start_date > end_date: st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
     else:
         keep_screen_awake()
         with st.spinner(f"Scanning Nifty 500 | Weekly MTF Logic | State: {state_code}..."):
@@ -430,7 +436,7 @@ if st.session_state.get('scan_run', False):
     if not results: st.warning("No stocks matched these criteria. (Try expanding the date range).")
     else:
         df_all = pd.DataFrame(results)
-        if saved_state_code == "4":
+        if saved_state_code == "3":
             def calculate_metrics(row):
                 entry_key, sl_key, risk = 'Entry', 'SL', saved_risk
                 risk_dist = abs(row[entry_key] - row[sl_key])
@@ -458,7 +464,7 @@ if st.session_state.get('scan_run', False):
                 cols = df.columns.tolist()
                 if 'Stock name' in cols: cols.insert(0, cols.pop(cols.index('Stock name')))
                 df = df[cols]
-                if saved_state_code == "4":
+                if saved_state_code == "3":
                     total_pnl, total_funds = df['Profit/Loss (₹)'].sum(), df['Funds Needed (₹)'].sum()
                     wins, losses = len(df[df['Profit/Loss (₹)'] > 0]), len(df[df['Profit/Loss (₹)'] <= 0])
                     win_rate = (wins / len(df) * 100) if len(df) > 0 else 0
