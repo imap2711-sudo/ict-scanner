@@ -206,7 +206,7 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
             proximal = zone_candles['Low'].min()
             legout_count = len(post_base[(post_base['Close'] < post_base['Open']) & (~post_base['Is_Base'])])
             
-        if not (1 <= legout_count <= 3): return None, None, 0
+        # Capping removed completely as requested
         return proximal, distal, legout_count
     except: return None, None, 0
 
@@ -389,7 +389,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                             if not mss_cands.empty:
                                 mss_idx_75m = mss_cands.index[0]
                                 
-                                # STRICT CONSTRAINT: MSS break must happen on same day (sweep date) or the next day
                                 sweep_date = sweep_idx_75m.date()
                                 mss_date = mss_idx_75m.date()
                                 days_diff = (mss_date - sweep_date).days
@@ -397,7 +396,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                 if 0 <= days_diff <= 1:
                                     proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sh_val_75m, 'Bullish')
                                     
-                                    if proximal and distal and 1 <= legout_count <= 3:
+                                    if proximal and distal:
                                         _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'high')
                                         if target_val:
                                             entry_price = proximal
@@ -455,7 +454,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                             if not mss_cands.empty:
                                 mss_idx_75m = mss_cands.index[0]
                                 
-                                # STRICT CONSTRAINT: MSS break must happen on same day (sweep date) or the next day
                                 sweep_date = sweep_idx_75m.date()
                                 mss_date = mss_idx_75m.date()
                                 days_diff = (mss_date - sweep_date).days
@@ -463,7 +461,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                 if 0 <= days_diff <= 1:
                                     proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sl_val_75m, 'Bearish')
                                     
-                                    if proximal and distal and 1 <= legout_count <= 3:
+                                    if proximal and distal:
                                         _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'low')
                                         if target_val:
                                             entry_price = proximal
