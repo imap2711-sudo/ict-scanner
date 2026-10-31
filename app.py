@@ -21,47 +21,29 @@ def keep_screen_awake():
         <script>
         let wakeLock = null;
         const requestWakeLock = async () => {
-          try {
-            wakeLock = await navigator.wakeLock.request('screen');
-          } catch (err) {
-            console.log(`${err.name}, ${err.message}`);
-          }
+          try { wakeLock = await navigator.wakeLock.request('screen'); }
+          catch (err) { console.log(`${err.name}, ${err.message}`); }
         };
         requestWakeLock();
         document.addEventListener('visibilitychange', async () => {
-          if (wakeLock !== null && document.visibilityState === 'visible') {
-            requestWakeLock();
-          }
+          if (wakeLock !== null && document.visibilityState === 'visible') requestWakeLock();
         });
         </script>
         """,
         height=0, width=0
     )
 
-if 'scan_run' not in st.session_state:
-    st.session_state['scan_run'] = False
-if 'scan_results' not in st.session_state:
-    st.session_state['scan_results'] = None
-if 'current_start' not in st.session_state:
-    st.session_state['current_start'] = None
-if 'current_end' not in st.session_state:
-    st.session_state['current_end'] = None
-if 'current_state_code' not in st.session_state:
-    st.session_state['current_state_code'] = None
-if 'current_risk' not in st.session_state:
-    st.session_state['current_risk'] = None
+for key in ['scan_run', 'scan_results', 'current_start', 'current_end', 'current_state_code', 'current_risk']:
+    if key not in st.session_state:
+        st.session_state[key] = False if key == 'scan_run' else None
 
 custom_css = """
 <style>
     .stApp { background-color: #0B1121; color: #E2E8F0; }
     h1, h2, h3, p, label { color: #E2E8F0 !important; font-family: 'Inter', sans-serif !important; }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
-    div[data-testid="stVerticalBlock"] > div[style*="flex-direction: column;"] > div[data-testid="stVerticalBlock"] {
-        background-color: #161E2E; padding: 20px; border-radius: 12px; border: 1px solid #1E293B; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-    }
-    .stSelectbox div[data-baseweb="select"] > div, .stNumberInput input, .stDateInput input {
-        background-color: #0F172A !important; color: white !important; border: 1px solid #334155 !important; border-radius: 8px !important;
-    }
+    div[data-testid="stVerticalBlock"] > div[style*="flex-direction: column;"] > div[data-testid="stVerticalBlock"] { background-color: #161E2E; padding: 20px; border-radius: 12px; border: 1px solid #1E293B; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+    .stSelectbox div[data-baseweb="select"] > div, .stNumberInput input, .stDateInput input { background-color: #0F172A !important; color: white !important; border: 1px solid #334155 !important; border-radius: 8px !important; }
     .stSlider div[data-baseweb="slider"] div[data-testid="stTickBar"] > div { background-color: #10B981 !important; }
     button[kind="primary"] { background-color: #EF4444 !important; color: white !important; font-weight: 600 !important; border-radius: 8px !important; border: none !important; padding: 10px !important; width: 100%; }
     button[kind="primary"]:hover { background-color: #DC2626 !important; }
@@ -76,7 +58,6 @@ custom_css = """
 """
 st.markdown(custom_css, unsafe_allow_html=True)
 
-# --- CORE LOGIC & CACHE (HIGH PRECISION VERSION) ---
 CACHE_DIR = "nifty500_data_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -154,20 +135,6 @@ def get_post_mss_swing(df, mss_idx, direction='high'):
         return None, None, None
     except: return None, None, None
 
-def get_dynamic_entry(df, sweep_idx, peak_idx, direction, anchor, peak):
-    leg_df = df.loc[sweep_idx:peak_idx]
-    range_size = abs(peak - anchor)
-    if direction == 'Bullish':
-        eq_50 = anchor + range_size * 0.5
-        fib_618 = peak - range_size * 0.618
-        fvg_tops = [leg_df['Low'].iloc[i+2] for i in range(len(leg_df)-2) if leg_df['Low'].iloc[i+2] > leg_df['High'].iloc[i] and leg_df['Low'].iloc[i+2] <= eq_50]
-        return (max(fvg_tops), "Discount FVG") if fvg_tops else (fib_618, "61.8% Fib")
-    else:
-        eq_50 = anchor - range_size * 0.5
-        fib_618 = peak + range_size * 0.618
-        fvg_bottoms = [leg_df['High'].iloc[i+2] for i in range(len(leg_df)-2) if leg_df['High'].iloc[i+2] < leg_df['Low'].iloc[i] and leg_df['High'].iloc[i+2] >= eq_50]
-        return (min(fvg_bottoms), "Premium FVG") if fvg_bottoms else (fib_618, "61.8% Fib")
-
 def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
     risk_dist = abs(entry - stop_loss)
     if risk_dist == 0: return 0.0
@@ -210,149 +177,9 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
         return proximal, distal, legout_count
     except: return None, None, 0
 
-def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eval_end, strict_opposite, entry_method, target_method, is_daily=False, monthly_sh_val=None, monthly_sl_val=None, target_entry_start=None, target_entry_end=None):
-    setups = []
-    df_index = df.index.tolist()
-    cmp = df['Close'].iloc[-1]
-    
-    # In State 4, we evaluate based on Entry Window. We still need history to find sweeps.
-    # We broaden the window to catch bases formed up to 60 days before the entry period.
-    if scan_state == "4":
-        expanded_start = eval_start - pd.Timedelta(days=60)
-        window_df = df.loc[(df.index >= expanded_start) & (df.index <= eval_end)]
-    else:
-        window_df = df.loc[(df.index >= eval_start) & (df.index <= eval_end)]
-        
-    if window_df.empty: return setups
-    time_fmt = '%Y-%m-%d' if is_daily else '%Y-%m-%d %H:%M'
-
-    # Bullish
-    bull_sweeps = window_df[window_df['Low'] <= htf_low]
-    if not bull_sweeps.empty:
-        sweep_idx = bull_sweeps.index[0] 
-        sweep_low = df.loc[sweep_idx, 'Low']
-        post_sweep_df = window_df.loc[sweep_idx:]
-        if not strict_opposite or post_sweep_df['High'].max() < htf_high:
-            sh_idx, sh_val = get_recent_swing(df, sweep_idx, 'high') 
-            if sh_idx:
-                mss_cands = post_sweep_df[post_sweep_df['Close'] > sh_val]
-                if not mss_cands.empty:
-                    mss_idx = mss_cands.index[0]
-                    mss_count = df_index.index(mss_idx) - df_index.index(sweep_idx)
-                    if 0 < mss_count <= mss_limit:
-                        post_sh_idx, post_sh_val, confirm_idx = get_post_mss_swing(df, mss_idx, 'high')
-                        setup_data = {"Direction": "Bullish", "Stock name": None, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx.strftime(time_fmt), "Base End (MSS)": mss_idx.strftime(time_fmt), "MSS candles": mss_count, "MSS Line": round(sh_val, 2), "Entry Distance": "N/A", "Entry Time": "Pending"}
-                        if not post_sh_idx:
-                            if scan_state == "1" and sweep_idx >= eval_start: setups.append(setup_data)
-                        else:
-                            if entry_method == "Breaker Block (Shallow Pullback)": entry_price, entry_type, active_sl = sh_val, "Breaker Block", df.loc[sh_idx, 'Low'] * 0.99
-                            else: entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sh_idx, 'Bullish', sweep_low, post_sh_val); active_sl = sweep_low
-                            risk_dist = abs(entry_price - active_sl)
-                            if risk_dist > 0:
-                                if target_method == "Fixed 1:2 Risk-to-Reward": active_target = entry_price + (2 * risk_dist)
-                                elif target_method == "Monthly Untested Swing": active_target = monthly_sh_val if (monthly_sh_val and monthly_sh_val > post_sh_val) else post_sh_val
-                                else: active_target = post_sh_val
-                                if active_target > entry_price and active_sl < entry_price:
-                                    actual_rr = (active_target - entry_price) / risk_dist
-                                    if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
-                                        setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((cmp - entry_price)/cmp)*100, 2)}%"})
-                                        
-                                        start_tracking_idx = df_index.index(confirm_idx)
-                                        if start_tracking_idx + 1 < len(df_index):
-                                            tracking_df = df.iloc[start_tracking_idx + 1:]
-                                            touched_entry_df = tracking_df[tracking_df['Low'] <= entry_price]
-                                            
-                                            if touched_entry_df.empty and scan_state == "2" and sweep_idx >= eval_start: setups.append(setup_data)
-                                            elif not touched_entry_df.empty:
-                                                entry_idx = touched_entry_df.index[0]
-                                                setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
-                                                
-                                                if scan_state == "3" and sweep_idx >= eval_start:
-                                                    end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                    entry_day_df = df.loc[entry_idx : end_of_day]
-                                                    if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
-                                                        setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
-                                                        setups.append(setup_data)
-                                                
-                                                # STATE 4 FILTER: Check if the exact ENTRY timestamp falls in the selected date range
-                                                elif scan_state == "4":
-                                                    if target_entry_start <= entry_idx <= target_entry_end:
-                                                        end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                        entry_day_df = df.loc[entry_idx:end_of_day]
-                                                        outcome, exit_price, highest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                        for idx, row in entry_day_df.iterrows():
-                                                            highest_seen = max(highest_seen, row['High'])
-                                                            if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                            elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
-                                                        setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
-                                                        setups.append(setup_data)
-
-    # Bearish
-    bear_sweeps = window_df[window_df['High'] >= htf_high]
-    if not bear_sweeps.empty:
-        sweep_idx = bear_sweeps.index[0] 
-        sweep_high = df.loc[sweep_idx, 'High']
-        post_sweep_df = window_df.loc[sweep_idx:]
-        if not strict_opposite or post_sweep_df['Low'].min() > htf_low:
-            sl_idx, sl_val = get_recent_swing(df, sweep_idx, 'low')
-            if sl_idx:
-                mss_cands = post_sweep_df[post_sweep_df['Close'] < sl_val]
-                if not mss_cands.empty:
-                    mss_idx = mss_cands.index[0]
-                    mss_count = df_index.index(mss_idx) - df_index.index(sweep_idx)
-                    if 0 < mss_count <= mss_limit:
-                        post_sl_idx, post_sl_val, confirm_idx = get_post_mss_swing(df, mss_idx, 'low')
-                        setup_data = {"Direction": "Bearish", "Stock name": None, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx.strftime(time_fmt), "Base End (MSS)": mss_idx.strftime(time_fmt), "MSS candles": mss_count, "MSS Line": round(sl_val, 2), "Entry Distance": "N/A", "Entry Time": "Pending"}
-                        if not post_sl_idx:
-                            if scan_state == "1" and sweep_idx >= eval_start: setups.append(setup_data)
-                        else:
-                            if entry_method == "Breaker Block (Shallow Pullback)": entry_price, entry_type, active_sl = sl_val, "Breaker Block", df.loc[sl_idx, 'High'] * 1.01
-                            else: entry_price, entry_type = get_dynamic_entry(df, sweep_idx, post_sl_idx, 'Bearish', sweep_high, post_sl_val); active_sl = sweep_high
-                            risk_dist = abs(entry_price - active_sl)
-                            if risk_dist > 0:
-                                if target_method == "Fixed 1:2 Risk-to-Reward": active_target = entry_price - (2 * risk_dist)
-                                elif target_method == "Monthly Untested Swing": active_target = monthly_sl_val if (monthly_sl_val and monthly_sl_val < post_sl_val) else post_sl_val
-                                else: active_target = post_sl_val
-                                if active_target < entry_price and active_sl > entry_price:
-                                    actual_rr = (entry_price - active_target) / risk_dist
-                                    if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
-                                        setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((entry_price - cmp)/cmp)*100, 2)}%"})
-                                        
-                                        start_tracking_idx = df_index.index(confirm_idx)
-                                        if start_tracking_idx + 1 < len(df_index):
-                                            tracking_df = df.iloc[start_tracking_idx + 1:]
-                                            touched_entry_df = tracking_df[tracking_df['High'] >= entry_price]
-                                            
-                                            if touched_entry_df.empty and scan_state == "2" and sweep_idx >= eval_start: setups.append(setup_data)
-                                            elif not touched_entry_df.empty:
-                                                entry_idx = touched_entry_df.index[0]
-                                                setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
-                                                
-                                                if scan_state == "3" and sweep_idx >= eval_start:
-                                                    end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                    entry_day_df = df.loc[entry_idx : end_of_day]
-                                                    if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
-                                                        setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
-                                                        setups.append(setup_data)
-                                                
-                                                # STATE 4 FILTER
-                                                elif scan_state == "4":
-                                                    if target_entry_start <= entry_idx <= target_entry_end:
-                                                        end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                        entry_day_df = df.loc[entry_idx:end_of_day]
-                                                        outcome, exit_price, lowest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                        for idx, row in entry_day_df.iterrows():
-                                                            lowest_seen = min(lowest_seen, row['Low'])
-                                                            if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                            elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
-                                                        setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
-                                                        setups.append(setup_data)
-    return setups
-
-def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit, target_entry_start=None, target_entry_end=None):
+def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, mss_limit, scan_state, d, strict_opposite, target_method, target_entry_start=None, target_entry_end=None):
     setups = []
     if d not in daily_htf.index: return setups
-    daily_candle = daily_htf.loc[d]
     cmp = df_15m['Close'].iloc[-1]
     
     current_monday = d - pd.Timedelta(days=d.weekday())
@@ -360,229 +187,148 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
     past_weekly = weekly_hist.loc[weekly_hist.index < current_monday]
     if past_weekly.empty: return setups
     
-    if sweep_type == "Previous Weekly Candle Liquidity Sweep": pwl, pwh = past_weekly['Low'].iloc[-1], past_weekly['High'].iloc[-1]
-    else:
-        _, pwh = get_recent_swing(weekly_hist, past_weekly.index[-1], 'high')
-        _, pwl = get_recent_swing(weekly_hist, past_weekly.index[-1], 'low')
-        
+    pwl, pwh = past_weekly['Low'].iloc[-1], past_weekly['High'].iloc[-1]
     if not pwh or not pwl: return setups
     time_fmt = '%Y-%m-%d %H:%M'
     df_15m_index = df_15m.index.tolist()
     
-    bull_already_touched = False
-    bear_already_touched = False
-    if "single touch" in weekly_touch_limit.lower():
-        days_before_d = daily_htf.loc[(daily_htf.index >= current_monday) & (daily_htf.index < d)]
-        if not days_before_d.empty:
-            bull_already_touched = not days_before_d[days_before_d['Low'] <= pwl].empty
-            bear_already_touched = not days_before_d[days_before_d['High'] >= pwh].empty
-    
-    # Bullish
-    if not bull_already_touched and daily_candle['Low'] <= pwl:
-        future_75m = df_75m.loc[d.strftime('%Y-%m-%d'):]
-        if not future_75m.empty:
-            bull_sweeps = future_75m[future_75m['Low'] <= pwl]
-            if not bull_sweeps.empty:
-                sweep_idx_75m = bull_sweeps.index[0]
-                if sweep_idx_75m.date() == d.date():
-                    post_sweep_75m = future_75m.loc[sweep_idx_75m:]
-                    if not strict_opposite or post_sweep_75m['High'].max() < pwh:
-                        sh_idx_75m, sh_val_75m = get_recent_swing(df_75m, sweep_idx_75m, 'high')
-                        if sh_idx_75m:
-                            mss_cands = post_sweep_75m[post_sweep_75m['Close'] > sh_val_75m]
-                            if not mss_cands.empty:
-                                mss_idx_75m = mss_cands.index[0]
-                                proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sh_val_75m, 'Bullish')
-                                
-                                if proximal and distal and 1 <= legout_count <= 3:
-                                    _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'high')
-                                    if target_val:
-                                        entry_price = proximal
-                                        active_sl = distal * 0.999
-                                        risk_dist = abs(entry_price - active_sl)
-                                        if risk_dist > 0:
-                                            active_target = entry_price + (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
-                                            if active_target > entry_price and active_sl < entry_price:
-                                                actual_rr = (active_target - entry_price) / risk_dist
-                                                if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
-                                                    setup_data = {"Direction": "Bullish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m/125m)": round(sh_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((cmp - entry_price)/cmp)*100, 2)}%", "Entry Time": "Pending"}
+    # Bullish Sequence (Previous Weekly Low)
+    future_75m = df_75m.loc[d.strftime('%Y-%m-%d'):]
+    if not future_75m.empty:
+        bull_sweeps = future_75m[future_75m['Low'] <= pwl]
+        if not bull_sweeps.empty:
+            sweep_idx_75m = bull_sweeps.index[0]
+            if sweep_idx_75m.date() == d.date():
+                post_sweep_75m = future_75m.loc[sweep_idx_75m:]
+                if not strict_opposite or post_sweep_75m['High'].max() < pwh:
+                    sh_idx_75m, sh_val_75m = get_recent_swing(df_75m, sweep_idx_75m, 'high')
+                    if sh_idx_75m:
+                        mss_cands = post_sweep_75m[post_sweep_75m['Close'] > sh_val_75m]
+                        if not mss_cands.empty:
+                            mss_idx_75m = mss_cands.index[0]
+                            proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sh_val_75m, 'Bullish')
+                            
+                            if proximal and distal and 1 <= legout_count <= 3:
+                                _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'high')
+                                if target_val:
+                                    entry_price = proximal
+                                    active_sl = distal * 0.999
+                                    risk_dist = abs(entry_price - active_sl)
+                                    if risk_dist > 0:
+                                        active_target = entry_price + (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
+                                        if active_target > entry_price and active_sl < entry_price:
+                                            actual_rr = (active_target - entry_price) / risk_dist
+                                            if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
+                                                setup_data = {"Direction": "Bullish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m/125m)": round(sh_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((cmp - entry_price)/cmp)*100, 2)}%", "Entry Time": "Pending"}
+                                                
+                                                start_tracking_idx = df_15m_index.index(mss_idx_75m)
+                                                if start_tracking_idx + 1 < len(df_15m_index):
+                                                    tracking_df = df_15m.iloc[start_tracking_idx + 1:]
+                                                    touched_entry_df = tracking_df[tracking_df['Low'] <= entry_price]
                                                     
-                                                    start_tracking_idx = df_15m_index.index(mss_idx_75m)
-                                                    if start_tracking_idx + 1 < len(df_15m_index):
-                                                        tracking_df = df_15m.iloc[start_tracking_idx + 1:]
-                                                        touched_entry_df = tracking_df[tracking_df['Low'] <= entry_price]
+                                                    if touched_entry_df.empty and scan_state == "2": setups.append(setup_data)
+                                                    elif not touched_entry_df.empty:
+                                                        entry_idx = touched_entry_df.index[0]
+                                                        setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                         
-                                                        if touched_entry_df.empty and scan_state == "2" and sweep_idx_75m >= target_entry_start: setups.append(setup_data)
-                                                        elif not touched_entry_df.empty:
-                                                            entry_idx = touched_entry_df.index[0]
-                                                            setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
-                                                            
-                                                            if scan_state == "3" and sweep_idx_75m >= target_entry_start:
+                                                        if scan_state == "3" and entry_idx.date() == target_entry_end.date():
+                                                            end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
+                                                            entry_day_df = df_15m.loc[entry_idx : end_of_day]
+                                                            if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
+                                                                setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
+                                                                setups.append(setup_data)
+                                                        
+                                                        elif scan_state == "4":
+                                                            if target_entry_start <= entry_idx <= target_entry_end:
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                                entry_day_df = df_15m.loc[entry_idx : end_of_day]
-                                                                if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
-                                                                    setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
-                                                                    setups.append(setup_data)
-                                                            
-                                                            # STATE 4 FILTER
-                                                            elif scan_state == "4":
-                                                                if target_entry_start <= entry_idx <= target_entry_end:
-                                                                    end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                                    entry_day_df = df_15m.loc[entry_idx:end_of_day]
-                                                                    outcome, exit_price, highest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                                    for idx, row in entry_day_df.iterrows():
-                                                                        highest_seen = max(highest_seen, row['High'])
-                                                                        if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                                        elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
-                                                                    setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
-                                                                    setups.append(setup_data)
+                                                                entry_day_df = df_15m.loc[entry_idx:end_of_day]
+                                                                outcome, exit_price, highest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
+                                                                for idx, row in entry_day_df.iterrows():
+                                                                    highest_seen = max(highest_seen, row['High'])
+                                                                    if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                                    elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                                setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
+                                                                setups.append(setup_data)
 
-    # Bearish
-    if not bear_already_touched and daily_candle['High'] >= pwh:
-        future_75m = df_75m.loc[d.strftime('%Y-%m-%d'):]
-        if not future_75m.empty:
-            bear_sweeps = future_75m[future_75m['High'] >= pwh]
-            if not bear_sweeps.empty:
-                sweep_idx_75m = bear_sweeps.index[0]
-                if sweep_idx_75m.date() == d.date():
-                    post_sweep_75m = future_75m.loc[sweep_idx_75m:]
-                    if not strict_opposite or post_sweep_75m['Low'].min() > pwl:
-                        sh_idx_75m, sl_val_75m = get_recent_swing(df_75m, sweep_idx_75m, 'low')
-                        if sh_idx_75m:
-                            mss_cands = post_sweep_75m[post_sweep_75m['Close'] < sl_val_75m]
-                            if not mss_cands.empty:
-                                mss_idx_75m = mss_cands.index[0]
-                                proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sl_val_75m, 'Bearish')
-                                
-                                if proximal and distal and 1 <= legout_count <= 3:
-                                    _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'low')
-                                    if target_val:
-                                        entry_price = proximal
-                                        active_sl = distal * 1.001
-                                        risk_dist = abs(entry_price - active_sl)
-                                        if risk_dist > 0:
-                                            active_target = entry_price - (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
-                                            if active_target < entry_price and active_sl > entry_price:
-                                                actual_rr = (entry_price - active_target) / risk_dist
-                                                if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
-                                                    setup_data = {"Direction": "Bearish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m/125m)": round(sl_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((entry_price - cmp)/cmp)*100, 2)}%", "Entry Time": "Pending"}
+    # Bearish Sequence (Previous Weekly High)
+    if not future_75m.empty:
+        bear_sweeps = future_75m[future_75m['High'] >= pwh]
+        if not bear_sweeps.empty:
+            sweep_idx_75m = bear_sweeps.index[0]
+            if sweep_idx_75m.date() == d.date():
+                post_sweep_75m = future_75m.loc[sweep_idx_75m:]
+                if not strict_opposite or post_sweep_75m['Low'].min() > pwl:
+                    sh_idx_75m, sl_val_75m = get_recent_swing(df_75m, sweep_idx_75m, 'low')
+                    if sh_idx_75m:
+                        mss_cands = post_sweep_75m[post_sweep_75m['Close'] < sl_val_75m]
+                        if not mss_cands.empty:
+                            mss_idx_75m = mss_cands.index[0]
+                            proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sl_val_75m, 'Bearish')
+                            
+                            if proximal and distal and 1 <= legout_count <= 3:
+                                _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'low')
+                                if target_val:
+                                    entry_price = proximal
+                                    active_sl = distal * 1.001
+                                    risk_dist = abs(entry_price - active_sl)
+                                    if risk_dist > 0:
+                                        active_target = entry_price - (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
+                                        if active_target < entry_price and active_sl > entry_price:
+                                            actual_rr = (entry_price - active_target) / risk_dist
+                                            if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
+                                                setup_data = {"Direction": "Bearish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m/125m)": round(sl_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((entry_price - cmp)/cmp)*100, 2)}%", "Entry Time": "Pending"}
+                                                
+                                                start_tracking_idx = df_15m_index.index(mss_idx_75m)
+                                                if start_tracking_idx + 1 < len(df_15m_index):
+                                                    tracking_df = df_15m.iloc[start_tracking_idx + 1:]
+                                                    touched_entry_df = tracking_df[tracking_df['High'] >= entry_price]
                                                     
-                                                    start_tracking_idx = df_15m_index.index(mss_idx_75m)
-                                                    if start_tracking_idx + 1 < len(df_15m_index):
-                                                        tracking_df = df_15m.iloc[start_tracking_idx + 1:]
-                                                        touched_entry_df = tracking_df[tracking_df['High'] >= entry_price]
+                                                    if touched_entry_df.empty and scan_state == "2": setups.append(setup_data)
+                                                    elif not touched_entry_df.empty:
+                                                        entry_idx = touched_entry_df.index[0]
+                                                        setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                         
-                                                        if touched_entry_df.empty and scan_state == "2" and sweep_idx_75m >= target_entry_start: setups.append(setup_data)
-                                                        elif not touched_entry_df.empty:
-                                                            entry_idx = touched_entry_df.index[0]
-                                                            setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
-                                                            
-                                                            if scan_state == "3" and sweep_idx_75m >= target_entry_start:
+                                                        if scan_state == "3" and entry_idx.date() == target_entry_end.date():
+                                                            end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
+                                                            entry_day_df = df_15m.loc[entry_idx : end_of_day]
+                                                            if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
+                                                                setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
+                                                                setups.append(setup_data)
+                                                        
+                                                        elif scan_state == "4":
+                                                            if target_entry_start <= entry_idx <= target_entry_end:
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                                entry_day_df = df_15m.loc[entry_idx : end_of_day]
-                                                                if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
-                                                                    setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
-                                                                    setups.append(setup_data)
-                                                            
-                                                            # STATE 4 FILTER
-                                                            elif scan_state == "4":
-                                                                if target_entry_start <= entry_idx <= target_entry_end:
-                                                                    end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                                    entry_day_df = df_15m.loc[entry_idx:end_of_day]
-                                                                    outcome, exit_price, lowest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                                    for idx, row in entry_day_df.iterrows():
-                                                                        lowest_seen = min(lowest_seen, row['Low'])
-                                                                        if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                                        elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
-                                                                    setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
-                                                                    setups.append(setup_data)
+                                                                entry_day_df = df_15m.loc[entry_idx:end_of_day]
+                                                                outcome, exit_price, lowest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
+                                                                for idx, row in entry_day_df.iterrows():
+                                                                    lowest_seen = min(lowest_seen, row['Low'])
+                                                                    if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                                    elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                                setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
+                                                                setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method, weekly_touch_limit):
+def scan_ticker(ticker, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, target_method):
     try:
         target_entry_start = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         target_entry_end = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         res = []
-        if timeframe == "15 Minute":
-            if sweep_type == "Daily Liquidity Sweep":
-                daily_htf = fetch_market_data(ticker, "2y", "1d")
-                df = fetch_market_data(ticker, "60d", "15m")
-                if df.empty or daily_htf.empty: return None
-                available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
-                if scan_state != "4":
-                    if target_entry_start not in available_dates.values: target_entry_start = available_dates.iloc[-1] 
-                    past_htf = daily_htf.loc[daily_htf.index < target_entry_start]
-                    if len(past_htf) >= 1:
-                        pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
-                        r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, target_entry_start, target_entry_start + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), strict_opposite, entry_method, target_method, is_daily=False)
-                        if r_today: res.extend(r_today)
-                else: 
-                    # State 4 logic: Loop through the date range, but evaluate bases older than the range to catch overlapping entries
-                    days_in_range = available_dates[(available_dates >= target_entry_start) & (available_dates <= target_entry_end)]
-                    for d in days_in_range:
-                        past_htf = daily_htf.loc[daily_htf.index < d]
-                        if len(past_htf) >= 1:
-                            # Note: eval_start passed to evaluate_setup is 'd', but evaluate_setup expands it internally for state 4
-                            r_today = evaluate_setup(df, past_htf['High'].iloc[-1], past_htf['Low'].iloc[-1], mss_limit, scan_state, d, target_entry_end, strict_opposite, entry_method, target_method, is_daily=False, target_entry_start=target_entry_start, target_entry_end=target_entry_end)
-                            if r_today: res.extend(r_today)
-            else:
-                df_15m = fetch_market_data(ticker, "60d", "15m")
-                daily_htf = fetch_market_data(ticker, "2y", "1d")
-                if df_15m.empty or daily_htf.empty: return None
-                resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df_15m.groupby(df_15m.index.date) for i in range(0, len(group), 5) if len(chunk := group.iloc[i:i+5]) > 0]
-                df_htf = pd.DataFrame(resampled).set_index('Datetime')
-                weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
-                available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
-                days_in_range = available_dates[(available_dates >= target_entry_start) & (available_dates <= target_entry_end)]
-                
-                # To catch old bases that entry triggered in date range
-                expanded_start = target_entry_start - pd.Timedelta(days=15) if scan_state == "4" else target_entry_start
-                expanded_days = available_dates[(available_dates >= expanded_start) & (available_dates <= target_entry_end)]
-                
-                for d in expanded_days:
-                    r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit, target_entry_start, target_entry_end)
-                    if r_today: res.extend(r_today)
-                    
-        elif timeframe in ["75 Minute", "125 Minute"]:
-            df_15m = fetch_market_data(ticker, "60d", "15m")
-            daily_htf = fetch_market_data(ticker, "2y", "1d")
-            if df_15m.empty or daily_htf.empty: return None
-            chunk_size = 5 if timeframe == "75 Minute" else 8
-            resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df_15m.groupby(df_15m.index.date) for i in range(0, len(group), chunk_size) if len(chunk := group.iloc[i:i+chunk_size]) > 0]
-            df_htf = pd.DataFrame(resampled).set_index('Datetime')
-            weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
-            available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
-            
-            expanded_start = target_entry_start - pd.Timedelta(days=15) if scan_state == "4" else target_entry_start
-            expanded_days = available_dates[(available_dates >= expanded_start) & (available_dates <= target_entry_end)]
-            
-            for d in expanded_days:
-                r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit, target_entry_start, target_entry_end)
-                if r_today: res.extend(r_today)
-        else: 
-            df = fetch_market_data(ticker, "5y", "1d")
-            if df.empty: return None
-            monthly_hist = df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
-            if scan_state != "4":
-                target_month_start = target_entry_start.replace(day=1)
-                hist_df = monthly_hist.loc[monthly_hist.index < target_month_start]
-                if hist_df.empty: return None
-                m_idx = hist_df.index[-1]
-                _, monthly_sh_val = get_recent_swing(monthly_hist, m_idx, 'high')
-                _, monthly_sl_val = get_recent_swing(monthly_hist, m_idx, 'low')
-                r_today = evaluate_setup(df, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, target_month_start, target_month_start + pd.offsets.MonthEnd(0), strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
-                if r_today: res.extend(r_today)
-            else:
-                months_in_range = pd.date_range(start=target_entry_start.replace(day=1), end=target_entry_end, freq='MS')
-                for m_start in months_in_range:
-                    hist_df = monthly_hist.loc[monthly_hist.index < m_start]
-                    if hist_df.empty: continue
-                    m_idx = hist_df.index[-1]
-                    _, monthly_sh_val = get_recent_swing(monthly_hist, m_idx, 'high')
-                    _, monthly_sl_val = get_recent_swing(monthly_hist, m_idx, 'low')
-                    # Pass target dates down for strict filtering
-                    r_month = evaluate_setup(df, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, m_start, target_entry_end, strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val, target_entry_start=target_entry_start, target_entry_end=target_entry_end)
-                    if r_month: res.extend(r_month)
+        
+        df_15m = fetch_market_data(ticker, "60d", "15m")
+        daily_htf = fetch_market_data(ticker, "2y", "1d")
+        if df_15m.empty or daily_htf.empty: return None
+        
+        resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df_15m.groupby(df_15m.index.date) for i in range(0, len(group), 5) if len(chunk := group.iloc[i:i+5]) > 0]
+        df_htf = pd.DataFrame(resampled).set_index('Datetime')
+        weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
+        available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
+        
+        expanded_start = target_entry_start - pd.Timedelta(days=15) if scan_state != "4" else target_entry_start - pd.Timedelta(days=60)
+        expanded_days = available_dates[(available_dates >= expanded_start) & (available_dates <= target_entry_end)]
+        
+        for d in expanded_days:
+            r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, mss_limit, scan_state, d, strict_opposite, target_method, target_entry_start, target_entry_end)
+            if r_today: res.extend(r_today)
 
         if res:
             unique_res, seen_mss_lines, seen_entries = [], set(), set()
@@ -597,51 +343,24 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
     except: return None
 
 # --- MAIN UI LAYOUT ---
-st.markdown("<h2>⚡ Ultimate ICT Precision Screener</h2>", unsafe_allow_html=True)
-st.caption("Locate Institutional Supply & Demand Zones")
+st.markdown("<h2>⚡ Weekly MTF Precision Screener</h2>", unsafe_allow_html=True)
+st.caption("Hardcoded for Previous Weekly High/Low Sweeps (Multiple Touches Allowed)")
 
 with st.container():
     c1, c2 = st.columns(2)
     with c1:
-        timeframe = st.selectbox("Execution Timeframe", ["15 Minute", "75 Minute", "125 Minute", "Daily"])
-    with c2:
         scan_state = st.selectbox(
             "Select Market State", 
             ["1. MSS done (Swing high not yet formed)", "2. Awaiting entry (Price has not touched Entry Level)", "3. Trade open (Price has touched Entry, SL/Target not hit)", "4. Previous reports (Date Range Backtest Mode)"]
         )
         state_code = scan_state.split(".")[0]
-
-with st.container():
-    if timeframe == "15 Minute":
-        sweep_type = st.selectbox("HTF Liquidity Sweep Level", ["Daily Liquidity Sweep", "Previous Weekly Candle Liquidity Sweep", "Weekly Swing High/Low Liquidity Sweep"])
-        if sweep_type == "Daily Liquidity Sweep":
-            c3, c4 = st.columns(2)
-            with c3: entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
-            with c4: target_method = st.selectbox("Target Strategy", ["Structural Anchor (Momentum Peak)", "Fixed 1:2 Risk-to-Reward"])
-            weekly_touch_limit = "Multiple touches allowed"
-        else:
-            entry_method = "15m S/D Base"
-            c3, c4 = st.columns(2)
-            with c3: target_method = st.selectbox("Target Strategy", ["Nearest 15 min swing point", "Fixed 1:2 Risk-to-Reward"])
-            with c4: weekly_touch_limit = st.selectbox("Weekly Sweep Touch Rule", ["Multiple touches allowed", "Only single touch allowed (First sweep only)"])
-    elif timeframe in ["75 Minute", "125 Minute"]:
-        sweep_type = st.selectbox("HTF Liquidity Sweep Level (Weekly)", ["Previous Weekly Candle Liquidity Sweep", "Weekly Swing High/Low Liquidity Sweep"])
-        entry_method = "15m S/D Base"
-        c3, c4 = st.columns(2)
-        with c3: target_method = st.selectbox("Target Strategy", ["Nearest 15 min swing point", "Fixed 1:2 Risk-to-Reward"])
-        with c4: weekly_touch_limit = st.selectbox("Weekly Sweep Touch Rule", ["Multiple touches allowed", "Only single touch allowed (First sweep only)"])
-    elif timeframe == "Daily":
-        sweep_type = None
-        c3, c4 = st.columns(2)
-        with c3: entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
-        with c4: target_method = st.selectbox("Target Strategy", ["Daily Anchor Swing (Momentum Peak)", "Monthly Untested Swing", "Fixed 1:2 Risk-to-Reward"])
-        weekly_touch_limit = "Multiple touches allowed"
+    with c2:
+        target_method = st.selectbox("Target Strategy", ["Nearest 15 min swing point", "Fixed 1:2 Risk-to-Reward"])
 
 with st.container():
     c5, c6 = st.columns(2)
     with c5:
-        mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
-        mss_limit = st.select_slider("Max Displacement Candles for MSS", options=mss_options, value=6)
+        mss_limit = st.select_slider("Max Displacement Candles for MSS", options=list(range(1, 11)), value=6)
     with c6:
         st.write("")
         st.write("")
@@ -652,20 +371,14 @@ if state_code == "4":
         st.markdown("<p style='color:#E2E8F0;font-weight:600;'>Backtest Parameters</p>", unsafe_allow_html=True)
         today = pd.to_datetime(datetime.now(ist).date())
         c7, c8 = st.columns(2)
-        if timeframe in ["15 Minute", "75 Minute", "125 Minute"]:
-            valid_dates = get_valid_trading_dates()
-            valid_dates_rev = list(reversed(valid_dates))
-            if valid_dates_rev:
-                with c7: from_date_str = st.selectbox("From Date", valid_dates_rev, index=len(valid_dates_rev)-1, format_func=lambda x: x.strftime('%d %b %Y'))
-                with c8: to_date_str = st.selectbox("To Date", valid_dates_rev, index=0, format_func=lambda x: x.strftime('%d %b %Y'))
-                start_date, end_date = pd.to_datetime(from_date_str), pd.to_datetime(to_date_str)
-            else:
-                start_date, end_date = today, today
+        valid_dates = get_valid_trading_dates()
+        valid_dates_rev = list(reversed(valid_dates))
+        if valid_dates_rev:
+            with c7: from_date_str = st.selectbox("From Date", valid_dates_rev, index=len(valid_dates_rev)-1, format_func=lambda x: x.strftime('%d %b %Y'))
+            with c8: to_date_str = st.selectbox("To Date", valid_dates_rev, index=0, format_func=lambda x: x.strftime('%d %b %Y'))
+            start_date, end_date = pd.to_datetime(from_date_str), pd.to_datetime(to_date_str)
         else:
-            month_opts = [(today - pd.DateOffset(months=i)).strftime('%Y-%m-01') for i in range(24)]
-            with c7: from_month_str = st.selectbox("From Month", reversed(month_opts), format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
-            with c8: to_month_str = st.selectbox("To Month", month_opts, format_func=lambda x: pd.to_datetime(x).strftime('%B %Y'))
-            start_date, end_date = pd.to_datetime(from_month_str), pd.to_datetime(to_month_str) + pd.offsets.MonthEnd(0)
+            start_date, end_date = today, today
         risk_per_trade = st.number_input("Risk per Trade (₹)", min_value=100, value=1000, step=100)
 else:
     start_date = end_date = pd.to_datetime(datetime.now(ist).date())
@@ -673,29 +386,25 @@ else:
 
 st.write("")
 col_btn1, col_btn2 = st.columns([3,1])
-with col_btn1:
-    execute_scan = st.button("🚀 Execute Master Scan", type="primary")
+with col_btn1: execute_scan = st.button("🚀 Execute Master Scan", type="primary")
 with col_btn2:
     if st.button("🗑️ Clear Cache", type="secondary"):
-        if os.path.exists(CACHE_DIR):
-            shutil.rmtree(CACHE_DIR)
-            os.makedirs(CACHE_DIR)
+        if os.path.exists(CACHE_DIR): shutil.rmtree(CACHE_DIR); os.makedirs(CACHE_DIR)
         st.session_state['scan_run'] = False
         st.session_state['scan_results'] = None
         st.rerun()
 
 if execute_scan:
-    if state_code == "4" and start_date > end_date: 
-        st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
+    if state_code == "4" and start_date > end_date: st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
     else:
         keep_screen_awake()
-        with st.spinner(f"Scanning Nifty 500 | Smart Delta Cache Enabled | State: {state_code}..."):
+        with st.spinner(f"Scanning Nifty 500 | Weekly MTF Logic | State: {state_code}..."):
             progress_bar = st.progress(0, text="Downloading Daily History... 0 / 500 assets (0%)")
             tickers = get_nifty500_symbols()
             results = []
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                futures = {executor.submit(scan_ticker, tick, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit): tick for tick in tickers}
+                futures = {executor.submit(scan_ticker, tick, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, target_method): tick for tick in tickers}
                 
                 completed = 0
                 for f in concurrent.futures.as_completed(futures):
@@ -718,8 +427,7 @@ if st.session_state.get('scan_run', False):
     saved_state_code = st.session_state.get('current_state_code', state_code)
     saved_risk = st.session_state.get('current_risk', 1000)
     
-    if not results: 
-        st.warning("No stocks matched these criteria. (Try expanding the date range).")
+    if not results: st.warning("No stocks matched these criteria. (Try expanding the date range).")
     else:
         df_all = pd.DataFrame(results)
         if saved_state_code == "4":
