@@ -185,7 +185,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
                                         setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((cmp - entry_price)/cmp)*100, 2)}%"})
                                         
-                                        # STRICT NEXT-CANDLE RULE
                                         start_tracking_idx = df_index.index(confirm_idx)
                                         if start_tracking_idx + 1 < len(df_index):
                                             tracking_df = df.iloc[start_tracking_idx + 1:]
@@ -243,7 +242,6 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                     if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
                                         setup_data.update({"Entry Type": entry_type, "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((entry_price - cmp)/cmp)*100, 2)}%"})
                                         
-                                        # STRICT NEXT-CANDLE RULE
                                         start_tracking_idx = df_index.index(confirm_idx)
                                         if start_tracking_idx + 1 < len(df_index):
                                             tracking_df = df.iloc[start_tracking_idx + 1:]
@@ -271,7 +269,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                                     setups.append(setup_data)
     return setups
 
-def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method):
+def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit):
     setups = []
     if d not in daily_htf.index: return setups
     daily_candle = daily_htf.loc[d]
@@ -291,8 +289,17 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
     time_fmt = '%Y-%m-%d %H:%M'
     df_15m_index = df_15m.index.tolist()
     
+    # SINGLE TOUCH LOGIC EVALUATION
+    bull_already_touched = False
+    bear_already_touched = False
+    if "single touch" in weekly_touch_limit.lower():
+        days_before_d = daily_htf.loc[(daily_htf.index >= current_monday) & (daily_htf.index < d)]
+        if not days_before_d.empty:
+            bull_already_touched = not days_before_d[days_before_d['Low'] <= pwl].empty
+            bear_already_touched = not days_before_d[days_before_d['High'] >= pwh].empty
+    
     # Bullish
-    if daily_candle['Low'] <= pwl:
+    if not bull_already_touched and daily_candle['Low'] <= pwl:
         future_75m = df_75m.loc[d.strftime('%Y-%m-%d'):]
         if not future_75m.empty:
             bull_sweeps = future_75m[future_75m['Low'] <= pwl]
@@ -321,7 +328,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                 if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
                                                     setup_data = {"Direction": "Bullish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m/125m)": round(sh_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((cmp - entry_price)/cmp)*100, 2)}%", "Entry Time": "Pending"}
                                                     
-                                                    # STRICT NEXT-CANDLE RULE
                                                     start_tracking_idx = df_15m_index.index(mss_idx_75m)
                                                     if start_tracking_idx + 1 < len(df_15m_index):
                                                         tracking_df = df_15m.iloc[start_tracking_idx + 1:]
@@ -349,7 +355,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                                 setups.append(setup_data)
 
     # Bearish
-    if daily_candle['High'] >= pwh:
+    if not bear_already_touched and daily_candle['High'] >= pwh:
         future_75m = df_75m.loc[d.strftime('%Y-%m-%d'):]
         if not future_75m.empty:
             bear_sweeps = future_75m[future_75m['High'] >= pwh]
@@ -378,7 +384,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                 if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
                                                     setup_data = {"Direction": "Bearish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m/125m)": round(sl_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((entry_price - cmp)/cmp)*100, 2)}%", "Entry Time": "Pending"}
                                                     
-                                                    # STRICT NEXT-CANDLE RULE
                                                     start_tracking_idx = df_15m_index.index(mss_idx_75m)
                                                     if start_tracking_idx + 1 < len(df_15m_index):
                                                         tracking_df = df_15m.iloc[start_tracking_idx + 1:]
@@ -406,7 +411,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                                 setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method):
+def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method, weekly_touch_limit):
     try:
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
@@ -441,7 +446,7 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                 available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
                 days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
                 for d in days_in_range:
-                    r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method)
+                    r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit)
                     if r_today: res.extend(r_today)
         elif timeframe in ["75 Minute", "125 Minute"]:
             df_15m = fetch_market_data(ticker, "60d", "15m")
@@ -454,7 +459,7 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
             available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
             days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
             for d in days_in_range:
-                r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method)
+                r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit)
                 if r_today: res.extend(r_today)
         else: 
             df = fetch_market_data(ticker, "5y", "1d")
@@ -515,19 +520,23 @@ with st.sidebar:
         if sweep_type == "Daily Liquidity Sweep":
             entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
             target_method = st.selectbox("Target Strategy", ["Structural Anchor (Momentum Peak)", "Fixed 1:2 Risk-to-Reward"])
+            weekly_touch_limit = "Multiple touches allowed"
         else:
             entry_method = "15m S/D Base"
             st.info("💡 MTF Sequence Active: Weekly Sweep -> Daily Sweep -> Unbounded 75m MSS -> 15m S/D Base.")
             target_method = st.selectbox("Target Strategy", ["Nearest 15 min swing point", "Fixed 1:2 Risk-to-Reward"])
+            weekly_touch_limit = st.radio("Weekly Sweep Touch Rule", ["Multiple touches allowed", "Only single touch allowed (First sweep only)"])
     elif timeframe in ["75 Minute", "125 Minute"]:
         sweep_type = st.selectbox("HTF Liquidity Sweep Level (Weekly)", ["Previous Weekly Candle Liquidity Sweep", "Weekly Swing High/Low Liquidity Sweep"])
         entry_method = "15m S/D Base"
         st.info("💡 Entry locked to **15m S/D Base** for advanced MTF execution.")
         target_method = st.selectbox("Target Strategy", ["Nearest 15 min swing point", "Fixed 1:2 Risk-to-Reward"])
+        weekly_touch_limit = st.radio("Weekly Sweep Touch Rule", ["Multiple touches allowed", "Only single touch allowed (First sweep only)"])
     elif timeframe == "Daily":
         sweep_type = None
         entry_method = st.selectbox("Entry Trigger Logic", ["Dynamic Discount (FVG / 61.8%)", "Breaker Block (Shallow Pullback)"])
         target_method = st.selectbox("Target Strategy", ["Daily Anchor Swing (Momentum Peak)", "Monthly Untested Swing", "Fixed 1:2 Risk-to-Reward"])
+        weekly_touch_limit = "Multiple touches allowed"
     
     mss_options = list(range(1, 16)) if timeframe == "Daily" else list(range(1, 11))
     mss_limit = st.selectbox("Max Displacement Candles for MSS", mss_options, index=6)
@@ -563,7 +572,7 @@ if st.button("🚀 Execute Master Scan", type="primary"):
             tickers = get_nifty500_symbols()
             results = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                futures = [executor.submit(scan_ticker, tick, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method) for tick in tickers]
+                futures = [executor.submit(scan_ticker, tick, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit) for tick in tickers]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res: results.extend(res)
