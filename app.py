@@ -1,20 +1,13 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import requests
-import io
 import concurrent.futures
 from datetime import datetime, timedelta
 import pytz
 import numpy as np
-import os
-import shutil
 
 st.set_page_config(page_title="Ultimate ICT Precision Scanner", layout="wide", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
-
-CACHE_DIR = "nifty500_data_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
 
 @st.cache_data(ttl=86400)
 def get_nifty500_symbols():
@@ -30,41 +23,33 @@ def get_valid_trading_dates():
     today = datetime.now(ist).date()
     return [today - timedelta(days=i) for i in range(60) if (today - timedelta(days=i)).weekday() < 5][::-1]
 
-def fetch_market_data(ticker, period, interval):
-    file_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}.csv")
-    t = yf.Ticker(ticker)
-    if os.path.exists(file_path):
-        try:
-            local_df = pd.read_csv(file_path, index_col=0, parse_dates=True)
-            if not local_df.empty:
-                last_date = local_df.index[-1]
-                now = datetime.now().replace(tzinfo=None)
-                if interval == '15m' and (now - last_date) > timedelta(minutes=15):
-                    recent_df = t.history(period="5d", interval="15m", auto_adjust=False)
-                    if not recent_df.empty:
-                        recent_df.index = recent_df.index.tz_convert('Asia/Kolkata').tz_localize(None) if recent_df.index.tz else recent_df.index.tz_localize(None)
-                        combined = pd.concat([local_df, recent_df])
-                        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
-                        sixty_days_ago = combined.index[-1] - pd.Timedelta(days=60)
-                        combined = combined[combined.index >= sixty_days_ago]
-                        combined.to_csv(file_path)
-                        return combined
-                elif interval == '1d' and (now - last_date) > timedelta(hours=24):
-                    recent_df = t.history(period="1mo", interval="1d", auto_adjust=False)
-                    if not recent_df.empty:
-                        recent_df.index = recent_df.index.tz_localize(None)
-                        combined = pd.concat([local_df, recent_df])
-                        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
-                        combined.to_csv(file_path)
-                        return combined
-                return local_df
-        except: pass 
-    df = t.history(period=period, interval=interval, auto_adjust=False)
-    if not df.empty:
-        if interval == '15m': df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
-        else: df.index = df.index.tz_localize(None)
-        df.to_csv(file_path)
-    return df
+# --- LIGHTNING FAST BULK DATA ENGINE ---
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_bulk_data(tickers, tf_category):
+    """Downloads all 500 stocks in a single vectorized network call."""
+    if tf_category == "intraday":
+        d15 = yf.download(tickers, period="60d", interval="15m", group_by="ticker", threads=True, auto_adjust=False, progress=False)
+        d1 = yf.download(tickers, period="2y", interval="1d", group_by="ticker", threads=True, auto_adjust=False, progress=False)
+        return d15, d1
+    else:
+        d1 = yf.download(tickers, period="5y", interval="1d", group_by="ticker", threads=True, auto_adjust=False, progress=False)
+        return None, d1
+
+def get_ticker_data(bulk_df, ticker, interval):
+    """Extracts lightning-fast preloaded data for a specific ticker."""
+    try:
+        if isinstance(bulk_df.columns, pd.MultiIndex):
+            if ticker in bulk_df.columns.levels[0]:
+                df = bulk_df[ticker].copy().dropna(how='all')
+            else: return pd.DataFrame()
+        else:
+            df = bulk_df.copy().dropna(how='all')
+            
+        if not df.empty:
+            if interval == '15m': df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
+            else: df.index = df.index.tz_localize(None)
+        return df
+    except: return pd.DataFrame()
 
 def get_recent_swing(df, current_idx, direction='high'):
     try:
@@ -190,24 +175,32 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                             tracking_df = df.iloc[start_tracking_idx + 1:]
                                             touched_entry_df = tracking_df[tracking_df['Low'] <= entry_price]
                                             
-                                            if touched_entry_df.empty and scan_state == "2": setups.append(setup_data)
+                                            if touched_entry_df.empty and scan_state == "2": 
+                                                setups.append(setup_data)
                                             elif not touched_entry_df.empty:
                                                 entry_idx = touched_entry_df.index[0]
                                                 setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                 if scan_state == "3":
                                                     end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                     entry_day_df = df.loc[entry_idx : end_of_day]
-                                                    if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
+                                                    
+                                                    # FAST C-OPTIMIZED LOOP
+                                                    is_active = not any((row.Low <= active_sl or row.High >= active_target) for row in entry_day_df.itertuples())
+                                                    if is_active:
                                                         setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
                                                         setups.append(setup_data)
                                                 elif scan_state == "4":
                                                     end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                     entry_day_df = df.loc[entry_idx:end_of_day]
+                                                    
                                                     outcome, exit_price, highest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                    for idx, row in entry_day_df.iterrows():
-                                                        highest_seen = max(highest_seen, row['High'])
-                                                        if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                        elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                    
+                                                    # FAST C-OPTIMIZED LOOP
+                                                    for row in entry_day_df.itertuples():
+                                                        highest_seen = max(highest_seen, row.High)
+                                                        if row.Low <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                        elif row.High >= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                        
                                                     setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
                                                     setups.append(setup_data)
 
@@ -254,17 +247,23 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                                 if scan_state == "3":
                                                     end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                     entry_day_df = df.loc[entry_idx : end_of_day]
-                                                    if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
+                                                    
+                                                    # FAST C-OPTIMIZED LOOP
+                                                    is_active = not any((row.High >= active_sl or row.Low <= active_target) for row in entry_day_df.itertuples())
+                                                    if is_active:
                                                         setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
                                                         setups.append(setup_data)
                                                 elif scan_state == "4":
                                                     end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                     entry_day_df = df.loc[entry_idx:end_of_day]
+                                                    
                                                     outcome, exit_price, lowest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                    for idx, row in entry_day_df.iterrows():
-                                                        lowest_seen = min(lowest_seen, row['Low'])
-                                                        if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                        elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                    
+                                                    # FAST C-OPTIMIZED LOOP
+                                                    for row in entry_day_df.itertuples():
+                                                        lowest_seen = min(lowest_seen, row.Low)
+                                                        if row.High >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                        elif row.Low <= active_target: outcome, exit_price = "Target Hit", active_target; break
                                                     setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
                                                     setups.append(setup_data)
     return setups
@@ -289,7 +288,6 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
     time_fmt = '%Y-%m-%d %H:%M'
     df_15m_index = df_15m.index.tolist()
     
-    # SINGLE TOUCH LOGIC EVALUATION
     bull_already_touched = False
     bear_already_touched = False
     if "single touch" in weekly_touch_limit.lower():
@@ -340,17 +338,24 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                             if scan_state == "3":
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx : end_of_day]
-                                                                if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
+                                                                
+                                                                # FAST C-OPTIMIZED LOOP
+                                                                is_active = not any((row.Low <= active_sl or row.High >= active_target) for row in entry_day_df.itertuples())
+                                                                if is_active:
                                                                     setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
                                                                     setups.append(setup_data)
                                                             elif scan_state == "4":
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx:end_of_day]
+                                                                
                                                                 outcome, exit_price, highest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                                for idx, row in entry_day_df.iterrows():
-                                                                    highest_seen = max(highest_seen, row['High'])
-                                                                    if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                                    elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                                
+                                                                # FAST C-OPTIMIZED LOOP
+                                                                for row in entry_day_df.itertuples():
+                                                                    highest_seen = max(highest_seen, row.High)
+                                                                    if row.Low <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                                    elif row.High >= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                                    
                                                                 setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
                                                                 setups.append(setup_data)
 
@@ -396,75 +401,68 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                             if scan_state == "3":
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx : end_of_day]
-                                                                if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
+                                                                
+                                                                # FAST C-OPTIMIZED LOOP
+                                                                is_active = not any((row.High >= active_sl or row.Low <= active_target) for row in entry_day_df.itertuples())
+                                                                if is_active:
                                                                     setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
                                                                     setups.append(setup_data)
                                                             elif scan_state == "4":
                                                                 end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
                                                                 entry_day_df = df_15m.loc[entry_idx:end_of_day]
+                                                                
                                                                 outcome, exit_price, lowest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                                for idx, row in entry_day_df.iterrows():
-                                                                    lowest_seen = min(lowest_seen, row['Low'])
-                                                                    if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                                    elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                                
+                                                                # FAST C-OPTIMIZED LOOP
+                                                                for row in entry_day_df.itertuples():
+                                                                    lowest_seen = min(lowest_seen, row.Low)
+                                                                    if row.High >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+                                                                    elif row.Low <= active_target: outcome, exit_price = "Target Hit", active_target; break
+                                                                    
                                                                 setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
                                                                 setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method, weekly_touch_limit):
+def scan_ticker(ticker, df_15m_all, daily_htf_all, timeframe, sweep_type, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, entry_method, target_method, weekly_touch_limit):
     try:
         start_date = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         end_date = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
         res = []
+        
+        df = get_ticker_data(df_15m_all, ticker, "15m") if df_15m_all is not None else pd.DataFrame()
+        daily_htf = get_ticker_data(daily_htf_all, ticker, "1d")
+        if daily_htf.empty: return None
+
         if timeframe == "15 Minute":
-            if sweep_type == "Daily Liquidity Sweep":
-                daily_htf = fetch_market_data(ticker, "2y", "1d")
-                df = fetch_market_data(ticker, "60d", "15m")
-                if df.empty or daily_htf.empty: return None
-                available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
-                if scan_state != "4":
-                    if start_date not in available_dates.values: start_date = available_dates.iloc[-1] 
-                    past_htf = daily_htf.loc[daily_htf.index < start_date]
-                    if len(past_htf) >= 1:
-                        pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
-                        r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), strict_opposite, entry_method, target_method, is_daily=False)
-                        if r_today: res.extend(r_today)
-                else: 
-                    days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
-                    for d in days_in_range:
-                        past_htf = daily_htf.loc[daily_htf.index < d]
-                        if len(past_htf) >= 1:
-                            r_today = evaluate_setup(df, past_htf['High'].iloc[-1], past_htf['Low'].iloc[-1], mss_limit, scan_state, d, d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), strict_opposite, entry_method, target_method, is_daily=False)
-                            if r_today: res.extend(r_today)
-            else:
-                df_15m = fetch_market_data(ticker, "60d", "15m")
-                daily_htf = fetch_market_data(ticker, "2y", "1d")
-                if df_15m.empty or daily_htf.empty: return None
-                resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df_15m.groupby(df_15m.index.date) for i in range(0, len(group), 5) if len(chunk := group.iloc[i:i+5]) > 0]
-                df_htf = pd.DataFrame(resampled).set_index('Datetime')
-                weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
-                available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
+            if df.empty: return None
+            available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
+            if scan_state != "4":
+                if start_date not in available_dates.values: start_date = available_dates.iloc[-1] 
+                past_htf = daily_htf.loc[daily_htf.index < start_date]
+                if len(past_htf) >= 1:
+                    pdl_today, pdh_today = past_htf['Low'].iloc[-1], past_htf['High'].iloc[-1]
+                    r_today = evaluate_setup(df, pdh_today, pdl_today, mss_limit, scan_state, start_date, start_date + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), strict_opposite, entry_method, target_method, is_daily=False)
+                    if r_today: res.extend(r_today)
+            else: 
                 days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
                 for d in days_in_range:
-                    r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit)
-                    if r_today: res.extend(r_today)
+                    past_htf = daily_htf.loc[daily_htf.index < d]
+                    if len(past_htf) >= 1:
+                        r_today = evaluate_setup(df, past_htf['High'].iloc[-1], past_htf['Low'].iloc[-1], mss_limit, scan_state, d, d + pd.Timedelta(days=1) - pd.Timedelta(seconds=1), strict_opposite, entry_method, target_method, is_daily=False)
+                        if r_today: res.extend(r_today)
         elif timeframe in ["75 Minute", "125 Minute"]:
-            df_15m = fetch_market_data(ticker, "60d", "15m")
-            daily_htf = fetch_market_data(ticker, "2y", "1d")
-            if df_15m.empty or daily_htf.empty: return None
+            if df.empty: return None
             chunk_size = 5 if timeframe == "75 Minute" else 8
-            resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df_15m.groupby(df_15m.index.date) for i in range(0, len(group), chunk_size) if len(chunk := group.iloc[i:i+chunk_size]) > 0]
+            resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df.groupby(df.index.date) for i in range(0, len(group), chunk_size) if len(chunk := group.iloc[i:i+chunk_size]) > 0]
             df_htf = pd.DataFrame(resampled).set_index('Datetime')
             weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
-            available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
+            available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
             days_in_range = available_dates[(available_dates >= start_date) & (available_dates <= end_date)]
             for d in days_in_range:
-                r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit)
+                r_today = evaluate_mtf_weekly_setup(ticker, df, df_htf, daily_htf, weekly_hist, sweep_type, mss_limit, scan_state, d, strict_opposite, target_method, weekly_touch_limit)
                 if r_today: res.extend(r_today)
         else: 
-            df = fetch_market_data(ticker, "5y", "1d")
-            if df.empty: return None
-            monthly_hist = df.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
+            monthly_hist = daily_htf.resample('ME').agg({'High':'max', 'Low':'min'}).dropna()
             if scan_state != "4":
                 target_month_start = start_date.replace(day=1)
                 hist_df = monthly_hist.loc[monthly_hist.index < target_month_start]
@@ -472,7 +470,7 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                 m_idx = hist_df.index[-1]
                 _, monthly_sh_val = get_recent_swing(monthly_hist, m_idx, 'high')
                 _, monthly_sl_val = get_recent_swing(monthly_hist, m_idx, 'low')
-                r_today = evaluate_setup(df, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, target_month_start, target_month_start + pd.offsets.MonthEnd(0), strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
+                r_today = evaluate_setup(daily_htf, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, target_month_start, target_month_start + pd.offsets.MonthEnd(0), strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
                 if r_today: res.extend(r_today)
             else:
                 months_in_range = pd.date_range(start=start_date.replace(day=1), end=end_date, freq='MS')
@@ -482,12 +480,11 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                     m_idx = hist_df.index[-1]
                     _, monthly_sh_val = get_recent_swing(monthly_hist, m_idx, 'high')
                     _, monthly_sl_val = get_recent_swing(monthly_hist, m_idx, 'low')
-                    r_month = evaluate_setup(df, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, m_start, m_start + pd.offsets.MonthEnd(0), strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
+                    r_month = evaluate_setup(daily_htf, hist_df['High'].iloc[-1], hist_df['Low'].iloc[-1], mss_limit, scan_state, m_start, m_start + pd.offsets.MonthEnd(0), strict_opposite, entry_method, target_method, True, monthly_sh_val, monthly_sl_val)
                     if r_month: res.extend(r_month)
 
         if res:
-            unique_res = []
-            seen_mss_lines, seen_entries = set(), set()
+            unique_res, seen_mss_lines, seen_entries = [], set(), set()
             for r in res: 
                 if 'Stock name' not in r or r['Stock name'] is None: r['Stock name'] = ticker.replace('.NS', '')
                 mss_val = r.get('MSS Line (75m/125m)', r.get('MSS Line', r.get('MSS price (Breaker)', None)))
@@ -498,16 +495,12 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
         return None
     except: return None
 
+# --- STREAMLIT UI ---
 st.title("🎯 Ultimate ICT Precision Scanner")
 
 with st.sidebar:
     st.header("⚙️ Scanner Configurations")
-    if st.button("🗑️ Clear Local Disk Cache", type="secondary"):
-        if os.path.exists(CACHE_DIR):
-            shutil.rmtree(CACHE_DIR)
-            os.makedirs(CACHE_DIR)
-            st.success("Local cache cleared! Next scan will download fresh data.")
-
+    
     timeframe = st.selectbox("Execution Timeframe", ["15 Minute", "75 Minute", "125 Minute", "Daily"])
     scan_state = st.selectbox(
         "Select Market State", 
@@ -568,11 +561,17 @@ with st.sidebar:
 if st.button("🚀 Execute Master Scan", type="primary"):
     if state_code == "4" and start_date > end_date: st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
     else:
-        with st.spinner(f"Scanning Nifty 500 | Smart Delta Cache Enabled | State: {state_code}..."):
-            tickers = get_nifty500_symbols()
+        tickers = get_nifty500_symbols()
+        
+        # BULK NETWORK FETCHING (Runs once, caches in RAM)
+        with st.spinner("Downloading Nifty 500 Bulk Data (Vectorized API)..."):
+            tf_cat = "intraday" if timeframe in ["15 Minute", "75 Minute", "125 Minute"] else "daily"
+            df_15m_all, df_1d_all = fetch_bulk_data(tickers, tf_cat)
+            
+        with st.spinner(f"Computing Algorithmic Setups | Lightning Cache Enabled | State: {state_code}..."):
             results = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                futures = [executor.submit(scan_ticker, tick, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit) for tick in tickers]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+                futures = [executor.submit(scan_ticker, tick, df_15m_all, df_1d_all, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit) for tick in tickers]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res: results.extend(res)
