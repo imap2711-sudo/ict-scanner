@@ -215,7 +215,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
     df_index = df.index.tolist()
     cmp = df['Close'].iloc[-1]
     
-    # Universal lookback expansion for finding sweeps
+    # Universal lookback expansion for finding sweeps unconditionally
     expanded_start = eval_start - pd.Timedelta(days=60)
     window_df = df.loc[(df.index >= expanded_start) & (df.index <= eval_end)]
         
@@ -265,8 +265,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                                 setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                 
                                                 if scan_state == "3":
-                                                    end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                    entry_day_df = df.loc[entry_idx : end_of_day]
+                                                    entry_day_df = df.loc[entry_idx : df.index[-1]] # Tracks all the way to simulated current time
                                                     if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
                                                         setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
                                                         setups.append(setup_data)
@@ -326,8 +325,7 @@ def evaluate_setup(df, htf_high, htf_low, mss_limit, scan_state, eval_start, eva
                                                 setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                 
                                                 if scan_state == "3":
-                                                    end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                    entry_day_df = df.loc[entry_idx : end_of_day]
+                                                    entry_day_df = df.loc[entry_idx : df.index[-1]] # Tracks all the way to simulated current time
                                                     if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
                                                         setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
                                                         setups.append(setup_data)
@@ -414,8 +412,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                             setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                             
                                                             if scan_state == "3":
-                                                                end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                                entry_day_df = df_15m.loc[entry_idx : end_of_day]
+                                                                entry_day_df = df_15m.loc[entry_idx : df_15m.index[-1]]
                                                                 if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
                                                                     setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
                                                                     setups.append(setup_data)
@@ -473,8 +470,7 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, sw
                                                             setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
                                                             
                                                             if scan_state == "3":
-                                                                end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                                entry_day_df = df_15m.loc[entry_idx : end_of_day]
+                                                                entry_day_df = df_15m.loc[entry_idx : df_15m.index[-1]]
                                                                 if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
                                                                     setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
                                                                     setups.append(setup_data)
@@ -515,7 +511,6 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
                 df = df_15m
                 available_dates = pd.Series(df.index.date).drop_duplicates().apply(pd.to_datetime)
                 
-                # UNBOUNDED LOOKBACK FOR LIVE SCANS: Always look back 60 days for sweeps
                 expanded_start = target_entry_start - pd.Timedelta(days=60)
                 expanded_days = available_dates[(available_dates >= expanded_start) & (available_dates <= target_entry_end)]
                 
