@@ -14,105 +14,46 @@ import shutil
 st.set_page_config(page_title="ICT Precision Scanner", layout="centered", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
 
+# Initialize Session State for Mobile App Switching
+if 'scan_run' not in st.session_state:
+    st.session_state['scan_run'] = False
+if 'scan_results' not in st.session_state:
+    st.session_state['scan_results'] = None
+
 custom_css = """
 <style>
     /* Main Backgrounds */
-    .stApp {
-        background-color: #0B1121;
-        color: #E2E8F0;
-    }
-    
-    /* Header & Typography */
-    h1, h2, h3, p, label {
-        color: #E2E8F0 !important;
-        font-family: 'Inter', sans-serif !important;
-    }
-    
-    /* Hide Default Streamlit Chrome */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
+    .stApp { background-color: #0B1121; color: #E2E8F0; }
+    h1, h2, h3, p, label { color: #E2E8F0 !important; font-family: 'Inter', sans-serif !important; }
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
     
     /* Card Containers */
     div[data-testid="stVerticalBlock"] > div[style*="flex-direction: column;"] > div[data-testid="stVerticalBlock"] {
-        background-color: #161E2E;
-        padding: 20px;
-        border-radius: 12px;
-        border: 1px solid #1E293B;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        background-color: #161E2E; padding: 20px; border-radius: 12px; border: 1px solid #1E293B; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
     }
     
     /* Input Fields & Dropdowns */
     .stSelectbox div[data-baseweb="select"] > div, .stNumberInput input, .stDateInput input {
-        background-color: #0F172A !important;
-        color: white !important;
-        border: 1px solid #334155 !important;
-        border-radius: 8px !important;
+        background-color: #0F172A !important; color: white !important; border: 1px solid #334155 !important; border-radius: 8px !important;
     }
     
     /* Sliders */
-    .stSlider div[data-baseweb="slider"] div[data-testid="stTickBar"] > div {
-        background-color: #10B981 !important;
-    }
+    .stSlider div[data-baseweb="slider"] div[data-testid="stTickBar"] > div { background-color: #10B981 !important; }
     
-    /* Primary Execute Button */
-    button[kind="primary"] {
-        background-color: #EF4444 !important;
-        color: white !important;
-        font-weight: 600 !important;
-        border-radius: 8px !important;
-        border: none !important;
-        padding: 10px !important;
-        width: 100%;
-    }
-    button[kind="primary"]:hover {
-        background-color: #DC2626 !important;
-    }
+    /* Buttons */
+    button[kind="primary"] { background-color: #EF4444 !important; color: white !important; font-weight: 600 !important; border-radius: 8px !important; border: none !important; padding: 10px !important; width: 100%; }
+    button[kind="primary"]:hover { background-color: #DC2626 !important; }
+    button[kind="secondary"] { background-color: #3B82F6 !important; color: white !important; border-radius: 8px !important; border: none !important; font-weight: 500 !important; }
+    button[kind="secondary"]:hover { background-color: #2563EB !important; }
     
-    /* Secondary Action Button */
-    button[kind="secondary"] {
-        background-color: #3B82F6 !important;
-        color: white !important;
-        border-radius: 8px !important;
-        border: none !important;
-        font-weight: 500 !important;
-    }
-    button[kind="secondary"]:hover {
-        background-color: #2563EB !important;
-    }
-    
-    /* Custom Tabs (Demand/Supply Style) */
-    div[data-baseweb="tab-list"] {
-        gap: 10px;
-        background-color: transparent;
-    }
-    div[data-baseweb="tab"] {
-        background-color: #1E293B;
-        border-radius: 8px !important;
-        padding: 10px 20px !important;
-        border: 1px solid #334155;
-        color: white !important;
-        font-weight: 600;
-        margin: 0 !important;
-        flex: 1;
-        justify-content: center;
-    }
-    /* Active Bullish Tab */
-    div[data-baseweb="tab"][aria-selected="true"]:nth-child(1) {
-        background-color: #10B981 !important;
-        border-color: #059669 !important;
-    }
-    /* Active Bearish Tab */
-    div[data-baseweb="tab"][aria-selected="true"]:nth-child(2) {
-        background-color: #EF4444 !important;
-        border-color: #DC2626 !important;
-    }
+    /* Custom Tabs */
+    div[data-baseweb="tab-list"] { gap: 10px; background-color: transparent; }
+    div[data-baseweb="tab"] { background-color: #1E293B; border-radius: 8px !important; padding: 10px 20px !important; border: 1px solid #334155; color: white !important; font-weight: 600; margin: 0 !important; flex: 1; justify-content: center; }
+    div[data-baseweb="tab"][aria-selected="true"]:nth-child(1) { background-color: #10B981 !important; border-color: #059669 !important; }
+    div[data-baseweb="tab"][aria-selected="true"]:nth-child(2) { background-color: #EF4444 !important; border-color: #DC2626 !important; }
     
     /* Dataframes */
-    [data-testid="stDataFrame"] {
-        background-color: #0F172A;
-        border-radius: 8px;
-    }
+    [data-testid="stDataFrame"] { background-color: #0F172A; border-radius: 8px; }
 </style>
 """
 st.markdown(custom_css, unsafe_allow_html=True)
@@ -601,7 +542,6 @@ def scan_ticker(ticker, timeframe, sweep_type, mss_limit, scan_state, start_date
         return None
     except: return None
 
-
 # --- MAIN UI LAYOUT ---
 st.markdown("<h2>⚡ Ultimate ICT Precision Screener</h2>", unsafe_allow_html=True)
 st.caption("Locate Institutional Supply & Demand Zones")
@@ -686,69 +626,81 @@ with col_btn2:
         if os.path.exists(CACHE_DIR):
             shutil.rmtree(CACHE_DIR)
             os.makedirs(CACHE_DIR)
+        st.session_state['scan_run'] = False
+        st.session_state['scan_results'] = None
         st.rerun()
 
 if execute_scan:
-    if state_code == "4" and start_date > end_date: st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
+    if state_code == "4" and start_date > end_date: 
+        st.error("Error: 'From Date' must be earlier than or equal to 'To Date'.")
     else:
-        progress_bar = st.progress(0, text="Downloading Daily History... 0 / 500 assets (0%)")
-        tickers = get_nifty500_symbols()
-        results = []
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-            futures = {executor.submit(scan_ticker, tick, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit): tick for tick in tickers}
+        with st.spinner(f"Scanning Nifty 500 | Smart Delta Cache Enabled | State: {state_code}..."):
+            progress_bar = st.progress(0, text="Downloading Daily History... 0 / 500 assets (0%)")
+            tickers = get_nifty500_symbols()
+            results = []
             
-            completed = 0
-            for f in concurrent.futures.as_completed(futures):
-                res = f.result()
-                if res: results.extend(res)
-                completed += 1
-                progress_bar.progress(completed / 500, text=f"Downloading History... {completed} / 500 assets ({int((completed/500)*100)}%)")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+                futures = {executor.submit(scan_ticker, tick, timeframe, sweep_type, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, entry_method, target_method, weekly_touch_limit): tick for tick in tickers}
                 
-        progress_bar.empty()
-        
-        if not results: st.warning("No stocks matched these criteria. (Try expanding the date range).")
-        else:
-            df_all = pd.DataFrame(results)
-            if state_code == "4":
-                def calculate_metrics(row):
-                    entry_key, sl_key, risk = 'Entry', 'SL', risk_per_trade
-                    risk_dist = abs(row[entry_key] - row[sl_key])
-                    if risk_dist == 0: return pd.Series([0.0, 0.0], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
-                    qty = int(risk / risk_dist)
-                    funds_needed = round(qty * row[entry_key], 2)
-                    reward_dist = abs(row['Target'] - row[entry_key])
-                    reward_ratio = reward_dist / risk_dist
+                completed = 0
+                for f in concurrent.futures.as_completed(futures):
+                    res = f.result()
+                    if res: results.extend(res)
+                    completed += 1
+                    progress_bar.progress(completed / 500, text=f"Downloading History... {completed} / 500 assets ({int((completed/500)*100)}%)")
                     
-                    if row['Outcome'] == 'Target Hit': pnl = risk * reward_ratio
-                    elif row['Outcome'] == 'SL Hit': pnl = -risk
-                    elif row['Outcome'] == 'Time Square Off': pnl = qty * (row['Exit Price'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['Exit Price'])
-                    else: pnl = qty * (row['CMP'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['CMP'])
-                    return pd.Series([round(pnl, 2), funds_needed], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
-                df_all[['Profit/Loss (₹)', 'Funds Needed (₹)']] = df_all.apply(calculate_metrics, axis=1)
+            progress_bar.empty()
             
-            df_bull, df_bear = df_all[df_all['Direction'] == 'Bullish'], df_all[df_all['Direction'] == 'Bearish']
-            
-            tab1, tab2 = st.tabs(["🟢 Fresh Demand Zones (Buy)", "🔴 Fresh Supply Zones (Short)"])
-            
-            def render_tab_content(df, title):
-                st.markdown(f"<p style='color:#E2E8F0;'>Qualified Zones: <b>{len(df)}</b></p>", unsafe_allow_html=True)
-                if df.empty: st.info(f"No {title} Setups.")
-                else:
-                    cols = df.columns.tolist()
-                    if 'Stock name' in cols: cols.insert(0, cols.pop(cols.index('Stock name')))
-                    df = df[cols]
-                    if state_code == "4":
-                        total_pnl, total_funds = df['Profit/Loss (₹)'].sum(), df['Funds Needed (₹)'].sum()
-                        wins, losses = len(df[df['Profit/Loss (₹)'] > 0]), len(df[df['Profit/Loss (₹)'] <= 0])
-                        win_rate = (wins / len(df) * 100) if len(df) > 0 else 0
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Total P&L", f"₹ {total_pnl:,.2f}")
-                        c2.metric("Funds Reqd", f"₹ {total_funds:,.2f}")
-                        c3.metric("Win Rate", f"{win_rate:.1f}%")
-                        c4.metric("Trades", f"{wins}W/{losses}L")
-                        st.write("")
-                    st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
+            # Store in session state to survive app switches
+            st.session_state['scan_results'] = results
+            st.session_state['scan_run'] = True
 
-            with tab1: render_tab_content(df_bull, "Demand")
-            with tab2: render_tab_content(df_bear, "Supply")
+if st.session_state.get('scan_run', False):
+    results = st.session_state.get('scan_results', [])
+    
+    if not results: 
+        st.warning("No stocks matched these criteria. (Try expanding the date range).")
+    else:
+        df_all = pd.DataFrame(results)
+        if state_code == "4":
+            def calculate_metrics(row):
+                entry_key, sl_key, risk = 'Entry', 'SL', risk_per_trade
+                risk_dist = abs(row[entry_key] - row[sl_key])
+                if risk_dist == 0: return pd.Series([0.0, 0.0], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
+                qty = int(risk / risk_dist)
+                funds_needed = round(qty * row[entry_key], 2)
+                reward_dist = abs(row['Target'] - row[entry_key])
+                reward_ratio = reward_dist / risk_dist
+                
+                if row['Outcome'] == 'Target Hit': pnl = risk * reward_ratio
+                elif row['Outcome'] == 'SL Hit': pnl = -risk
+                elif row['Outcome'] == 'Time Square Off': pnl = qty * (row['Exit Price'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['Exit Price'])
+                else: pnl = qty * (row['CMP'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['CMP'])
+                return pd.Series([round(pnl, 2), funds_needed], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
+            df_all[['Profit/Loss (₹)', 'Funds Needed (₹)']] = df_all.apply(calculate_metrics, axis=1)
+        
+        df_bull, df_bear = df_all[df_all['Direction'] == 'Bullish'], df_all[df_all['Direction'] == 'Bearish']
+        
+        tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
+        
+        def render_tab_content(df, title):
+            st.markdown(f"<p style='color:#E2E8F0;'>Qualified Zones: <b>{len(df)}</b></p>", unsafe_allow_html=True)
+            if df.empty: st.info(f"No {title} Setups.")
+            else:
+                cols = df.columns.tolist()
+                if 'Stock name' in cols: cols.insert(0, cols.pop(cols.index('Stock name')))
+                df = df[cols]
+                if state_code == "4":
+                    total_pnl, total_funds = df['Profit/Loss (₹)'].sum(), df['Funds Needed (₹)'].sum()
+                    wins, losses = len(df[df['Profit/Loss (₹)'] > 0]), len(df[df['Profit/Loss (₹)'] <= 0])
+                    win_rate = (wins / len(df) * 100) if len(df) > 0 else 0
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Total P&L", f"₹ {total_pnl:,.2f}")
+                    c2.metric("Funds Reqd", f"₹ {total_funds:,.2f}")
+                    c3.metric("Win Rate", f"{win_rate:.1f}%")
+                    c4.metric("Trades", f"{wins}W/{losses}L")
+                    st.write("")
+                st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
+
+        with tab1: render_tab_content(df_bull, "Demand")
+        with tab2: render_tab_content(df_bear, "Supply")
