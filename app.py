@@ -135,12 +135,6 @@ def get_post_mss_swing(df, mss_idx, direction='high'):
         return None, None, None
     except: return None, None, None
 
-def calculate_floating_pnl(direction, cmp, entry, stop_loss, risk_amt):
-    risk_dist = abs(entry - stop_loss)
-    if risk_dist == 0: return 0.0
-    qty = int(risk_amt / risk_dist)
-    return round(qty * (cmp - entry), 2) if direction == 'Bullish' else round(qty * (entry - cmp), 2)
-
 def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
     try:
         leg_df = df_15m.loc[sweep_time:mss_time]
@@ -177,7 +171,7 @@ def find_sd_zone(df_15m, sweep_time, mss_time, mss_price, direction):
         return proximal, distal, legout_count
     except: return None, None, 0
 
-def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, mss_limit, scan_state, d, strict_opposite, target_method, target_entry_start=None, target_entry_end=None):
+def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, mss_limit, scan_state, d, strict_opposite, target_method, target_entry_start, target_entry_end, risk_per_trade):
     setups = []
     if d not in daily_htf.index: return setups
     cmp = df_15m['Close'].iloc[-1]
@@ -206,52 +200,85 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, ms
                         mss_cands = post_sweep_75m[post_sweep_75m['Close'] > sh_val_75m]
                         if not mss_cands.empty:
                             mss_idx_75m = mss_cands.index[0]
-                            proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sh_val_75m, 'Bullish')
-                            
-                            if proximal and distal and 1 <= legout_count <= 3:
-                                _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'high')
-                                if target_val:
-                                    entry_price = proximal
-                                    active_sl = distal * 0.999
-                                    risk_dist = abs(entry_price - active_sl)
-                                    if risk_dist > 0:
-                                        active_target = entry_price + (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
-                                        if active_target > entry_price and active_sl < entry_price:
-                                            actual_rr = (active_target - entry_price) / risk_dist
-                                            if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
-                                                setup_data = {"Direction": "Bullish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m/125m)": round(sh_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((cmp - entry_price)/cmp)*100, 2)}%", "Entry Time": "Pending"}
-                                                
-                                                start_tracking_idx = df_15m_index.index(mss_idx_75m)
-                                                if start_tracking_idx + 1 < len(df_15m_index):
-                                                    tracking_df = df_15m.iloc[start_tracking_idx + 1:]
-                                                    touched_entry_df = tracking_df[tracking_df['Low'] <= entry_price]
-                                                    
-                                                    # State 1: MSS completed, Entry awaited
-                                                    if touched_entry_df.empty and scan_state == "1": setups.append(setup_data)
-                                                    elif not touched_entry_df.empty:
-                                                        entry_idx = touched_entry_df.index[0]
-                                                        setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
+                            # RULE 8 ENFORCEMENT: Sweep and MSS MUST be on the exact same day
+                            if sweep_idx_75m.date() == mss_idx_75m.date():
+                                proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sh_val_75m, 'Bullish')
+                                
+                                if proximal and distal and 1 <= legout_count <= 3:
+                                    _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'high')
+                                    if target_val:
+                                        entry_price = proximal
+                                        active_sl = distal * 0.999
+                                        risk_dist = abs(entry_price - active_sl)
+                                        
+                                        if risk_dist > 0:
+                                            qty = int(risk_per_trade / risk_dist)
+                                            if qty > 0:
+                                                active_target = entry_price + (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
+                                                if active_target > entry_price and active_sl < entry_price:
+                                                    actual_rr = (active_target - entry_price) / risk_dist
+                                                    if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
+                                                        setup_data = {"Direction": "Bullish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m)": round(sh_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((cmp - entry_price)/cmp)*100, 2)}%", "Entry Time": "Pending"}
                                                         
-                                                        # State 2: Running trades
-                                                        if scan_state == "2" and entry_idx.date() == target_entry_end.date():
-                                                            end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                            entry_day_df = df_15m.loc[entry_idx : end_of_day]
-                                                            if not any((row['Low'] <= active_sl or row['High'] >= active_target) for _, row in entry_day_df.iterrows()):
-                                                                setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bullish", cmp, entry_price, active_sl, 1000)})
-                                                                setups.append(setup_data)
-                                                        
-                                                        # State 3: Backtester
-                                                        elif scan_state == "3":
-                                                            if target_entry_start <= entry_idx <= target_entry_end:
-                                                                end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                                entry_day_df = df_15m.loc[entry_idx:end_of_day]
-                                                                outcome, exit_price, highest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                                for idx, row in entry_day_df.iterrows():
-                                                                    highest_seen = max(highest_seen, row['High'])
-                                                                    if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                                    elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
-                                                                setup_data.update({"Max Move (%)": f"{round(((highest_seen - entry_price) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
-                                                                setups.append(setup_data)
+                                                        start_tracking_idx = df_15m_index.index(mss_idx_75m)
+                                                        if start_tracking_idx + 1 < len(df_15m_index):
+                                                            tracking_df = df_15m.iloc[start_tracking_idx + 1:]
+                                                            touched_entry_df = tracking_df[tracking_df['Low'] <= entry_price]
+                                                            
+                                                            if touched_entry_df.empty and scan_state == "1": setups.append(setup_data)
+                                                            elif not touched_entry_df.empty:
+                                                                entry_idx = touched_entry_df.index[0]
+                                                                
+                                                                # 5-DAY DELAY RULE: Void setups if entry triggers too late
+                                                                if (entry_idx.date() - mss_idx_75m.date()).days <= 5:
+                                                                    open_px = df_15m.loc[entry_idx, 'Open']
+                                                                    # Slippage Logic: Fill at Open if gapped below limit
+                                                                    actual_entry = open_px if open_px < entry_price else entry_price
+                                                                    funds_needed = qty * actual_entry
+                                                                    
+                                                                    setup_data.update({
+                                                                        "Entry Time": entry_idx.strftime('%Y-%m-%d %H:%M'), 
+                                                                        "Entry": round(actual_entry, 2), 
+                                                                        "Funds Needed (₹)": round(funds_needed, 2)
+                                                                    })
+                                                                    
+                                                                    end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
+                                                                    entry_day_df = df_15m.loc[entry_idx : end_of_day]
+                                                                    
+                                                                    if scan_state == "2" and entry_idx.date() == target_entry_end.date():
+                                                                        pnl = qty * (cmp - actual_entry)
+                                                                        setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": round(pnl, 2)})
+                                                                        
+                                                                        already_closed = False
+                                                                        if actual_entry <= active_sl: already_closed = True
+                                                                        else:
+                                                                            for idx, row in entry_day_df.iterrows():
+                                                                                if row['Low'] <= active_sl or row['High'] >= active_target:
+                                                                                    already_closed = True; break
+                                                                        if not already_closed: setups.append(setup_data)
+                                                                            
+                                                                    elif scan_state == "3":
+                                                                        if target_entry_start <= entry_idx <= target_entry_end:
+                                                                            outcome, exit_price, highest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], actual_entry
+                                                                            
+                                                                            if actual_entry <= active_sl:
+                                                                                outcome, exit_price = "Gap SL Hit", open_px
+                                                                            else:
+                                                                                for idx, row in entry_day_df.iterrows():
+                                                                                    highest_seen = max(highest_seen, row['High'])
+                                                                                    if row['Low'] <= active_sl:
+                                                                                        outcome, exit_price = "SL Hit", active_sl; break
+                                                                                    elif row['High'] >= active_target:
+                                                                                        outcome, exit_price = "Target Hit", active_target; break
+                                                                                        
+                                                                            pnl = qty * (exit_price - actual_entry)
+                                                                            setup_data.update({
+                                                                                "Max Move (%)": f"{round(((highest_seen - actual_entry) / actual_entry) * 100, 2)}%", 
+                                                                                "Outcome": outcome, 
+                                                                                "Exit Price": round(exit_price, 2), 
+                                                                                "Profit/Loss (₹)": round(pnl, 2)
+                                                                            })
+                                                                            setups.append(setup_data)
 
     # Bearish Sequence (Previous Weekly High)
     if not future_75m.empty:
@@ -266,55 +293,88 @@ def evaluate_mtf_weekly_setup(ticker, df_15m, df_75m, daily_htf, weekly_hist, ms
                         mss_cands = post_sweep_75m[post_sweep_75m['Close'] < sl_val_75m]
                         if not mss_cands.empty:
                             mss_idx_75m = mss_cands.index[0]
-                            proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sl_val_75m, 'Bearish')
-                            
-                            if proximal and distal and 1 <= legout_count <= 3:
-                                _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'low')
-                                if target_val:
-                                    entry_price = proximal
-                                    active_sl = distal * 1.001
-                                    risk_dist = abs(entry_price - active_sl)
-                                    if risk_dist > 0:
-                                        active_target = entry_price - (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
-                                        if active_target < entry_price and active_sl > entry_price:
-                                            actual_rr = (entry_price - active_target) / risk_dist
-                                            if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
-                                                setup_data = {"Direction": "Bearish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m/125m)": round(sl_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((entry_price - cmp)/cmp)*100, 2)}%", "Entry Time": "Pending"}
-                                                
-                                                start_tracking_idx = df_15m_index.index(mss_idx_75m)
-                                                if start_tracking_idx + 1 < len(df_15m_index):
-                                                    tracking_df = df_15m.iloc[start_tracking_idx + 1:]
-                                                    touched_entry_df = tracking_df[tracking_df['High'] >= entry_price]
-                                                    
-                                                    # State 1: MSS completed, Entry awaited
-                                                    if touched_entry_df.empty and scan_state == "1": setups.append(setup_data)
-                                                    elif not touched_entry_df.empty:
-                                                        entry_idx = touched_entry_df.index[0]
-                                                        setup_data["Entry Time"] = entry_idx.strftime('%Y-%m-%d %H:%M')
+                            # RULE 8 ENFORCEMENT: Sweep and MSS MUST be on the exact same day
+                            if sweep_idx_75m.date() == mss_idx_75m.date():
+                                proximal, distal, legout_count = find_sd_zone(df_15m, sweep_idx_75m, mss_idx_75m, sl_val_75m, 'Bearish')
+                                
+                                if proximal and distal and 1 <= legout_count <= 3:
+                                    _, target_val, _ = get_post_mss_swing(df_15m, mss_idx_75m, 'low')
+                                    if target_val:
+                                        entry_price = proximal
+                                        active_sl = distal * 1.001
+                                        risk_dist = abs(entry_price - active_sl)
+                                        
+                                        if risk_dist > 0:
+                                            qty = int(risk_per_trade / risk_dist)
+                                            if qty > 0:
+                                                active_target = entry_price - (2 * risk_dist) if target_method == "Fixed 1:2 Risk-to-Reward" else target_val
+                                                if active_target < entry_price and active_sl > entry_price:
+                                                    actual_rr = (entry_price - active_target) / risk_dist
+                                                    if target_method == "Fixed 1:2 Risk-to-Reward" or actual_rr >= 1.0:
+                                                        setup_data = {"Direction": "Bearish", "Stock name": ticker, "CMP": round(cmp, 2), "Base Start (Sweep)": sweep_idx_75m.strftime(time_fmt), "Base End (MSS)": mss_idx_75m.strftime(time_fmt), "MSS Line (75m)": round(sl_val_75m, 2), "15m Leg-out Candles": legout_count, "Entry Type": "15m S/D Base", "Entry": round(entry_price, 2), "SL": round(active_sl, 2), "Target": round(active_target, 2), "Target RR": f"1:{round(actual_rr, 1)}", "Entry Distance": f"{round(((entry_price - cmp)/cmp)*100, 2)}%", "Entry Time": "Pending"}
                                                         
-                                                        # State 2: Running trades
-                                                        if scan_state == "2" and entry_idx.date() == target_entry_end.date():
-                                                            end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                            entry_day_df = df_15m.loc[entry_idx : end_of_day]
-                                                            if not any((row['High'] >= active_sl or row['Low'] <= active_target) for _, row in entry_day_df.iterrows()):
-                                                                setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": calculate_floating_pnl("Bearish", cmp, entry_price, active_sl, 1000)})
-                                                                setups.append(setup_data)
-                                                        
-                                                        # State 3: Backtester
-                                                        elif scan_state == "3":
-                                                            if target_entry_start <= entry_idx <= target_entry_end:
-                                                                end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
-                                                                entry_day_df = df_15m.loc[entry_idx:end_of_day]
-                                                                outcome, exit_price, lowest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], entry_price
-                                                                for idx, row in entry_day_df.iterrows():
-                                                                    lowest_seen = min(lowest_seen, row['Low'])
-                                                                    if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-                                                                    elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
-                                                                setup_data.update({"Max Move (%)": f"{round(((entry_price - lowest_seen) / entry_price) * 100, 2)}%", "Outcome": outcome, "Exit Price": round(exit_price, 2)})
-                                                                setups.append(setup_data)
+                                                        start_tracking_idx = df_15m_index.index(mss_idx_75m)
+                                                        if start_tracking_idx + 1 < len(df_15m_index):
+                                                            tracking_df = df_15m.iloc[start_tracking_idx + 1:]
+                                                            touched_entry_df = tracking_df[tracking_df['High'] >= entry_price]
+                                                            
+                                                            if touched_entry_df.empty and scan_state == "1": setups.append(setup_data)
+                                                            elif not touched_entry_df.empty:
+                                                                entry_idx = touched_entry_df.index[0]
+                                                                
+                                                                # 5-DAY DELAY RULE: Void setups if entry triggers too late
+                                                                if (entry_idx.date() - mss_idx_75m.date()).days <= 5:
+                                                                    open_px = df_15m.loc[entry_idx, 'Open']
+                                                                    # Slippage Logic: Fill at Open if gapped above limit
+                                                                    actual_entry = open_px if open_px > entry_price else entry_price
+                                                                    funds_needed = qty * actual_entry
+                                                                    
+                                                                    setup_data.update({
+                                                                        "Entry Time": entry_idx.strftime('%Y-%m-%d %H:%M'), 
+                                                                        "Entry": round(actual_entry, 2), 
+                                                                        "Funds Needed (₹)": round(funds_needed, 2)
+                                                                    })
+                                                                    
+                                                                    end_of_day = entry_idx.replace(hour=23, minute=59, second=59) if isinstance(entry_idx, pd.Timestamp) else entry_idx
+                                                                    entry_day_df = df_15m.loc[entry_idx : end_of_day]
+                                                                    
+                                                                    if scan_state == "2" and entry_idx.date() == target_entry_end.date():
+                                                                        pnl = qty * (actual_entry - cmp)
+                                                                        setup_data.update({"Entry Distance": "Touched (Active)", "Profit/Loss (₹)": round(pnl, 2)})
+                                                                        
+                                                                        already_closed = False
+                                                                        if actual_entry >= active_sl: already_closed = True
+                                                                        else:
+                                                                            for idx, row in entry_day_df.iterrows():
+                                                                                if row['High'] >= active_sl or row['Low'] <= active_target:
+                                                                                    already_closed = True; break
+                                                                        if not already_closed: setups.append(setup_data)
+                                                                            
+                                                                    elif scan_state == "3":
+                                                                        if target_entry_start <= entry_idx <= target_entry_end:
+                                                                            outcome, exit_price, lowest_seen = "Time Square Off", entry_day_df['Close'].iloc[-1], actual_entry
+                                                                            
+                                                                            if actual_entry >= active_sl:
+                                                                                outcome, exit_price = "Gap SL Hit", open_px
+                                                                            else:
+                                                                                for idx, row in entry_day_df.iterrows():
+                                                                                    lowest_seen = min(lowest_seen, row['Low'])
+                                                                                    if row['High'] >= active_sl:
+                                                                                        outcome, exit_price = "SL Hit", active_sl; break
+                                                                                    elif row['Low'] <= active_target:
+                                                                                        outcome, exit_price = "Target Hit", active_target; break
+                                                                                        
+                                                                            pnl = qty * (actual_entry - exit_price)
+                                                                            setup_data.update({
+                                                                                "Max Move (%)": f"{round(((actual_entry - lowest_seen) / actual_entry) * 100, 2)}%", 
+                                                                                "Outcome": outcome, 
+                                                                                "Exit Price": round(exit_price, 2), 
+                                                                                "Profit/Loss (₹)": round(pnl, 2)
+                                                                            })
+                                                                            setups.append(setup_data)
     return setups
 
-def scan_ticker(ticker, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, target_method):
+def scan_ticker(ticker, mss_limit, scan_state, start_date_str, end_date_str, strict_opposite, target_method, risk_per_trade):
     try:
         target_entry_start = pd.to_datetime(start_date_str).replace(hour=0, minute=0, second=0)
         target_entry_end = pd.to_datetime(end_date_str).replace(hour=23, minute=59, second=59)
@@ -324,7 +384,8 @@ def scan_ticker(ticker, mss_limit, scan_state, start_date_str, end_date_str, str
         daily_htf = fetch_market_data(ticker, "2y", "1d")
         if df_15m.empty or daily_htf.empty: return None
         
-        resampled = [{'Datetime': chunk.index[-1], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df_15m.groupby(df_15m.index.date) for i in range(0, len(group), 5) if len(chunk := group.iloc[i:i+5]) > 0]
+        # NSE EXACT TIMESTAMP FIX: Re-indexing to the START of the 5-candle chunk (e.g. 09:15)
+        resampled = [{'Datetime': chunk.index[0], 'Open': chunk['Open'].iloc[0], 'High': chunk['High'].max(), 'Low': chunk['Low'].min(), 'Close': chunk['Close'].iloc[-1]} for date, group in df_15m.groupby(df_15m.index.date) for i in range(0, len(group), 5) if len(chunk := group.iloc[i:i+5]) > 0]
         df_htf = pd.DataFrame(resampled).set_index('Datetime')
         weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
         available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
@@ -333,17 +394,23 @@ def scan_ticker(ticker, mss_limit, scan_state, start_date_str, end_date_str, str
         expanded_days = available_dates[(available_dates >= expanded_start) & (available_dates <= target_entry_end)]
         
         for d in expanded_days:
-            r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, mss_limit, scan_state, d, strict_opposite, target_method, target_entry_start, target_entry_end)
+            r_today = evaluate_mtf_weekly_setup(ticker, df_15m, df_htf, daily_htf, weekly_hist, mss_limit, scan_state, d, strict_opposite, target_method, target_entry_start, target_entry_end, risk_per_trade)
             if r_today: res.extend(r_today)
 
         if res:
-            unique_res, seen_mss_lines, seen_entries = [], set(), set()
+            unique_res = []
+            seen_entries = set()
             for r in res: 
                 if 'Stock name' not in r or r['Stock name'] is None: r['Stock name'] = ticker.replace('.NS', '')
-                mss_val = r.get('MSS Line (75m/125m)', r.get('MSS Line', r.get('MSS price (Breaker)', None)))
-                sig_mss, sig_entry = (r['Direction'], mss_val), (r['Direction'], r.get('Entry', r.get('Entry Level', None)))
-                if sig_mss not in seen_mss_lines and sig_entry not in seen_entries:
-                    seen_mss_lines.add(sig_mss); seen_entries.add(sig_entry); unique_res.append(r)
+                entry_time = r.get('Entry Time')
+                
+                # EXACT DEDUPLICATION RULE: Filter by Stock, Direction, and the Exact Time it Triggered
+                if entry_time != 'Pending': sig = (r['Stock name'], r['Direction'], entry_time)
+                else: sig = (r['Stock name'], r['Direction'], r['Base Start (Sweep)'])
+                
+                if sig not in seen_entries:
+                    seen_entries.add(sig)
+                    unique_res.append(r)
             return unique_res
         return None
     except: return None
@@ -410,7 +477,7 @@ if execute_scan:
             results = []
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                futures = {executor.submit(scan_ticker, tick, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, target_method): tick for tick in tickers}
+                futures = {executor.submit(scan_ticker, tick, mss_limit, state_code, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), strict_opposite, target_method, risk_per_trade): tick for tick in tickers}
                 
                 completed = 0
                 for f in concurrent.futures.as_completed(futures):
@@ -431,39 +498,25 @@ if execute_scan:
 if st.session_state.get('scan_run', False):
     results = st.session_state.get('scan_results', [])
     saved_state_code = st.session_state.get('current_state_code', state_code)
-    saved_risk = st.session_state.get('current_risk', 1000)
     
     if not results: st.warning("No stocks matched these criteria. (Try expanding the date range).")
     else:
         df_all = pd.DataFrame(results)
-        if saved_state_code == "3":
-            def calculate_metrics(row):
-                entry_key, sl_key, risk = 'Entry', 'SL', saved_risk
-                risk_dist = abs(row[entry_key] - row[sl_key])
-                if risk_dist == 0: return pd.Series([0.0, 0.0], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
-                qty = int(risk / risk_dist)
-                funds_needed = round(qty * row[entry_key], 2)
-                reward_dist = abs(row['Target'] - row[entry_key])
-                reward_ratio = reward_dist / risk_dist
-                
-                if row['Outcome'] == 'Target Hit': pnl = risk * reward_ratio
-                elif row['Outcome'] == 'SL Hit': pnl = -risk
-                elif row['Outcome'] == 'Time Square Off': pnl = qty * (row['Exit Price'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['Exit Price'])
-                else: pnl = qty * (row['CMP'] - row[entry_key]) if row['Direction'] == 'Bullish' else qty * (row[entry_key] - row['CMP'])
-                return pd.Series([round(pnl, 2), funds_needed], index=['Profit/Loss (₹)', 'Funds Needed (₹)'])
-            df_all[['Profit/Loss (₹)', 'Funds Needed (₹)']] = df_all.apply(calculate_metrics, axis=1)
-        
         df_bull, df_bear = df_all[df_all['Direction'] == 'Bullish'], df_all[df_all['Direction'] == 'Bearish']
         
         tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
+        
+        # UNIFIED COLUMN STRUCTURE
+        base_cols = ['Stock name', 'Base Start (Sweep)', 'Base End (MSS)', 'MSS Line (75m)', '15m Leg-out Candles', 'Entry Type', 'Entry', 'SL', 'Target', 'Target RR', 'Entry Distance', 'Entry Time']
+        if saved_state_code == "3": base_cols.extend(['Max Move (%)', 'Outcome', 'Exit Price', 'Profit/Loss (₹)', 'Funds Needed (₹)'])
+        elif saved_state_code == "2": base_cols.extend(['Profit/Loss (₹)', 'Funds Needed (₹)'])
         
         def render_tab_content(df, title):
             st.markdown(f"<p style='color:#E2E8F0;'>Qualified Zones: <b>{len(df)}</b></p>", unsafe_allow_html=True)
             if df.empty: st.info(f"No {title} Setups.")
             else:
-                cols = df.columns.tolist()
-                if 'Stock name' in cols: cols.insert(0, cols.pop(cols.index('Stock name')))
-                df = df[cols]
+                # Apply column ordering strictly
+                df = df[[c for c in base_cols if c in df.columns]]
                 if saved_state_code == "3":
                     total_pnl, total_funds = df['Profit/Loss (₹)'].sum(), df['Funds Needed (₹)'].sum()
                     wins, losses = len(df[df['Profit/Loss (₹)'] > 0]), len(df[df['Profit/Loss (₹)'] <= 0])
@@ -474,7 +527,7 @@ if st.session_state.get('scan_run', False):
                     c3.metric("Win Rate", f"{win_rate:.1f}%")
                     c4.metric("Trades", f"{wins}W/{losses}L")
                     st.write("")
-                st.dataframe(df.drop(columns=['Direction']), use_container_width=True, hide_index=True)
+                st.dataframe(df, use_container_width=True, hide_index=True)
 
         with tab1: render_tab_content(df_bull, "Demand")
         with tab2: render_tab_content(df_bear, "Supply")
