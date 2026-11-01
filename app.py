@@ -32,69 +32,62 @@ custom_css = """
 """
 st.markdown(custom_css, unsafe_allow_html=True)
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_nifty500_symbols():
     nifty500_csv = "360ONE,3MINDIA,ABB,ACC,AIAENG,APLAPOLLO,AUBANK,AARTIDRUGS,AARTIIND,AAVAS,ABBOTINDIA,ADANIENT,ADANIGREEN,ADANIPORTS,ADANIPOWER,ATGL,AWL,ABCAPITAL,ABFRL,AEGISCHEM,AETHER,AFFLE,AJANTPHARM,APLLTD,ALKEM,ALKYLAMINE,ALLCARGO,AMARAJABAT,AMBER,AMBUJACEM,ANANDAMATH,ANGELONE,ANURAS,APARINDS,APOLLOHOSP,APOLLOTYRE,APTUS,ASAHIINDIA,ASHOKLEY,ASIANPAINT,ASTERDM,ASTRAL,ATUL,AUROPHARMA,AVANTIFEED,DMART,AXISBANK,BEML,BSE,BAJAJ-AUTO,BAJAJFINSV,BAJFINANCE,BAJAJHLDNG,BALAMINES,BALKRISIND,BALRAMCHIN,BANDHANBNK,BANKBARODA,BANKINDIA,MAHABANK,BATAINDIA,BAYERCROP,BERGEPAINT,BDL,BEL,BHARATFORG,BHEL,BPCL,BHARTIARTL,BIOCON,BOSCHLTD,BRIGADE,BRITANNIA,MAPMYINDIA,CCL,CESC,CGPOWER,CAMS,CANFINHOME,CANBK,CAPLIPOINT,CARBORUNIV,CASTROLIND,CEATLTD,CENTRALBK,CDSL,CENTURYPLY,CENTURYTEX,CERA,CHALET,CHAMBLFERT,CHEMPLASTS,CHENNPETRO,CHOLAFIN,CHOLAHLDNG,CIPLA,CLEAN,COALINDIA,COCHINSHIP,COFORGE,COLPAL,CONCOR,COROMANDEL,CRAFTSMAN,CREDITACC,CROMPTON,CUB,CUMMINSIND,CYIENT,DCMSHRIRAM,DLF,DABUR,DALBHARAT,DEEPAKNTR,DELHIVERY,DEVYANI,DIVISLAB,DIXON,LALPATHLAB,DRREDDY,EIDPARRY,EIHOTEL,EPL,EASEMYTRIP,EICHERMOT,ELECON,ELGIEQUIP,EMAMILTD,ENDURANCE,ENGINERSIN,EQUITASBNK,ERIS,ESCORTS,EXIDEIND,FDC,NYKAA,FEDERALBNK,FACT,FINEORG,FINCABLES,FINPIPE,FSL,FORTIS,GRINFRA,GAIL,GMMPFAUDLR,GMRINFRA,GALAXYSURF,GARFIBRES,GICRE,GLAXO,GLENMARK,MEDANTA,GODFRYPHLP,GODREJAGRO,GODREJCP,GODREJIND,GODREJPROP,GRASIM,GESHIP,GRINDWELL,GUJGASLTD,GNFC,GSFC,GSPL,HAVELLS,HEG,HEGAM,HCLTECH,HDFCAMC,HDFCBANK,HDFCLIFE,HFCL,HAL,HINDALCO,HINDCOPPER,HINDPETRO,HINDUNILVR,HINDZINC,HONAUT,HSCL,HUDCO,ITC,IDBI,IDFCFIRSTB,IFBIND,IIFL,IRB,IRCON,ITI,INDIACEM,INDIAMART,INDIANB,IEX,INDHOTEL,IOC,IOB,IRCTC,IRFC,INDIGOPNTS,IGL,INDUSINDBK,NAUKRI,INFIBEAM,INFY,INOXWIND,INTELLECT,INDIGO,IPCALAB,JBCHEPHARM,JKCEMENT,JKLAKSHMI,JKPAPER,JKTYRE,JMFINANCIL,JSWENERGY,JSWSTEEL,JAICORPLTD,J&KBANK,JINDALSTEL,JINDALPHOT,JIOFIN,JUBILANT,JUBLFOOD,JUBLINGREA,JUBLPHARMA,KPRMILL,KEI,KNRCON,KPITTECH,KRBL,KSB,KAJARIACER,KALYANKJIL,KANSAINER,KARURVYSYA,KAYNES,KEC,KFINTECH,KOTAKBANK,KIMS,L&TFH,LTTS,LICHSGFIN,LTIM,LT,LATENTVIEW,LAURUSLABS,LEMONTREE,LICI,LINDEINDIA,LUPIN,MRF,MTARTECH,MACPOWER,LODHA,MGL,M&MFIN,M&M,MAHSEAMLES,MARICO,MARUTI,MASTEK,MAXHEALTH,MAXFIN,MAZDOCK,MEDPLUS,METROBRAND,METROPOLIS,MINDACORP,UNOINDA,MOTILALOFS,MPHASIS,MCX,MUTHOOTFIN,NATCOPHARM,NBCC,NCC,NHPC,NLCINDIA,NMDC,NOCIL,NTPC,OBEROIRLTY,ONGC,OIL,OLECTRA,PAYTM,OFSS,POLICYBKR,PCBL,PIIND,PNBHOUSING,PNCINFRA,PVRINOX,PAGEIND,PATANJALI,PERSISTENT,PETRONET,PFIZER,PHOENIXLTD,PIDILITIND,PEL,PPLPHARMA,POLYMED,POLYCAB,POONAWALLA,PFC,POWERGRID,PRAJIND,PRESTIGE,PRINCEPIPE,PRSMJOHNSN,PGHL,PNB,QUESS,RBLBANK,RECLTD,RHIM,RITES,RADICO,RVNL,RAILTEL,RAIN,RAMCOCEM,RATNAMANI,RAYMOND,REDINGTON,RELAXO,RELIANCE,RBA,ROUTE,SJVN,SKFINDIA,SRF,MOTHERSON,SANOFI,SAPPHIRE,SAREGAMA,SCHAEFFLER,SCHNEIDER,CIGNITITEC,SEQUENT,SHARDACROP,SHAREINDIA,SCI,SHREECEM,SHRIRAMFIN,SHYAMMETL,SIEMENS,SOBHA,SOLARINDS,SONACOMS,STARHEALTH,SBI,SAIL,SBM,STLTECH,STARCEMENT,SUDARSCHEM,SUMICHEM,SPARC,SUNPHARMA,SUNTV,SUNDARMFIN,SUNDRMFAST,SUNTECK,SUPREMEIND,SUVENPHAR,SUZLON,SWANENERGY,SYMPHONY,SYNGENE,TCIEXP,TCNSBRANDS,TCS,TATACHEM,TATACOMM,TATACONSUM,TATAELXSI,TATAINVEST,TATAMOTORS,TATAPOWER,TATASTEEL,TTML,TEAMLEASE,TECHM,TEJASNET,THERMAX,TIDEWATER,TIMKEN,TITAN,TORNTPHARM,TORNTPOWER,TRENT,TRIDENT,TRIVENI,TRIVENITQ,TUBEINVEST,UCOBANK,UPL,UTIAMC,UJJIVANSFB,ULTRACEMCO,UNIONBANK,UBL,MCDOWELL-N,VGUARD,VMART,VIPIND,VAIBHAVGBL,VTL,VARROC,VBL,VEDL,VENKEYS,VIJAYA,VINATIORGA,IDEA,VOLTAS,WELCORP,WELENT,WHIRLPOOL,WIPRO,YESBANK,ZFCVINDIA,ZEEL,ZENSARTECH,ZOMATO,ZYDUSLIFE"
     return [s.strip() + ".NS" for s in nifty500_csv.split(",")]
 
 # ---------------------------------------------------------
-# SMART CACHE FUNCTION
+# SMART RAM + DISK CACHE FUNCTION
 # ---------------------------------------------------------
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_market_data(ticker, period, interval):
-    """
-    Checks for a local CSV file. Uses os.path.getmtime to verify the physical 
-    file age to prevent endless weekend looping on stale market data.
-    """
     file_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}.csv")
     t = yf.Ticker(ticker)
     
     if os.path.exists(file_path):
         try:
-            # Check the physical file modification time to prevent weekend looping
-            file_mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-            now = datetime.now()
+            # Use UTC to guarantee safe cross-timezone file age comparison
+            file_mod_time = datetime.fromtimestamp(os.path.getmtime(file_path), tz=pytz.UTC)
+            now = datetime.now(pytz.UTC)
             
             local_df = pd.read_csv(file_path, index_col=0, parse_dates=True)
             if not local_df.empty:
-                
-                # Only ping Yahoo Finance if the CACHE FILE itself is older than 15 mins
+                is_stale = False
                 if interval == '15m' and (now - file_mod_time) > timedelta(minutes=15):
-                    recent_df = t.history(period="5d", interval="15m", auto_adjust=False)
+                    is_stale = True
+                elif interval == '1d' and (now - file_mod_time) > timedelta(hours=24):
+                    is_stale = True
+                    
+                if is_stale:
+                    fetch_period = "5d" if interval == "15m" else "1mo"
+                    recent_df = t.history(period=fetch_period, interval=interval, auto_adjust=False)
+                    
                     if not recent_df.empty:
                         recent_df.index = recent_df.index.tz_convert('Asia/Kolkata').tz_localize(None) if recent_df.index.tz else recent_df.index.tz_localize(None)
                         combined = pd.concat([local_df, recent_df])
                         combined = combined[~combined.index.duplicated(keep='last')].sort_index()
                         
-                        sixty_days_ago = combined.index[-1] - pd.Timedelta(days=60)
-                        combined = combined[combined.index >= sixty_days_ago]
+                        # Strict memory trimming
+                        if interval == '15m':
+                            sixty_days_ago = combined.index[-1] - pd.Timedelta(days=60)
+                            combined = combined[combined.index >= sixty_days_ago]
+                            
                         combined.to_csv(file_path)
                         return combined
-                        
-                # Only ping Yahoo Finance if the Daily cache file is older than 24 hours
-                elif interval == '1d' and (now - file_mod_time) > timedelta(hours=24):
-                    recent_df = t.history(period="1mo", interval="1d", auto_adjust=False)
-                    if not recent_df.empty:
-                        recent_df.index = recent_df.index.tz_localize(None)
-                        combined = pd.concat([local_df, recent_df])
-                        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
-                        combined.to_csv(file_path)
-                        return combined
-                        
-                return local_df
-        except Exception as e:
-            # If the CSV is corrupted, fall back to fetching fresh
+                    else:
+                        # Override modification timestamp so it stops pinging Yahoo on closed weekends
+                        os.utime(file_path, None) 
+                        return local_df
+                else:
+                    return local_df
+        except Exception:
             pass 
             
-    # Fallback: Download full dataset if no valid cache exists
     df = t.history(period=period, interval=interval, auto_adjust=False)
     if not df.empty:
-        if interval == '15m': 
-            df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
-        else: 
-            df.index = df.index.tz_localize(None)
-        # Save to local cache
+        df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
         df.to_csv(file_path)
-        
     return df
 
 def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
@@ -207,7 +200,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
             if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
             elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
             
-    # Dynamic live status update
     is_today = entry_time.date() == datetime.now(ist).date()
     current_time = datetime.now(ist)
     if is_today and (current_time.hour < 15 or (current_time.hour == 15 and current_time.minute < 30)):
@@ -339,12 +331,13 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 
 # --- UI EXECUTION ---
 st.title("⚡ Weekly ICT Sweep & MTF Screener")
-st.write("Strictly executing the 7-Rule framework with Smart Local Caching.")
+st.write("Strictly executing the 7-Rule framework with Smart Local RAM Caching.")
 
 if st.button("🗑️ Clear Local Data Cache", type="secondary"):
     if os.path.exists(CACHE_DIR):
         shutil.rmtree(CACHE_DIR)
         os.makedirs(CACHE_DIR)
+    st.cache_data.clear()
     st.success("Cache cleared! The next scan will download fresh historical data.")
 
 app_mode = st.radio("Operating Mode", ["Today's Live Trades", "Backtester"], horizontal=True)
@@ -369,7 +362,8 @@ if st.button("🚀 Execute Scan", type="primary"):
         all_setups = []
         progress_bar = st.progress(0)
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        # Reduced max_workers to 10 to bypass Python GIL CPU choking
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method, app_mode): t for t in tickers}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
