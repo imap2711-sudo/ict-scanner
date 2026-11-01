@@ -329,8 +329,13 @@ if st.button("🚀 Execute Scan", type="primary"):
             df_bull = df[df['Type'] == 'Bullish'].copy()
             df_bear = df[df['Type'] == 'Bearish'].copy()
             
-            if not df_bull.empty: df_bull = df_bull[[c for c in cols_order if c in df_bull.columns]]
-            if not df_bear.empty: df_bear = df_bear[[c for c in cols_order if c in df_bear.columns]]
+            # Applying chronological sorting by Entry Date
+            if not df_bull.empty: 
+                df_bull = df_bull[[c for c in cols_order if c in df_bull.columns]]
+                df_bull = df_bull.sort_values(by="Entry Date", ascending=True)
+            if not df_bear.empty: 
+                df_bear = df_bear[[c for c in cols_order if c in df_bear.columns]]
+                df_bear = df_bear.sort_values(by="Entry Date", ascending=True)
             
             tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
             
