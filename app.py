@@ -6,7 +6,6 @@ import concurrent.futures
 from datetime import datetime, timedelta
 import pytz
 import os
-import shutil
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="ICT Precision Scanner", layout="wide", page_icon="⚡")
@@ -41,7 +40,13 @@ def fetch_market_data(ticker, period, interval):
 
 def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
     """RULE 2: Finds the nearest 3-candle swing point formed before or after the sweep."""
-    loc = df_75m.index.get_loc(sweep_idx)
+    
+    # Map the 15m sweep time to the nearest preceding 75m block timestamp
+    closest_75m_time = df_75m.index.asof(sweep_idx)
+    if pd.isna(closest_75m_time):
+        return None, None
+        
+    loc = df_75m.index.get_loc(closest_75m_time)
     
     # Check backwards first
     for i in range(loc - 1, 0, -1):
