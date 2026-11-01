@@ -129,13 +129,13 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     if direction == 'Bullish': touched = tracking_df[tracking_df['Low'] <= entry_price]
     else: touched = tracking_df[tracking_df['High'] >= entry_price]
     
-    if touched.empty: return {"Entry Date": "-", "Outcome": "No Entry", "P&L (₹)": 0, "Exit Price": "-"}
+    if touched.empty: return {"Entry Date": "-", "Outcome": "No Entry", "P&L (₹)": 0.0, "Exit Price": "-"}
     
     entry_time = touched.index[0]
     open_px = df_15m.loc[entry_time, 'Open']
     
-    if direction == 'Bullish' and open_px < active_sl: return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0, "Exit Price": "-"}
-    if direction == 'Bearish' and open_px > active_sl: return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0, "Exit Price": "-"}
+    if direction == 'Bullish' and open_px < active_sl: return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
+    if direction == 'Bearish' and open_px > active_sl: return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
     
     actual_entry = round(open_px if open_px < entry_price else entry_price, 2) if direction == 'Bullish' else round(open_px if open_px > entry_price else entry_price, 2)
     end_of_day = entry_time.replace(hour=23, minute=59, second=59)
@@ -146,11 +146,18 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     
     for idx, row in day_df.iterrows():
         if direction == 'Bullish':
-            if row['Low'] <= active_sl: outcome, exit_price = "SL", active_sl; break
-            elif row['High'] >= active_target: outcome, exit_price = "Target", active_target; break
+            if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+            elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
         else:
-            if row['High'] >= active_sl: outcome, exit_price = "SL", active_sl; break
-            elif row['Low'] <= active_target: outcome, exit_price = "Target", active_target; break
+            if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
+            elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
+            
+    # Dynamic live status update
+    is_today = entry_time.date() == datetime.now(ist).date()
+    current_time = datetime.now(ist)
+    if is_today and (current_time.hour < 15 or (current_time.hour == 15 and current_time.minute < 30)):
+        if outcome == "Time Square Off":
+            outcome = "Running (Live)"
             
     pnl = round(qty * (exit_price - actual_entry), 2) if direction == 'Bullish' else round(qty * (actual_entry - exit_price), 2)
     
@@ -161,8 +168,12 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
         "P&L (₹)": pnl
     }
 
-def evaluate_ticker(ticker, start_date, end_date, risk_amt, zone_method):
+def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method, app_mode):
     raw_setups = []
+    
+    # Internal Scan Range: Scan slightly further back to catch pending entries for today
+    internal_start = start_date_val - timedelta(days=10) if app_mode == "Today's Live Trades" else start_date_val - timedelta(days=15)
+    
     df_15m = fetch_market_data(ticker, "60d", "15m")
     daily_htf = fetch_market_data(ticker, "1y", "1d")
     if df_15m.empty or daily_htf.empty: return []
@@ -171,7 +182,7 @@ def evaluate_ticker(ticker, start_date, end_date, risk_amt, zone_method):
     df_75m = pd.DataFrame(resampled).set_index('Datetime')
     weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High':'max', 'Low':'min'}).dropna()
     available_dates = pd.Series(df_15m.index.date).drop_duplicates().apply(pd.to_datetime)
-    scan_days = available_dates[(available_dates >= pd.to_datetime(start_date)) & (available_dates <= pd.to_datetime(end_date))]
+    scan_days = available_dates[(available_dates >= pd.to_datetime(internal_start)) & (available_dates <= pd.to_datetime(end_date_val))]
     
     for d in scan_days:
         current_monday = d - pd.Timedelta(days=d.weekday())
@@ -241,39 +252,65 @@ def evaluate_ticker(ticker, start_date, end_date, risk_amt, zone_method):
             deduped_setups[key] = s
             
     final_setups = []
+    today_str = datetime.now(ist).strftime('%Y-%m-%d')
+    
     for s in deduped_setups.values():
         exec_data = simulate_intraday_execution(df_15m, s['Activation Time'], s['Entry'], s['SL'], s['Target'], s['Qty'], s['Type'])
-        if exec_data and exec_data['Outcome'] not in ["No Entry", "Gap SL Void"]:
-            s.update(exec_data)
-            s['Sweep Time'] = s['Sweep Time'].strftime('%Y-%m-%d %H:%M')
-            s['Activation Time'] = s['Activation Time'].strftime('%Y-%m-%d %H:%M')
-            final_setups.append(s)
-            
+        if not exec_data: continue
+        
+        s.update(exec_data)
+        s['Sweep Time'] = s['Sweep Time'].strftime('%Y-%m-%d %H:%M')
+        s['Activation Time'] = s['Activation Time'].strftime('%Y-%m-%d %H:%M')
+        
+        entry_date_str = exec_data.get("Entry Date", "-")
+        outcome = exec_data.get("Outcome", "")
+        
+        if app_mode == "Today's Live Trades":
+            if entry_date_str.startswith(today_str):
+                final_setups.append(s)
+            elif outcome == "No Entry" and s['Activation Time'].startswith(today_str):
+                s["Outcome"] = "Pending Entry"
+                final_setups.append(s)
+        
+        elif app_mode == "Backtester":
+            if entry_date_str != "-" and outcome != "Gap SL Void":
+                try:
+                    entry_date_obj = datetime.strptime(entry_date_str, '%Y-%m-%d %H:%M').date()
+                    if start_date_val <= entry_date_obj <= end_date_val:
+                        final_setups.append(s)
+                except ValueError:
+                    pass
+                    
     return final_setups
 
 # --- UI EXECUTION ---
 st.title("⚡ Weekly ICT Sweep & MTF Screener")
-st.write("Strictly executing the 7-Rule framework with deduplication and intraday auto-square off.")
+st.write("Strictly executing the 7-Rule framework with Live Intraday Tracking.")
 
-c1, c2, c3, c4 = st.columns(4)
-with c1:
+app_mode = st.radio("Operating Mode", ["Today's Live Trades", "Backtester"], horizontal=True)
+
+if app_mode == "Backtester":
+    c1, c2, c3, c4 = st.columns(4)
     today = datetime.now(ist).date()
-    start_date = st.date_input("Start Date", today - timedelta(days=5))
-with c2:
-    end_date = st.date_input("End Date", today)
-with c3:
-    risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
-with c4:
-    zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
+    with c1: start_date = st.date_input("Entry Start Date", today - timedelta(days=5))
+    with c2: end_date = st.date_input("Entry End Date", today)
+    with c3: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
+    with c4: zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
+else:
+    c1, c2 = st.columns(2)
+    today = datetime.now(ist).date()
+    start_date, end_date = today, today # Defaults used purely for data slicing range
+    with c1: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
+    with c2: zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
 
 if st.button("🚀 Execute Scan", type="primary"):
-    with st.spinner("Analyzing rules and backtesting execution..."):
+    with st.spinner(f"Analyzing Nifty 500 across {app_mode}..."):
         tickers = get_nifty500_symbols()
         all_setups = []
         progress_bar = st.progress(0)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method): t for t in tickers}
+            futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method, app_mode): t for t in tickers}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 res = f.result()
@@ -285,8 +322,13 @@ if st.button("🚀 Execute Scan", type="primary"):
         
         if all_setups:
             df = pd.DataFrame(all_setups)
+            cols_order = ["Stock", "Type", "Sweep Time", "Activation Time", "MSS Line", "Entry Date", "Entry", "SL", "Target", "Target RR", "Qty", "Outcome", "Exit Price", "P&L (₹)"]
+            
             df_bull = df[df['Type'] == 'Bullish'].copy()
             df_bear = df[df['Type'] == 'Bearish'].copy()
+            
+            if not df_bull.empty: df_bull = df_bull[[c for c in cols_order if c in df_bull.columns]]
+            if not df_bear.empty: df_bear = df_bear[[c for c in cols_order if c in df_bear.columns]]
             
             tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
             
@@ -294,13 +336,16 @@ if st.button("🚀 Execute Scan", type="primary"):
                 if df_sub.empty:
                     st.info("No triggered trades in this category.")
                     return
-                wins = len(df_sub[df_sub['P&L (₹)'] > 0])
-                total = len(df_sub)
+                    
+                # Exclude Pending Entry from win rate / PnL math
+                completed_trades = df_sub[df_sub['Outcome'].isin(["Target Hit", "SL Hit", "Time Square Off", "Running (Live)"])]
+                wins = len(completed_trades[completed_trades['P&L (₹)'] > 0])
+                total = len(completed_trades)
                 win_rate = (wins / total) * 100 if total > 0 else 0
-                total_pnl = df_sub['P&L (₹)'].sum()
+                total_pnl = completed_trades['P&L (₹)'].sum()
                 
                 m1, m2, m3 = st.columns(3)
-                m1.metric("Total Trades", total)
+                m1.metric("Active / Completed Trades", total)
                 m2.metric("Win Rate", f"{win_rate:.1f}%")
                 m3.metric("Net Profit / Loss", f"₹ {total_pnl:,.2f}")
                 
@@ -309,4 +354,4 @@ if st.button("🚀 Execute Scan", type="primary"):
             with tab1: render_tab(df_bull)
             with tab2: render_tab(df_bear)
         else:
-            st.warning("No setups met all 7 strict conditions in this timeframe.")
+            st.warning("No setups met all conditions for the selected mode.")
