@@ -44,41 +44,13 @@ def fetch_market_data(ticker, period, interval):
             df.index = df.index.tz_localize(None)
     return df
 
-def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
-    closest_75m_time = df_75m.index.asof(sweep_idx)
-    if pd.isna(closest_75m_time): return None, None
-    loc = df_75m.index.get_loc(closest_75m_time)
-    
-    for i in range(loc - 1, 0, -1):
-        if direction == 'high':
-            if df_75m['High'].iloc[i] > df_75m['High'].iloc[i-1] and df_75m['High'].iloc[i] > df_75m['High'].iloc[i+1]:
-                if df_75m['Close'].iloc[i:loc].max() < df_75m['High'].iloc[i]:
-                    return df_75m.index[i], df_75m['High'].iloc[i]
-        else:
-            if df_75m['Low'].iloc[i] < df_75m['Low'].iloc[i-1] and df_75m['Low'].iloc[i] < df_75m['Low'].iloc[i+1]:
-                if df_75m['Close'].iloc[i:loc].min() > df_75m['Low'].iloc[i]:
-                    return df_75m.index[i], df_75m['Low'].iloc[i]
-                    
-    for i in range(loc + 1, len(df_75m)-1):
-        if direction == 'high':
-            if df_75m['High'].iloc[i] > df_75m['High'].iloc[i-1] and df_75m['High'].iloc[i] > df_75m['High'].iloc[i+1]:
-                return df_75m.index[i], df_75m['High'].iloc[i]
-        else:
-            if df_75m['Low'].iloc[i] < df_75m['Low'].iloc[i-1] and df_75m['Low'].iloc[i] < df_75m['Low'].iloc[i+1]:
-                return df_75m.index[i], df_75m['Low'].iloc[i]
-    return None, None
-
-def get_nearest_15m_target_swing(df_15m, activation_idx, direction='high'):
+def get_nearest_15m_target_swing(df_15m, sweep_time, activation_time, direction='high'):
     try:
-        loc = df_15m.index.get_loc(activation_idx)
-        for i in range(loc - 1, 0, -1):
-            if direction == 'high':
-                if df_15m['High'].iloc[i] > df_15m['High'].iloc[i-1] and df_15m['High'].iloc[i] > df_15m['High'].iloc[i+1]:
-                    return df_15m['High'].iloc[i]
-            else:
-                if df_15m['Low'].iloc[i] < df_15m['Low'].iloc[i-1] and df_15m['Low'].iloc[i] < df_15m['Low'].iloc[i+1]:
-                    return df_15m['Low'].iloc[i]
-        return None
+        leg_df = df_15m.loc[sweep_time:activation_time]
+        if direction == 'high':
+            return leg_df['High'].max()
+        else:
+            return leg_df['Low'].min()
     except: 
         return None
 
@@ -141,13 +113,11 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     dynamic_target = initial_target
     
     for idx, row in tracking_df_entry.iterrows():
-        # Check gap SL void
         if direction == 'Bullish' and row['Low'] <= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
         if direction == 'Bearish' and row['High'] >= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
             
-        # Dynamically track the true unmitigated extreme of the impulse leg
         if direction == 'Bullish':
             if row['High'] > dynamic_target:
                 dynamic_target = row['High']
@@ -173,7 +143,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     if not entry_time:
         return {"Entry Date": "-", "Outcome": "No Entry", "P&L (₹)": 0.0, "Exit Price": "-"}
         
-    # Re-evaluate Target & RR based on the dynamic_target at the exact moment of entry
     risk_dist = round(abs(entry_price - active_sl), 2)
     
     if direction == 'Bullish':
@@ -221,6 +190,30 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
         "P&L (₹)": pnl
     }
 
+def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
+    closest_75m_time = df_75m.index.asof(sweep_idx)
+    if pd.isna(closest_75m_time): return None, None
+    loc = df_75m.index.get_loc(closest_75m_time)
+    
+    for i in range(loc - 1, 0, -1):
+        if direction == 'high':
+            if df_75m['High'].iloc[i] > df_75m['High'].iloc[i-1] and df_75m['High'].iloc[i] > df_75m['High'].iloc[i+1]:
+                if df_75m['Close'].iloc[i:loc].max() < df_75m['High'].iloc[i]:
+                    return df_75m.index[i], df_75m['High'].iloc[i]
+        else:
+            if df_75m['Low'].iloc[i] < df_75m['Low'].iloc[i-1] and df_75m['Low'].iloc[i] < df_75m['Low'].iloc[i+1]:
+                if df_75m['Close'].iloc[i:loc].min() > df_75m['Low'].iloc[i]:
+                    return df_75m.index[i], df_75m['Low'].iloc[i]
+                    
+    for i in range(loc + 1, len(df_75m)-1):
+        if direction == 'high':
+            if df_75m['High'].iloc[i] > df_75m['High'].iloc[i-1] and df_75m['High'].iloc[i] > df_75m['High'].iloc[i+1]:
+                return df_75m.index[i], df_75m['High'].iloc[i]
+        else:
+            if df_75m['Low'].iloc[i] < df_75m['Low'].iloc[i-1] and df_75m['Low'].iloc[i] < df_75m['Low'].iloc[i+1]:
+                return df_75m.index[i], df_75m['Low'].iloc[i]
+    return None, None
+
 def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method, app_mode, max_wait_hours, trading_window, cap_rr):
     raw_setups = []
     
@@ -262,7 +255,7 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                     if len(np.unique(df_15m.loc[sweep_idx:activation_idx].index.date)) <= 2:
                         proximal, distal = find_sd_zone(df_15m, sweep_idx, activation_idx, sh_val_75m, 'Bullish', zone_method)
                         if proximal and distal:
-                            target_val = get_nearest_15m_target_swing(df_15m, activation_idx, 'high')
+                            target_val = get_nearest_15m_target_swing(df_15m, sweep_idx, activation_idx, 'high')
                             if target_val:
                                 entry_price, active_sl, active_target = round(proximal, 2), round(distal * 0.999, 2), round(target_val, 2)
                                 
@@ -295,7 +288,7 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                     if len(np.unique(df_15m.loc[sweep_idx:activation_idx].index.date)) <= 2:
                         proximal, distal = find_sd_zone(df_15m, sweep_idx, activation_idx, sl_val_75m, 'Bearish', zone_method)
                         if proximal and distal:
-                            target_val = get_nearest_15m_target_swing(df_15m, activation_idx, 'low')
+                            target_val = get_nearest_15m_target_swing(df_15m, sweep_idx, activation_idx, 'low')
                             if target_val:
                                 entry_price, active_sl, active_target = round(proximal, 2), round(distal * 1.001, 2), round(target_val, 2)
                                 
