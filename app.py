@@ -131,7 +131,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     entry_time = None
     open_px = None
     
-    # Calculate Max Candlestick Wait duration (4 candles per trading hour)
     max_wait_candles = int(max_wait_hours * 4)
     tracking_df_entry = tracking_df.iloc[:max_wait_candles]
     
@@ -139,19 +138,16 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     t_end = time(13, 30)
     
     for idx, row in tracking_df_entry.iterrows():
-        # Immediate strict check if SL hit before valid entry
         if direction == 'Bullish' and row['Low'] <= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
         if direction == 'Bearish' and row['High'] >= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
             
-        # Time Window Constraint Verification
         in_window = True
         if trading_window == "09:45 - 13:30":
             if not (t_start <= idx.time() <= t_end):
                 in_window = False
                 
-        # Fill order only if we touch the price during the valid time window
         if in_window:
             if direction == 'Bullish' and row['Low'] <= entry_price:
                 entry_time = idx
@@ -243,7 +239,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                                 risk_dist = round(abs(entry_price - active_sl), 2)
                                 target_dist = round(active_target - entry_price, 2)
                                 
-                                # Cap RR Implementation
                                 if cap_rr == "Yes" and risk_dist > 0 and (target_dist / risk_dist) > 3:
                                     target_dist = round(3 * risk_dist, 2)
                                     active_target = round(entry_price + target_dist, 2)
@@ -277,7 +272,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                                 risk_dist = round(abs(entry_price - active_sl), 2)
                                 target_dist = round(entry_price - active_target, 2)
                                 
-                                # Cap RR Implementation
                                 if cap_rr == "Yes" and risk_dist > 0 and (target_dist / risk_dist) > 3:
                                     target_dist = round(3 * risk_dist, 2)
                                     active_target = round(entry_price - target_dist, 2)
@@ -296,7 +290,7 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
         if key not in deduped_setups or s['Sweep Time'] > deduped_setups[key]['Sweep Time']:
             deduped_setups[key] = s
             
-    final_setups = []
+    temp_setups = []
     today_str = datetime.now(ist).strftime('%Y-%m-%d')
     
     for s in deduped_setups.values():
@@ -312,25 +306,46 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
         
         if app_mode == "Today's Live Trades":
             if entry_date_str.startswith(today_str):
-                final_setups.append(s)
+                temp_setups.append(s)
             elif outcome == "No Entry" and s['Activation Time'].startswith(today_str):
                 s["Outcome"] = "Pending Entry"
-                final_setups.append(s)
+                temp_setups.append(s)
         
         elif app_mode == "Backtester":
             if entry_date_str != "-" and outcome != "Gap SL Void":
                 try:
                     entry_date_obj = datetime.strptime(entry_date_str, '%Y-%m-%d %H:%M').date()
                     if start_date_val <= entry_date_obj <= end_date_val:
-                        final_setups.append(s)
+                        temp_setups.append(s)
                 except ValueError:
                     pass
                     
+    # Strict ONE trade per stock per day deduplication
+    final_setups = []
+    daily_tracker = set()
+    for s in temp_setups:
+        if s["Entry Date"] != "-":
+            day_str = s["Entry Date"].split()[0]
+        else:
+            day_str = s["Activation Time"].split()[0]
+            
+        dedup_key = (s['Stock'], day_str)
+        if dedup_key not in daily_tracker:
+            daily_tracker.add(dedup_key)
+            final_setups.append(s)
+            
     return final_setups
 
 # --- UI EXECUTION ---
 st.title("⚡ Weekly ICT Sweep & MTF Screener")
 st.write("Strictly executing the 7-Rule framework with Advanced Trade Management.")
+
+wait_options_dict = {
+    "30 min": 0.5, "1 hr": 1.0, "1:30 hrs": 1.5, "2 hrs": 2.0, "2:30 hrs": 2.5,
+    "3 hrs": 3.0, "3:30 hrs": 3.5, "4 hrs": 4.0, "4:30 hrs": 4.5, "5 hrs": 5.0,
+    "5:30 hrs": 5.5, "6 hrs": 6.0, "6:30 hrs": 6.5, "7 hrs": 7.0, "7:30 hrs": 7.5,
+    "8 hrs": 8.0, "8:30 hrs": 8.5, "9 hrs": 9.0, "9:30 hrs": 9.5, "10 hrs": 10.0
+}
 
 app_mode = st.radio("Operating Mode", ["Today's Live Trades", "Backtester"], horizontal=True)
 
@@ -345,7 +360,9 @@ if app_mode == "Backtester":
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     with r2c1: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
     with r2c2: trading_window = st.selectbox("Entry Window", ["Full Day (09:15 - 15:30)", "09:45 - 13:30"])
-    with r2c3: max_wait_hours = st.selectbox("Max Wait to Entry (Hrs)", list(range(1, 11)), index=9)
+    with r2c3: 
+        max_wait_label = st.selectbox("Max Wait to Entry", list(wait_options_dict.keys()), index=19)
+        max_wait_hours = wait_options_dict[max_wait_label]
     with r2c4: cap_rr = st.selectbox("Cap RR at 1:3?", ["No", "Yes"])
 else:
     r1c1, r1c2, r1c3 = st.columns(3)
@@ -357,7 +374,9 @@ else:
     
     r2c1, r2c2, r2c3 = st.columns(3)
     with r2c1: trading_window = st.selectbox("Entry Window", ["Full Day (09:15 - 15:30)", "09:45 - 13:30"])
-    with r2c2: max_wait_hours = st.selectbox("Max Wait to Entry (Hrs)", list(range(1, 11)), index=9)
+    with r2c2: 
+        max_wait_label = st.selectbox("Max Wait to Entry", list(wait_options_dict.keys()), index=19)
+        max_wait_hours = wait_options_dict[max_wait_label]
     with r2c3: cap_rr = st.selectbox("Cap RR at 1:3?", ["No", "Yes"])
 
 if st.button("🚀 Execute Scan", type="primary"):
