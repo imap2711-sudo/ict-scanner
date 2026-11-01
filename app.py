@@ -195,6 +195,8 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
         if day_15m.empty: continue
         
         for sweep_idx, sweep_row in day_15m.iterrows():
+            
+            # --- BULLISH SETUP ---
             if sweep_row['Low'] <= pwl:
                 sh_idx_75m, sh_val_75m = get_nearest_untested_75m_swing(df_75m, sweep_idx, 'high')
                 if not sh_idx_75m: continue
@@ -211,7 +213,10 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                             target_val = get_nearest_15m_target_swing(df_15m, activation_idx, 'high')
                             if target_val:
                                 entry_price, active_sl, active_target = round(proximal, 2), round(distal * 0.999, 2), round(target_val, 2)
-                                risk_dist, target_dist = round(abs(entry_price - active_sl), 2), round(abs(active_target - entry_price), 2)
+                                
+                                # FIX: Removed abs() from target math so it must be mathematically above the entry
+                                risk_dist = round(abs(entry_price - active_sl), 2)
+                                target_dist = round(active_target - entry_price, 2)
                                 
                                 if risk_dist > 0 and target_dist >= risk_dist:
                                     qty = int(risk_amt / risk_dist)
@@ -220,6 +225,7 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                                         raw_setups.append(setup)
                                         break 
 
+            # --- BEARISH SETUP ---
             elif sweep_row['High'] >= pwh:
                 sl_idx_75m, sl_val_75m = get_nearest_untested_75m_swing(df_75m, sweep_idx, 'low')
                 if not sl_idx_75m: continue
@@ -236,7 +242,10 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                             target_val = get_nearest_15m_target_swing(df_15m, activation_idx, 'low')
                             if target_val:
                                 entry_price, active_sl, active_target = round(proximal, 2), round(distal * 1.001, 2), round(target_val, 2)
-                                risk_dist, target_dist = round(abs(entry_price - active_sl), 2), round(abs(entry_price - active_target), 2)
+                                
+                                # FIX: Removed abs() from target math so it must be mathematically below the entry
+                                risk_dist = round(abs(entry_price - active_sl), 2)
+                                target_dist = round(entry_price - active_target, 2)
                                 
                                 if risk_dist > 0 and target_dist >= risk_dist:
                                     qty = int(risk_amt / risk_dist)
@@ -329,7 +338,6 @@ if st.button("🚀 Execute Scan", type="primary"):
             df_bull = df[df['Type'] == 'Bullish'].copy()
             df_bear = df[df['Type'] == 'Bearish'].copy()
             
-            # Applying chronological sorting by Entry Date
             if not df_bull.empty: 
                 df_bull = df_bull[[c for c in cols_order if c in df_bull.columns]]
                 df_bull = df_bull.sort_values(by="Entry Date", ascending=True)
