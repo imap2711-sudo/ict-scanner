@@ -71,7 +71,8 @@ def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
 def get_nearest_15m_target_swing(df_15m, activation_idx, direction='high'):
     try:
         loc = df_15m.index.get_loc(activation_idx)
-        for i in range(loc + 1, len(df_15m)-1):
+        # Scan backward historically from the activation candle to avoid lookahead bias
+        for i in range(loc - 1, 0, -1):
             if direction == 'high':
                 if df_15m['High'].iloc[i] > df_15m['High'].iloc[i-1] and df_15m['High'].iloc[i] > df_15m['High'].iloc[i+1]:
                     return df_15m['High'].iloc[i]
@@ -79,7 +80,8 @@ def get_nearest_15m_target_swing(df_15m, activation_idx, direction='high'):
                 if df_15m['Low'].iloc[i] < df_15m['Low'].iloc[i-1] and df_15m['Low'].iloc[i] < df_15m['Low'].iloc[i+1]:
                     return df_15m['Low'].iloc[i]
         return None
-    except: return None
+    except: 
+        return None
 
 def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone_method):
     try:
