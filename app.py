@@ -79,7 +79,7 @@ def get_nearest_15m_target_swing(df_15m, activation_idx, direction='high'):
         return None
     except: return None
 
-def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction):
+def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone_method):
     try:
         leg_df = df_15m.loc[sweep_time:activation_time].copy()
         if len(leg_df) < 3: return None, None
@@ -97,6 +97,23 @@ def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction):
         leg_df['Block'] = (~leg_df['Is_Base']).cumsum()
         target_block = leg_df.loc[closest_base_idx, 'Block']
         zone_candles = leg_df[(leg_df['Is_Base']) & (leg_df['Block'] == target_block)]
+        
+        if zone_candles.empty: return None, None
+        
+        if zone_method == "Strict (Base + Leg-Out)":
+            last_base_idx = zone_candles.index[-1]
+            post_base = leg_df.loc[last_base_idx:]
+            if len(post_base) > 1:
+                post_base = post_base.iloc[1:]
+            else:
+                return None, None
+            
+            if direction == 'Bullish':
+                valid_legout = post_base[(post_base['Close'] > post_base['Open']) & (~post_base['Is_Base'])]
+            else:
+                valid_legout = post_base[(post_base['Close'] < post_base['Open']) & (~post_base['Is_Base'])]
+                
+            if valid_legout.empty: return None, None
         
         if direction == 'Bullish':
             return zone_candles['High'].max(), zone_candles['Low'].min()
@@ -144,7 +161,7 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
         "P&L (₹)": pnl
     }
 
-def evaluate_ticker(ticker, start_date, end_date, risk_amt):
+def evaluate_ticker(ticker, start_date, end_date, risk_amt, zone_method):
     raw_setups = []
     df_15m = fetch_market_data(ticker, "60d", "15m")
     daily_htf = fetch_market_data(ticker, "1y", "1d")
@@ -178,7 +195,7 @@ def evaluate_ticker(ticker, start_date, end_date, risk_amt):
                 if not activation_points.empty:
                     activation_idx = activation_points.index[0]
                     if len(np.unique(df_15m.loc[sweep_idx:activation_idx].index.date)) <= 2:
-                        proximal, distal = find_sd_zone(df_15m, sweep_idx, activation_idx, sh_val_75m, 'Bullish')
+                        proximal, distal = find_sd_zone(df_15m, sweep_idx, activation_idx, sh_val_75m, 'Bullish', zone_method)
                         if proximal and distal:
                             target_val = get_nearest_15m_target_swing(df_15m, activation_idx, 'high')
                             if target_val:
@@ -203,7 +220,7 @@ def evaluate_ticker(ticker, start_date, end_date, risk_amt):
                 if not activation_points.empty:
                     activation_idx = activation_points.index[0]
                     if len(np.unique(df_15m.loc[sweep_idx:activation_idx].index.date)) <= 2:
-                        proximal, distal = find_sd_zone(df_15m, sweep_idx, activation_idx, sl_val_75m, 'Bearish')
+                        proximal, distal = find_sd_zone(df_15m, sweep_idx, activation_idx, sl_val_75m, 'Bearish', zone_method)
                         if proximal and distal:
                             target_val = get_nearest_15m_target_swing(df_15m, activation_idx, 'low')
                             if target_val:
@@ -217,14 +234,12 @@ def evaluate_ticker(ticker, start_date, end_date, risk_amt):
                                         raw_setups.append(setup)
                                         break
                                         
-    # Deduplication Logic
     deduped_setups = {}
     for s in raw_setups:
         key = (s['Stock'], s['Type'], s['Activation Time'])
         if key not in deduped_setups or s['Sweep Time'] > deduped_setups[key]['Sweep Time']:
             deduped_setups[key] = s
             
-    # Intraday Execution
     final_setups = []
     for s in deduped_setups.values():
         exec_data = simulate_intraday_execution(df_15m, s['Activation Time'], s['Entry'], s['SL'], s['Target'], s['Qty'], s['Type'])
@@ -240,7 +255,7 @@ def evaluate_ticker(ticker, start_date, end_date, risk_amt):
 st.title("⚡ Weekly ICT Sweep & MTF Screener")
 st.write("Strictly executing the 7-Rule framework with deduplication and intraday auto-square off.")
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     today = datetime.now(ist).date()
     start_date = st.date_input("Start Date", today - timedelta(days=5))
@@ -248,6 +263,8 @@ with c2:
     end_date = st.date_input("End Date", today)
 with c3:
     risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
+with c4:
+    zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
 
 if st.button("🚀 Execute Scan", type="primary"):
     with st.spinner("Analyzing rules and backtesting execution..."):
@@ -256,7 +273,7 @@ if st.button("🚀 Execute Scan", type="primary"):
         progress_bar = st.progress(0)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt): t for t in tickers}
+            futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method): t for t in tickers}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 res = f.result()
