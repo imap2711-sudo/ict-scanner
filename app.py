@@ -6,10 +6,15 @@ import concurrent.futures
 from datetime import datetime, timedelta
 import pytz
 import os
+import shutil
 
+# --- PAGE SETUP ---
 st.set_page_config(page_title="ICT Precision Scanner", layout="wide", page_icon="⚡")
 ist = pytz.timezone('Asia/Kolkata')
 
+# ---------------------------------------------------------
+# SMART CACHE DIRECTORY SETUP
+# ---------------------------------------------------------
 CACHE_DIR = "nifty500_data_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -32,14 +37,69 @@ def get_nifty500_symbols():
     nifty500_csv = "360ONE,3MINDIA,ABB,ACC,AIAENG,APLAPOLLO,AUBANK,AARTIDRUGS,AARTIIND,AAVAS,ABBOTINDIA,ADANIENT,ADANIGREEN,ADANIPORTS,ADANIPOWER,ATGL,AWL,ABCAPITAL,ABFRL,AEGISCHEM,AETHER,AFFLE,AJANTPHARM,APLLTD,ALKEM,ALKYLAMINE,ALLCARGO,AMARAJABAT,AMBER,AMBUJACEM,ANANDAMATH,ANGELONE,ANURAS,APARINDS,APOLLOHOSP,APOLLOTYRE,APTUS,ASAHIINDIA,ASHOKLEY,ASIANPAINT,ASTERDM,ASTRAL,ATUL,AUROPHARMA,AVANTIFEED,DMART,AXISBANK,BEML,BSE,BAJAJ-AUTO,BAJAJFINSV,BAJFINANCE,BAJAJHLDNG,BALAMINES,BALKRISIND,BALRAMCHIN,BANDHANBNK,BANKBARODA,BANKINDIA,MAHABANK,BATAINDIA,BAYERCROP,BERGEPAINT,BDL,BEL,BHARATFORG,BHEL,BPCL,BHARTIARTL,BIOCON,BOSCHLTD,BRIGADE,BRITANNIA,MAPMYINDIA,CCL,CESC,CGPOWER,CAMS,CANFINHOME,CANBK,CAPLIPOINT,CARBORUNIV,CASTROLIND,CEATLTD,CENTRALBK,CDSL,CENTURYPLY,CENTURYTEX,CERA,CHALET,CHAMBLFERT,CHEMPLASTS,CHENNPETRO,CHOLAFIN,CHOLAHLDNG,CIPLA,CLEAN,COALINDIA,COCHINSHIP,COFORGE,COLPAL,CONCOR,COROMANDEL,CRAFTSMAN,CREDITACC,CROMPTON,CUB,CUMMINSIND,CYIENT,DCMSHRIRAM,DLF,DABUR,DALBHARAT,DEEPAKNTR,DELHIVERY,DEVYANI,DIVISLAB,DIXON,LALPATHLAB,DRREDDY,EIDPARRY,EIHOTEL,EPL,EASEMYTRIP,EICHERMOT,ELECON,ELGIEQUIP,EMAMILTD,ENDURANCE,ENGINERSIN,EQUITASBNK,ERIS,ESCORTS,EXIDEIND,FDC,NYKAA,FEDERALBNK,FACT,FINEORG,FINCABLES,FINPIPE,FSL,FORTIS,GRINFRA,GAIL,GMMPFAUDLR,GMRINFRA,GALAXYSURF,GARFIBRES,GICRE,GLAXO,GLENMARK,MEDANTA,GODFRYPHLP,GODREJAGRO,GODREJCP,GODREJIND,GODREJPROP,GRASIM,GESHIP,GRINDWELL,GUJGASLTD,GNFC,GSFC,GSPL,HAVELLS,HEG,HEGAM,HCLTECH,HDFCAMC,HDFCBANK,HDFCLIFE,HFCL,HAL,HINDALCO,HINDCOPPER,HINDPETRO,HINDUNILVR,HINDZINC,HONAUT,HSCL,HUDCO,ITC,IDBI,IDFCFIRSTB,IFBIND,IIFL,IRB,IRCON,ITI,INDIACEM,INDIAMART,INDIANB,IEX,INDHOTEL,IOC,IOB,IRCTC,IRFC,INDIGOPNTS,IGL,INDUSINDBK,NAUKRI,INFIBEAM,INFY,INOXWIND,INTELLECT,INDIGO,IPCALAB,JBCHEPHARM,JKCEMENT,JKLAKSHMI,JKPAPER,JKTYRE,JMFINANCIL,JSWENERGY,JSWSTEEL,JAICORPLTD,J&KBANK,JINDALSTEL,JINDALPHOT,JIOFIN,JUBILANT,JUBLFOOD,JUBLINGREA,JUBLPHARMA,KPRMILL,KEI,KNRCON,KPITTECH,KRBL,KSB,KAJARIACER,KALYANKJIL,KANSAINER,KARURVYSYA,KAYNES,KEC,KFINTECH,KOTAKBANK,KIMS,L&TFH,LTTS,LICHSGFIN,LTIM,LT,LATENTVIEW,LAURUSLABS,LEMONTREE,LICI,LINDEINDIA,LUPIN,MRF,MTARTECH,MACPOWER,LODHA,MGL,M&MFIN,M&M,MAHSEAMLES,MARICO,MARUTI,MASTEK,MAXHEALTH,MAXFIN,MAZDOCK,MEDPLUS,METROBRAND,METROPOLIS,MINDACORP,UNOINDA,MOTILALOFS,MPHASIS,MCX,MUTHOOTFIN,NATCOPHARM,NBCC,NCC,NHPC,NLCINDIA,NMDC,NOCIL,NTPC,OBEROIRLTY,ONGC,OIL,OLECTRA,PAYTM,OFSS,POLICYBKR,PCBL,PIIND,PNBHOUSING,PNCINFRA,PVRINOX,PAGEIND,PATANJALI,PERSISTENT,PETRONET,PFIZER,PHOENIXLTD,PIDILITIND,PEL,PPLPHARMA,POLYMED,POLYCAB,POONAWALLA,PFC,POWERGRID,PRAJIND,PRESTIGE,PRINCEPIPE,PRSMJOHNSN,PGHL,PNB,QUESS,RBLBANK,RECLTD,RHIM,RITES,RADICO,RVNL,RAILTEL,RAIN,RAMCOCEM,RATNAMANI,RAYMOND,REDINGTON,RELAXO,RELIANCE,RBA,ROUTE,SJVN,SKFINDIA,SRF,MOTHERSON,SANOFI,SAPPHIRE,SAREGAMA,SCHAEFFLER,SCHNEIDER,CIGNITITEC,SEQUENT,SHARDACROP,SHAREINDIA,SCI,SHREECEM,SHRIRAMFIN,SHYAMMETL,SIEMENS,SOBHA,SOLARINDS,SONACOMS,STARHEALTH,SBI,SAIL,SBM,STLTECH,STARCEMENT,SUDARSCHEM,SUMICHEM,SPARC,SUNPHARMA,SUNTV,SUNDARMFIN,SUNDRMFAST,SUNTECK,SUPREMEIND,SUVENPHAR,SUZLON,SWANENERGY,SYMPHONY,SYNGENE,TCIEXP,TCNSBRANDS,TCS,TATACHEM,TATACOMM,TATACONSUM,TATAELXSI,TATAINVEST,TATAMOTORS,TATAPOWER,TATASTEEL,TTML,TEAMLEASE,TECHM,TEJASNET,THERMAX,TIDEWATER,TIMKEN,TITAN,TORNTPHARM,TORNTPOWER,TRENT,TRIDENT,TRIVENI,TRIVENITQ,TUBEINVEST,UCOBANK,UPL,UTIAMC,UJJIVANSFB,ULTRACEMCO,UNIONBANK,UBL,MCDOWELL-N,VGUARD,VMART,VIPIND,VAIBHAVGBL,VTL,VARROC,VBL,VEDL,VENKEYS,VIJAYA,VINATIORGA,IDEA,VOLTAS,WELCORP,WELENT,WHIRLPOOL,WIPRO,YESBANK,ZFCVINDIA,ZEEL,ZENSARTECH,ZOMATO,ZYDUSLIFE"
     return [s.strip() + ".NS" for s in nifty500_csv.split(",")]
 
+# ---------------------------------------------------------
+# SMART CACHE FUNCTION
+# ---------------------------------------------------------
 def fetch_market_data(ticker, period, interval):
+    """
+    Checks for a local CSV file. If it exists and is recent enough, loads it.
+    If it's slightly stale, downloads only the recent missing candles and concatenates them.
+    If it doesn't exist, downloads the full requested period and saves it.
+    """
+    file_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}.csv")
     t = yf.Ticker(ticker)
+    
+    if os.path.exists(file_path):
+        try:
+            # 1. Read existing data
+            local_df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+            if not local_df.empty:
+                last_date = local_df.index[-1]
+                now = datetime.now().replace(tzinfo=None)
+                
+                # 2. Check if we need to update 15m data
+                if interval == '15m' and (now - last_date) > timedelta(minutes=15):
+                    # Fetch only the last 5 days to cover any recent gaps
+                    recent_df = t.history(period="5d", interval="15m", auto_adjust=False)
+                    if not recent_df.empty:
+                        recent_df.index = recent_df.index.tz_convert('Asia/Kolkata').tz_localize(None) if recent_df.index.tz else recent_df.index.tz_localize(None)
+                        # Merge and drop duplicates
+                        combined = pd.concat([local_df, recent_df])
+                        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+                        
+                        # Trim strictly to the original requested period length (e.g., 60 days) to prevent file bloat
+                        sixty_days_ago = combined.index[-1] - pd.Timedelta(days=60)
+                        combined = combined[combined.index >= sixty_days_ago]
+                        
+                        combined.to_csv(file_path)
+                        return combined
+                        
+                # 3. Check if we need to update Daily data
+                elif interval == '1d' and (now - last_date) > timedelta(hours=24):
+                     # Fetch only the last month to cover any recent gaps
+                    recent_df = t.history(period="1mo", interval="1d", auto_adjust=False)
+                    if not recent_df.empty:
+                        recent_df.index = recent_df.index.tz_localize(None)
+                        combined = pd.concat([local_df, recent_df])
+                        combined = combined[~combined.index.duplicated(keep='last')].sort_index()
+                        combined.to_csv(file_path)
+                        return combined
+                        
+                return local_df
+        except Exception as e:
+            # If the CSV is corrupted, fall back to fetching fresh
+            pass 
+            
+    # 4. Fallback: Download full dataset if no valid cache exists
     df = t.history(period=period, interval=interval, auto_adjust=False)
     if not df.empty:
         if interval == '15m': 
             df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None) if df.index.tz else df.index.tz_localize(None)
         else: 
             df.index = df.index.tz_localize(None)
+        # Save to local cache
+        df.to_csv(file_path)
+        
     return df
 
 def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
@@ -171,7 +231,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
 def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method, app_mode):
     raw_setups = []
     
-    # Internal Scan Range: Scan slightly further back to catch pending entries for today
     internal_start = start_date_val - timedelta(days=10) if app_mode == "Today's Live Trades" else start_date_val - timedelta(days=15)
     
     df_15m = fetch_market_data(ticker, "60d", "15m")
@@ -285,7 +344,14 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 
 # --- UI EXECUTION ---
 st.title("⚡ Weekly ICT Sweep & MTF Screener")
-st.write("Strictly executing the 7-Rule framework with Live Intraday Tracking.")
+st.write("Strictly executing the 7-Rule framework with Smart Local Caching.")
+
+# Optional Clear Cache Button
+if st.button("🗑️ Clear Local Data Cache", type="secondary"):
+    if os.path.exists(CACHE_DIR):
+        shutil.rmtree(CACHE_DIR)
+        os.makedirs(CACHE_DIR)
+    st.success("Cache cleared! The next scan will download fresh historical data.")
 
 app_mode = st.radio("Operating Mode", ["Today's Live Trades", "Backtester"], horizontal=True)
 
@@ -299,12 +365,12 @@ if app_mode == "Backtester":
 else:
     c1, c2 = st.columns(2)
     today = datetime.now(ist).date()
-    start_date, end_date = today, today # Defaults used purely for data slicing range
+    start_date, end_date = today, today
     with c1: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
     with c2: zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
 
 if st.button("🚀 Execute Scan", type="primary"):
-    with st.spinner(f"Analyzing Nifty 500 across {app_mode}..."):
+    with st.spinner(f"Scanning Nifty 500 across {app_mode}..."):
         tickers = get_nifty500_symbols()
         all_setups = []
         progress_bar = st.progress(0)
@@ -337,7 +403,6 @@ if st.button("🚀 Execute Scan", type="primary"):
                     st.info("No triggered trades in this category.")
                     return
                     
-                # Exclude Pending Entry from win rate / PnL math
                 completed_trades = df_sub[df_sub['Outcome'].isin(["Target Hit", "SL Hit", "Time Square Off", "Running (Live)"])]
                 wins = len(completed_trades[completed_trades['P&L (₹)'] > 0])
                 total = len(completed_trades)
