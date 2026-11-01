@@ -71,7 +71,6 @@ def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
 def get_nearest_15m_target_swing(df_15m, activation_idx, direction='high'):
     try:
         loc = df_15m.index.get_loc(activation_idx)
-        # Scan backward historically from the activation candle to avoid lookahead bias
         for i in range(loc - 1, 0, -1):
             if direction == 'high':
                 if df_15m['High'].iloc[i] > df_15m['High'].iloc[i-1] and df_15m['High'].iloc[i] > df_15m['High'].iloc[i+1]:
@@ -125,7 +124,7 @@ def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone
             return zone_candles['Low'].min(), zone_candles['High'].max()
     except: return None, None
 
-def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, active_target, qty, direction, max_wait_hours, trading_window):
+def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, initial_target, qty, direction, max_wait_hours, trading_window, cap_rr):
     post_activation_df = df_15m.loc[activation_idx:]
     if len(post_activation_df) <= 1: return None
     tracking_df = post_activation_df.iloc[1:]
@@ -139,12 +138,23 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     t_start = time(9, 45)
     t_end = time(13, 30)
     
+    dynamic_target = initial_target
+    
     for idx, row in tracking_df_entry.iterrows():
+        # Check gap SL void
         if direction == 'Bullish' and row['Low'] <= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
         if direction == 'Bearish' and row['High'] >= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
             
+        # Dynamically track the true unmitigated extreme of the impulse leg
+        if direction == 'Bullish':
+            if row['High'] > dynamic_target:
+                dynamic_target = row['High']
+        else:
+            if row['Low'] < dynamic_target:
+                dynamic_target = row['Low']
+                
         in_window = True
         if trading_window == "09:45 - 13:30":
             if not (t_start <= idx.time() <= t_end):
@@ -162,8 +172,24 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
                 
     if not entry_time:
         return {"Entry Date": "-", "Outcome": "No Entry", "P&L (₹)": 0.0, "Exit Price": "-"}
+        
+    # Re-evaluate Target & RR based on the dynamic_target at the exact moment of entry
+    risk_dist = round(abs(entry_price - active_sl), 2)
     
+    if direction == 'Bullish':
+        target_dist = round(dynamic_target - entry_price, 2)
+        if cap_rr == "Yes" and risk_dist > 0 and (target_dist / risk_dist) > 3:
+            target_dist = round(3 * risk_dist, 2)
+            dynamic_target = round(entry_price + target_dist, 2)
+    else:
+        target_dist = round(entry_price - dynamic_target, 2)
+        if cap_rr == "Yes" and risk_dist > 0 and (target_dist / risk_dist) > 3:
+            target_dist = round(3 * risk_dist, 2)
+            dynamic_target = round(entry_price - target_dist, 2)
+            
+    actual_rr = round(target_dist / risk_dist, 1) if risk_dist > 0 else 0
     actual_entry = round(open_px if open_px < entry_price else entry_price, 2) if direction == 'Bullish' else round(open_px if open_px > entry_price else entry_price, 2)
+    
     end_of_day = entry_time.replace(hour=23, minute=59, second=59)
     day_df = df_15m.loc[entry_time:end_of_day]
     
@@ -173,10 +199,10 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     for idx, row in day_df.iterrows():
         if direction == 'Bullish':
             if row['Low'] <= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-            elif row['High'] >= active_target: outcome, exit_price = "Target Hit", active_target; break
+            elif row['High'] >= dynamic_target: outcome, exit_price = "Target Hit", dynamic_target; break
         else:
             if row['High'] >= active_sl: outcome, exit_price = "SL Hit", active_sl; break
-            elif row['Low'] <= active_target: outcome, exit_price = "Target Hit", active_target; break
+            elif row['Low'] <= dynamic_target: outcome, exit_price = "Target Hit", dynamic_target; break
             
     is_today = entry_time.date() == datetime.now(ist).date()
     current_time = datetime.now(ist)
@@ -188,6 +214,8 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     
     return {
         "Entry Date": entry_time.strftime('%Y-%m-%d %H:%M'),
+        "Target": dynamic_target,
+        "Target RR": f"1:{actual_rr}",
         "Outcome": outcome,
         "Exit Price": round(exit_price, 2),
         "P&L (₹)": pnl
@@ -296,7 +324,7 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
     today_str = datetime.now(ist).strftime('%Y-%m-%d')
     
     for s in deduped_setups.values():
-        exec_data = simulate_intraday_execution(df_15m, s['Activation Time'], s['Entry'], s['SL'], s['Target'], s['Qty'], s['Type'], max_wait_hours, trading_window)
+        exec_data = simulate_intraday_execution(df_15m, s['Activation Time'], s['Entry'], s['SL'], s['Target'], s['Qty'], s['Type'], max_wait_hours, trading_window, cap_rr)
         if not exec_data: continue
         
         s.update(exec_data)
@@ -322,7 +350,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                 except ValueError:
                     pass
                     
-    # Strict ONE trade per stock per day deduplication
     final_setups = []
     daily_tracker = set()
     for s in temp_setups:
@@ -340,7 +367,7 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 
 # --- UI EXECUTION ---
 st.title("⚡ Weekly ICT Sweep & MTF Screener")
-st.write("Strictly executing the 7-Rule framework with Advanced Trade Management.")
+st.write("Strictly executing the 7-Rule framework with Dynamic Target Tracking.")
 
 wait_options_dict = {
     "30 min": 0.5, "1 hr": 1.0, "1:30 hrs": 1.5, "2 hrs": 2.0, "2:30 hrs": 2.5,
