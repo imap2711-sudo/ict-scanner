@@ -42,41 +42,36 @@ def get_nifty500_symbols():
 # ---------------------------------------------------------
 def fetch_market_data(ticker, period, interval):
     """
-    Checks for a local CSV file. If it exists and is recent enough, loads it.
-    If it's slightly stale, downloads only the recent missing candles and concatenates them.
-    If it doesn't exist, downloads the full requested period and saves it.
+    Checks for a local CSV file. Uses os.path.getmtime to verify the physical 
+    file age to prevent endless weekend looping on stale market data.
     """
     file_path = os.path.join(CACHE_DIR, f"{ticker}_{interval}.csv")
     t = yf.Ticker(ticker)
     
     if os.path.exists(file_path):
         try:
-            # 1. Read existing data
+            # Check the physical file modification time to prevent weekend looping
+            file_mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+            now = datetime.now()
+            
             local_df = pd.read_csv(file_path, index_col=0, parse_dates=True)
             if not local_df.empty:
-                last_date = local_df.index[-1]
-                now = datetime.now().replace(tzinfo=None)
                 
-                # 2. Check if we need to update 15m data
-                if interval == '15m' and (now - last_date) > timedelta(minutes=15):
-                    # Fetch only the last 5 days to cover any recent gaps
+                # Only ping Yahoo Finance if the CACHE FILE itself is older than 15 mins
+                if interval == '15m' and (now - file_mod_time) > timedelta(minutes=15):
                     recent_df = t.history(period="5d", interval="15m", auto_adjust=False)
                     if not recent_df.empty:
                         recent_df.index = recent_df.index.tz_convert('Asia/Kolkata').tz_localize(None) if recent_df.index.tz else recent_df.index.tz_localize(None)
-                        # Merge and drop duplicates
                         combined = pd.concat([local_df, recent_df])
                         combined = combined[~combined.index.duplicated(keep='last')].sort_index()
                         
-                        # Trim strictly to the original requested period length (e.g., 60 days) to prevent file bloat
                         sixty_days_ago = combined.index[-1] - pd.Timedelta(days=60)
                         combined = combined[combined.index >= sixty_days_ago]
-                        
                         combined.to_csv(file_path)
                         return combined
                         
-                # 3. Check if we need to update Daily data
-                elif interval == '1d' and (now - last_date) > timedelta(hours=24):
-                     # Fetch only the last month to cover any recent gaps
+                # Only ping Yahoo Finance if the Daily cache file is older than 24 hours
+                elif interval == '1d' and (now - file_mod_time) > timedelta(hours=24):
                     recent_df = t.history(period="1mo", interval="1d", auto_adjust=False)
                     if not recent_df.empty:
                         recent_df.index = recent_df.index.tz_localize(None)
@@ -90,7 +85,7 @@ def fetch_market_data(ticker, period, interval):
             # If the CSV is corrupted, fall back to fetching fresh
             pass 
             
-    # 4. Fallback: Download full dataset if no valid cache exists
+    # Fallback: Download full dataset if no valid cache exists
     df = t.history(period=period, interval=interval, auto_adjust=False)
     if not df.empty:
         if interval == '15m': 
@@ -346,7 +341,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 st.title("⚡ Weekly ICT Sweep & MTF Screener")
 st.write("Strictly executing the 7-Rule framework with Smart Local Caching.")
 
-# Optional Clear Cache Button
 if st.button("🗑️ Clear Local Data Cache", type="secondary"):
     if os.path.exists(CACHE_DIR):
         shutil.rmtree(CACHE_DIR)
