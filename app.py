@@ -4,11 +4,11 @@ import pandas as pd
 import numpy as np
 import concurrent.futures
 from datetime import datetime, timedelta, time
-import pytz
+from zoneinfo import ZoneInfo
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="ICT Precision Scanner", layout="wide", page_icon="⚡")
-ist = pytz.timezone('Asia/Kolkata')
+ist = ZoneInfo('Asia/Kolkata')
 
 custom_css = """
 <style>
