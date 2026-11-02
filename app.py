@@ -22,7 +22,9 @@ custom_css = """
     div[data-baseweb="tab"][aria-selected="true"]:nth-child(2) { background-color: #EF4444 !important; border-color: #DC2626 !important; }
 </style>
 """
-st.markdown(custom_css, unsafe_allow_html=True)
+st.title("⚡ Weekly ICT Sweep & MTF Screener")  # rendered first, before any custom CSS
+if st.query_params.get("plain") != "1":  # add ?plain=1 to the app URL to disable the custom CSS
+    st.markdown(custom_css, unsafe_allow_html=True)
 
 # --- CONSTANTS (Rule 2 / Rule 5 / Rule 7) ---
 MAX_SWEEP_TO_ACTIVATION = pd.Timedelta(days=2)   # Rule 2 validation window
@@ -204,14 +206,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
         if direction == 'Bearish' and row['High'] >= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
 
-        # Rule 6: target stretches while the order is still pending
-        if direction == 'Bullish':
-            if row['High'] > dynamic_target:
-                dynamic_target = row['High']
-        else:
-            if row['Low'] < dynamic_target:
-                dynamic_target = row['Low']
-
         # Entry window: candle must START inside [09:45, 13:30)
         in_window = True
         if trading_window == "09:45 - 13:30":
@@ -224,6 +218,16 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
             elif direction == 'Bearish' and row['High'] >= entry_price:
                 entry_time, open_px = idx, row['Open']
                 break
+
+        # Rule 6: the target stretches only on candles that finished BEFORE the fill.
+        # The entry candle's own extreme is never used - we cannot know whether it
+        # printed before or after the fill (e.g. an opening spike before the dip).
+        if direction == 'Bullish':
+            if row['High'] > dynamic_target:
+                dynamic_target = row['High']
+        else:
+            if row['Low'] < dynamic_target:
+                dynamic_target = row['Low']
 
     if entry_time is None:
         return {"Entry Date": "-", "Outcome": "No Entry", "P&L (₹)": 0.0, "Exit Price": "-"}
@@ -254,19 +258,22 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     outcome = "Time Square Off"
     exit_price = day_df['Close'].iloc[-1]
 
-    for idx, row in day_df.iterrows():
+    for n, (idx, row) in enumerate(day_df.iterrows()):
+        # Entry candle (n == 0): the stop can be hit after the fill, but a target touch
+        # in the same candle is not credited (the order of its high/low is unknown).
+        can_target = n > 0
         if direction == 'Bullish':
             if row['Low'] <= active_sl:
                 outcome, exit_price = "SL Hit", active_sl
                 break
-            elif row['High'] >= dynamic_target:
+            elif can_target and row['High'] >= dynamic_target:
                 outcome, exit_price = "Target Hit", dynamic_target
                 break
         else:
             if row['High'] >= active_sl:
                 outcome, exit_price = "SL Hit", active_sl
                 break
-            elif row['Low'] <= dynamic_target:
+            elif can_target and row['Low'] <= dynamic_target:
                 outcome, exit_price = "Target Hit", dynamic_target
                 break
 
@@ -431,7 +438,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 
 
 # --- UI EXECUTION ---
-st.title("⚡ Weekly ICT Sweep & MTF Screener")
 st.write("Strictly executing the 7-Rule framework with Dynamic Target Tracking.")
 
 wait_options_dict = {
