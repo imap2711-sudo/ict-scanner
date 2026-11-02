@@ -72,6 +72,9 @@ def fetch_market_data(ticker, period, interval):
         return pd.DataFrame()
 
 
+# ---------------------------------------------------------------------------
+# RULE 2 & 3: Build 75-Minute Candles & Swing Logic (No Lookahead)
+# ---------------------------------------------------------------------------
 def build_75m_candles(df_15m):
     rows = []
     for _, group in df_15m.groupby(df_15m.index.normalize()):
@@ -93,6 +96,10 @@ def build_75m_candles(df_15m):
 
 
 def get_nearest_untested_75m_swing(df_75m, sweep_75m_dt, direction='high'):
+    """
+    Identifies the nearest unmitigated 75m fractal swing BEFORE OR INCLUDING the sweep candle.
+    - Eliminates Wick Blindness by checking absolute wicks.
+    """
     if sweep_75m_dt not in df_75m.index:
         closest_time = df_75m.index.asof(sweep_75m_dt)
         if pd.isna(closest_time):
@@ -124,6 +131,10 @@ def get_nearest_untested_75m_swing(df_75m, sweep_75m_dt, direction='high'):
     return None, None
 
 
+# ---------------------------------------------------------------------------
+# RULE 4: Two consecutive 15m candles closing beyond the MSS line.
+# STRICT WEEKLY CUTOFF: Setup expires if not activated by the end of the week.
+# ---------------------------------------------------------------------------
 def find_activation(df_15m, sweep_bar_dt, mss_price, direction):
     days_to_next_monday = 7 - sweep_bar_dt.weekday()
     next_monday = (sweep_bar_dt + timedelta(days=days_to_next_monday)).replace(hour=0, minute=0, second=0)
@@ -144,6 +155,9 @@ def find_activation(df_15m, sweep_bar_dt, mss_price, direction):
     return hits.index[0] if not hits.empty else None
 
 
+# ---------------------------------------------------------------------------
+# RULE 6: Untested 15m Swing Target (Prior price action)
+# ---------------------------------------------------------------------------
 def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction, active_sl):
     hist = df_15m.loc[:activation_idx].iloc[-SWING_LOOKBACK_BARS:]
     highs, lows = hist['High'].to_numpy(), hist['Low'].to_numpy()
@@ -170,6 +184,9 @@ def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction
     return None
 
 
+# ---------------------------------------------------------------------------
+# RULE 5: Supply & Demand Zone Extraction
+# ---------------------------------------------------------------------------
 def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone_method,
                  zone_position=ZONE_NEAREST):
     try:
@@ -218,6 +235,9 @@ def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone
         return None, None
 
 
+# ---------------------------------------------------------------------------
+# RULE 6 & 7: Execution Engine with Dynamic New Swing High/Low Target Update
+# ---------------------------------------------------------------------------
 def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, initial_target, qty,
                                 direction, trading_window, cap_rr):
     post_activation_df = df_15m.loc[activation_idx:]
@@ -225,6 +245,7 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
         return None
     tracking_df = post_activation_df.iloc[1:]
     
+    # Constrain entry search strictly to the day of activation
     activation_date = activation_idx.date()
     tracking_df_entry = tracking_df[tracking_df.index.date == activation_date]
 
@@ -351,6 +372,9 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     }
 
 
+# ---------------------------------------------------------------------------
+# Setup Builder
+# ---------------------------------------------------------------------------
 def build_setup(ticker, direction, sweep_time_15m, df_15m, df_75m, zone_method, risk_amt, cap_rr,
                 zone_position=ZONE_NEAREST):
     bullish = direction == 'Bullish'
@@ -498,6 +522,15 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                         temp_setups.append(s)
                 except ValueError:
                     pass
+        
+        elif app_mode == "Grid Search Optimizer":
+            if entry_date_str != "-" and outcome != "Gap SL Void":
+                try:
+                    entry_date_obj = datetime.strptime(entry_date_str, '%Y-%m-%d %H:%M').date()
+                    if start_date_val <= entry_date_obj <= end_date_val:
+                        temp_setups.append(s)
+                except ValueError:
+                    pass
 
     def _order(s):
         executed = s.get("Entry Date", "-") != "-"
@@ -517,9 +550,102 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 # --- UI EXECUTION ---
 st.write("Executing 7-Rule ICT Framework with 15m Sweeps (No 9:15) and Dynamic Target Tracking.")
 
-app_mode = st.radio("Operating Mode", ["Today's Live Trades", "Backtester"], horizontal=True)
+app_mode = st.radio("Operating Mode", ["Today's Live Trades", "Backtester", "Grid Search Optimizer"], horizontal=True)
 
-if app_mode == "Backtester":
+if app_mode == "Grid Search Optimizer":
+    st.warning("⚠️ **Optimization Warning:** Testing 128 parameter combinations across 200+ stocks requires heavy computation. Using your local Dhan CSV data (instead of yfinance) is highly recommended for speed.")
+    
+    r1c1, r1c2, r1c3 = st.columns(3)
+    with r1c1: start_date = st.date_input("Entry Start Date", datetime(2026, 8, 1).date())
+    with r1c2: end_date = st.date_input("Entry End Date", datetime.now(ist).date())
+    with r1c3: universe_selection = st.selectbox("Stock Universe", ["Nifty 200", "Nifty 500"])
+    
+    if st.button("🔍 Find Optimal Settings", type="primary"):
+        import itertools
+        
+        grid = {
+            "zone_method": ["Standard (Base Only)", "Strict (Base + Leg-Out)"],
+            "trading_window": ["Full Day (09:15 - 15:30)", "09:45 - 13:30"],
+            "cap_rr": ["No", "1:1.5", "1:2", "1:3"],
+            "sweep_exhaustion": [MODE_SINGLE_SWEEP, MODE_MULTI_SWEEP],
+            "zone_pos": [ZONE_NEAREST, ZONE_STRICT]
+        }
+        
+        keys = grid.keys()
+        combinations = list(itertools.product(*grid.values()))
+        tickers = get_stock_symbols(universe_selection)
+        
+        progress_text = st.empty()
+        progress_bar = st.progress(0)
+        
+        progress_text.text("Pre-fetching historical market data into cache...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            list(executor.map(lambda t: fetch_market_data(t, "60d", "15m"), tickers))
+            list(executor.map(lambda t: fetch_market_data(t, "1y", "1d"), tickers))
+            
+        results_data = []
+        risk_amt = 1000 
+        
+        for idx, combo in enumerate(combinations):
+            params = dict(zip(keys, combo))
+            progress_text.text(f"Evaluating combination {idx+1}/{len(combinations)}...")
+            
+            all_setups = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(
+                    evaluate_ticker, t, start_date, end_date, risk_amt, 
+                    params["zone_method"], "Grid Search Optimizer", params["trading_window"], 
+                    params["cap_rr"], params["sweep_exhaustion"], params["zone_pos"]
+                ) for t in tickers]
+                
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        res = f.result()
+                        if res: all_setups.extend(res)
+                    except Exception:
+                        pass
+            
+            if all_setups:
+                df_setups = pd.DataFrame(all_setups)
+                completed = df_setups[df_setups['Outcome'].isin(["Target Hit", "SL Hit", "Time Square Off"])]
+                total_trades = len(completed)
+                
+                if total_trades > 0:
+                    wins = int((completed['P&L (₹)'] > 0).sum())
+                    win_rate = (wins / total_trades) * 100
+                    net_pnl = completed['P&L (₹)'].sum()
+                else:
+                    win_rate, net_pnl = 0.0, 0.0
+            else:
+                total_trades, win_rate, net_pnl = 0, 0.0, 0.0
+                
+            results_data.append({
+                "Zone Method": params["zone_method"],
+                "Entry Window": params["trading_window"],
+                "Cap RR": params["cap_rr"],
+                "Sweep Mode": params["sweep_exhaustion"],
+                "Zone Position": params["zone_pos"],
+                "Total Trades": total_trades,
+                "Win Rate (%)": round(win_rate, 2),
+                "Net P&L (₹)": round(net_pnl, 2)
+            })
+            
+            progress_bar.progress((idx + 1) / len(combinations))
+        
+        progress_text.text("Optimization Complete! Top configurations sorted by Win Rate:")
+        
+        df_results = pd.DataFrame(results_data)
+        df_filtered = df_results[df_results["Total Trades"] >= 5]
+        if df_filtered.empty:
+            df_filtered = df_results
+            
+        df_sorted = df_filtered.sort_values(by=["Win Rate (%)", "Net P&L (₹)"], ascending=[False, False])
+        
+        st.success(f"Best Configuration Found: {df_sorted['Win Rate (%)'].iloc[0]}% Win Rate")
+        st.dataframe(df_sorted, use_container_width=True, hide_index=True)
+
+
+elif app_mode == "Backtester":
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
     today = datetime.now(ist).date()
     with r1c1: start_date = st.date_input("Entry Start Date", today - timedelta(days=5))
@@ -532,6 +658,7 @@ if app_mode == "Backtester":
     with r2c2: trading_window = st.selectbox("Entry Window", ["Full Day (09:15 - 15:30)", "09:45 - 13:30"])
     with r2c3: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
     with r2c4: sweep_exhaustion_mode = st.selectbox("Weekly Liquidity Mode", [MODE_SINGLE_SWEEP, MODE_MULTI_SWEEP])
+
 else:
     r1c1, r1c2, r1c3 = st.columns(3)
     today = datetime.now(ist).date()
@@ -545,72 +672,74 @@ else:
     with r2c2: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
     with r2c3: sweep_exhaustion_mode = st.selectbox("Weekly Liquidity Mode", [MODE_SINGLE_SWEEP, MODE_MULTI_SWEEP])
 
-zone_position = st.selectbox(
-    "15m Zone Condition vs MSS Line",
-    [ZONE_NEAREST, ZONE_STRICT],
-    help="Nearest: base candles closest to MSS line. Strictly below/above: Demand strictly below MSS / Supply strictly above MSS.")
+if app_mode != "Grid Search Optimizer":
+    zone_position = st.selectbox(
+        "15m Zone Condition vs MSS Line",
+        [ZONE_NEAREST, ZONE_STRICT],
+        help="Nearest: base candles closest to MSS line. Strictly below/above: Demand strictly below MSS / Supply strictly above MSS."
+    )
 
-if st.button("🚀 Execute Scan", type="primary"):
-    with st.spinner(f"Scanning {universe_selection} across {app_mode}..."):
-        tickers = get_stock_symbols(universe_selection)
-        all_setups = []
-        progress_bar = st.progress(0)
+    if st.button("🚀 Execute Scan", type="primary"):
+        with st.spinner(f"Scanning {universe_selection} across {app_mode}..."):
+            tickers = get_stock_symbols(universe_selection)
+            all_setups = []
+            progress_bar = st.progress(0)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method,
-                                       app_mode, trading_window, cap_rr, sweep_exhaustion_mode, zone_position): t for t in tickers}
-            completed = 0
-            for f in concurrent.futures.as_completed(futures):
-                try:
-                    res = f.result()
-                except Exception:
-                    res = []
-                if res:
-                    all_setups.extend(res)
-                completed += 1
-                progress_bar.progress(completed / len(tickers))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method,
+                                           app_mode, trading_window, cap_rr, sweep_exhaustion_mode, zone_position): t for t in tickers}
+                completed = 0
+                for f in concurrent.futures.as_completed(futures):
+                    try:
+                        res = f.result()
+                    except Exception:
+                        res = []
+                    if res:
+                        all_setups.extend(res)
+                    completed += 1
+                    progress_bar.progress(completed / len(tickers))
 
-        progress_bar.empty()
+            progress_bar.empty()
 
-        if all_setups:
-            df = pd.DataFrame(all_setups)
-            cols_order = ["Stock", "Type", "Sweep Time", "Activation Time", "MSS Line", "Entry Date", "Entry",
-                          "SL", "Target", "Target RR", "Qty", "Outcome", "Exit Price", "P&L (₹)"]
+            if all_setups:
+                df = pd.DataFrame(all_setups)
+                cols_order = ["Stock", "Type", "Sweep Time", "Activation Time", "MSS Line", "Entry Date", "Entry",
+                              "SL", "Target", "Target RR", "Qty", "Outcome", "Exit Price", "P&L (₹)"]
 
-            df_bull = df[df['Type'] == 'Bullish'].copy()
-            df_bear = df[df['Type'] == 'Bearish'].copy()
+                df_bull = df[df['Type'] == 'Bullish'].copy()
+                df_bear = df[df['Type'] == 'Bearish'].copy()
 
-            if not df_bull.empty:
-                df_bull = df_bull[[c for c in cols_order if c in df_bull.columns]]
-                df_bull = df_bull.sort_values(by="Entry Date", ascending=True)
-            if not df_bear.empty:
-                df_bear = df_bear[[c for c in cols_order if c in df_bear.columns]]
-                df_bear = df_bear.sort_values(by="Entry Date", ascending=True)
+                if not df_bull.empty:
+                    df_bull = df_bull[[c for c in cols_order if c in df_bull.columns]]
+                    df_bull = df_bull.sort_values(by="Entry Date", ascending=True)
+                if not df_bear.empty:
+                    df_bear = df_bear[[c for c in cols_order if c in df_bear.columns]]
+                    df_bear = df_bear.sort_values(by="Entry Date", ascending=True)
 
-            tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
+                tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
 
-            def render_tab(df_sub):
-                if df_sub.empty:
-                    st.info("No triggered trades in this category.")
-                    return
+                def render_tab(df_sub):
+                    if df_sub.empty:
+                        st.info("No triggered trades in this category.")
+                        return
 
-                completed_trades = df_sub[df_sub['Outcome'].isin(["Target Hit", "SL Hit", "Time Square Off", "Running (Live)"])]
-                wins = int((completed_trades['P&L (₹)'] > 0).sum())
-                losses = int((completed_trades['P&L (₹)'] < 0).sum())
-                total = len(completed_trades)
-                win_rate = (wins / total) * 100 if total > 0 else 0
-                total_pnl = completed_trades['P&L (₹)'].sum()
+                    completed_trades = df_sub[df_sub['Outcome'].isin(["Target Hit", "SL Hit", "Time Square Off", "Running (Live)"])]
+                    wins = int((completed_trades['P&L (₹)'] > 0).sum())
+                    losses = int((completed_trades['P&L (₹)'] < 0).sum())
+                    total = len(completed_trades)
+                    win_rate = (wins / total) * 100 if total > 0 else 0
+                    total_pnl = completed_trades['P&L (₹)'].sum()
 
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("Active / Completed Trades", total)
-                m2.metric("Winners", wins)
-                m3.metric("Losers", losses)
-                m4.metric("Win Rate", f"{win_rate:.1f}%")
-                m5.metric("Net Profit / Loss", f"₹ {total_pnl:,.2f}")
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Active / Completed Trades", total)
+                    m2.metric("Winners", wins)
+                    m3.metric("Losers", losses)
+                    m4.metric("Win Rate", f"{win_rate:.1f}%")
+                    m5.metric("Net Profit / Loss", f"₹ {total_pnl:,.2f}")
 
-                st.dataframe(df_sub, use_container_width=True, hide_index=True)
+                    st.dataframe(df_sub, use_container_width=True, hide_index=True)
 
-            with tab1: render_tab(df_bull)
-            with tab2: render_tab(df_bear)
-        else:
-            st.warning("No setups met all conditions for the selected mode.")
+                with tab1: render_tab(df_bull)
+                with tab2: render_tab(df_bear)
+            else:
+                st.warning("No setups met all conditions for the selected mode.")
