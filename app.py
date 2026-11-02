@@ -134,13 +134,21 @@ def get_nearest_untested_75m_swing(df_75m, sweep_bar_dt, direction='high'):
 
 
 # ---------------------------------------------------------------------------
-# RULE 4: Exactly one completed 75m candle closing beyond the MSS line
-# No activation window restriction applied.
+# RULE 4: Exactly one completed 75m candle closing beyond the MSS line.
+# STRICT WEEKLY CUTOFF: Setup expires if not activated by the end of the 
+# current trading week (Sunday 23:59:59 / Monday 00:00:00).
 # ---------------------------------------------------------------------------
 def find_activation(df_75m, sweep_bar_dt, mss_price, direction):
-    bars = df_75m[df_75m['Complete'] & (df_75m.index >= sweep_bar_dt)]
+    # Calculate the very end of the current trading week
+    days_to_next_monday = 7 - sweep_bar_dt.weekday()
+    next_monday = (sweep_bar_dt + timedelta(days=days_to_next_monday)).replace(hour=0, minute=0, second=0)
+    end_of_week = next_monday - timedelta(seconds=1)
+    
+    # Filter bars strictly bounded between the sweep time and the end of the week
+    bars = df_75m[df_75m['Complete'] & (df_75m.index >= sweep_bar_dt) & (df_75m.index <= end_of_week)]
     if bars.empty:
         return None
+        
     beyond = (bars['Close'] > mss_price) if direction == 'Bullish' else (bars['Close'] < mss_price)
     hits = bars[beyond]
     return hits['End'].iloc[0] if not hits.empty else None
@@ -366,7 +374,7 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
 
 
 # ---------------------------------------------------------------------------
-# Setup Builder: 75m Sweep & No Activation Window
+# Setup Builder: 75m Sweep & Strict Weekly Cutoff
 # ---------------------------------------------------------------------------
 def build_setup(ticker, direction, sweep_bar_dt, df_15m, df_75m, zone_method, risk_amt, cap_rr,
                 zone_position=ZONE_NEAREST):
