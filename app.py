@@ -96,8 +96,9 @@ def build_75m_candles(df_15m):
 
 def get_nearest_untested_75m_swing(df_75m, sweep_bar_dt, direction='high'):
     """
-    Identifies the nearest unmitigated 75m fractal swing strictly BEFORE the sweep candle.
-    Prevents lookahead bias by ensuring the confirming bar is completed before the sweep.
+    Identifies the nearest unmitigated 75m fractal swing BEFORE OR INCLUDING the sweep candle.
+    - Eliminates Wick Blindness by checking the absolute High/Low wick rather than Close.
+    - Allows the Sweep Candle itself to act as the structural point if confirmed.
     """
     if sweep_bar_dt not in df_75m.index:
         closest_time = df_75m.index.asof(sweep_bar_dt)
@@ -107,16 +108,27 @@ def get_nearest_untested_75m_swing(df_75m, sweep_bar_dt, direction='high'):
     else:
         loc = df_75m.index.get_loc(sweep_bar_dt)
 
-    for i in range(loc - 2, 0, -1):
+    for i in range(loc, 0, -1):
+        if i + 1 >= len(df_75m):
+            continue
+            
         if direction == 'high':
             h = df_75m['High'].iloc[i]
             if h > df_75m['High'].iloc[i - 1] and h > df_75m['High'].iloc[i + 1]:
-                if df_75m['Close'].iloc[i + 1:loc].max() < h:
+                mitigated = False
+                if i < loc:
+                    # Mitigation requires any future wick high to explicitly break the swing high
+                    mitigated = df_75m['High'].iloc[i + 1 : loc + 1].max() >= h
+                if not mitigated:
                     return df_75m.index[i], h
         else:
             l = df_75m['Low'].iloc[i]
             if l < df_75m['Low'].iloc[i - 1] and l < df_75m['Low'].iloc[i + 1]:
-                if df_75m['Close'].iloc[i + 1:loc].min() > l:
+                mitigated = False
+                if i < loc:
+                    # Mitigation requires any future wick low to explicitly drop below the swing low
+                    mitigated = df_75m['Low'].iloc[i + 1 : loc + 1].min() <= l
+                if not mitigated:
                     return df_75m.index[i], l
     return None, None
 
@@ -432,7 +444,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
     scan_bars = completed_75m[(completed_75m.index >= pd.Timestamp(internal_start)) & 
                               (completed_75m.index <= pd.Timestamp(end_date_val) + pd.Timedelta(days=1))]
 
-    # Track exhaustion of weekly liquidity pools
     exhausted_pwl_monday = None
     exhausted_pwh_monday = None
 
@@ -446,14 +457,12 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 
         setup = None
         
-        # Bullish Sweep (PWL exhaustion check)
         if sweep_row['Low'] <= pwl and current_monday != exhausted_pwl_monday:
-            exhausted_pwl_monday = current_monday  # Mark PWL as exhausted for this week
+            exhausted_pwl_monday = current_monday  
             setup = build_setup(ticker, 'Bullish', sweep_bar_dt, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
         
-        # Bearish Sweep (PWH exhaustion check)
         if setup is None and sweep_row['High'] >= pwh and current_monday != exhausted_pwh_monday:
-            exhausted_pwh_monday = current_monday  # Mark PWH as exhausted for this week
+            exhausted_pwh_monday = current_monday  
             setup = build_setup(ticker, 'Bearish', sweep_bar_dt, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
 
         if setup is not None:
