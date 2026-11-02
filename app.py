@@ -35,7 +35,8 @@ SWING_N = 2
 SWING_LOOKBACK_BARS = 125                        
 ZONE_NEAREST = "Nearest to MSS line (above or below)"
 ZONE_STRICT = "Strictly below MSS line (demand) / above (supply)"
-
+MODE_SINGLE_SWEEP = "Single sweep allowed per week"
+MODE_MULTI_SWEEP = "Multiple sweeps allowed per week"
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_symbols(universe):
@@ -95,11 +96,6 @@ def build_75m_candles(df_15m):
 
 
 def get_nearest_untested_75m_swing(df_75m, sweep_bar_dt, direction='high'):
-    """
-    Identifies the nearest unmitigated 75m fractal swing BEFORE OR INCLUDING the sweep candle.
-    - Eliminates Wick Blindness by checking the absolute High/Low wick rather than Close.
-    - Allows the Sweep Candle itself to act as the structural point if confirmed.
-    """
     if sweep_bar_dt not in df_75m.index:
         closest_time = df_75m.index.asof(sweep_bar_dt)
         if pd.isna(closest_time):
@@ -117,7 +113,6 @@ def get_nearest_untested_75m_swing(df_75m, sweep_bar_dt, direction='high'):
             if h > df_75m['High'].iloc[i - 1] and h > df_75m['High'].iloc[i + 1]:
                 mitigated = False
                 if i < loc:
-                    # Mitigation requires any future wick high to explicitly break the swing high
                     mitigated = df_75m['High'].iloc[i + 1 : loc + 1].max() >= h
                 if not mitigated:
                     return df_75m.index[i], h
@@ -126,7 +121,6 @@ def get_nearest_untested_75m_swing(df_75m, sweep_bar_dt, direction='high'):
             if l < df_75m['Low'].iloc[i - 1] and l < df_75m['Low'].iloc[i + 1]:
                 mitigated = False
                 if i < loc:
-                    # Mitigation requires any future wick low to explicitly drop below the swing low
                     mitigated = df_75m['Low'].iloc[i + 1 : loc + 1].min() <= l
                 if not mitigated:
                     return df_75m.index[i], l
@@ -134,24 +128,31 @@ def get_nearest_untested_75m_swing(df_75m, sweep_bar_dt, direction='high'):
 
 
 # ---------------------------------------------------------------------------
-# RULE 4: Exactly one completed 75m candle closing beyond the MSS line.
+# RULE 4: Two consecutive 15m candles closing beyond the MSS line.
 # STRICT WEEKLY CUTOFF: Setup expires if not activated by the end of the 
 # current trading week (Sunday 23:59:59 / Monday 00:00:00).
 # ---------------------------------------------------------------------------
-def find_activation(df_75m, sweep_bar_dt, mss_price, direction):
+def find_activation(df_15m, sweep_bar_dt, mss_price, direction):
     # Calculate the very end of the current trading week
     days_to_next_monday = 7 - sweep_bar_dt.weekday()
     next_monday = (sweep_bar_dt + timedelta(days=days_to_next_monday)).replace(hour=0, minute=0, second=0)
     end_of_week = next_monday - timedelta(seconds=1)
     
-    # Filter bars strictly bounded between the sweep time and the end of the week
-    bars = df_75m[df_75m['Complete'] & (df_75m.index >= sweep_bar_dt) & (df_75m.index <= end_of_week)]
-    if bars.empty:
+    # Filter 15m bars strictly bounded between the sweep time and the end of the week
+    bars = df_15m[(df_15m.index >= sweep_bar_dt) & (df_15m.index <= end_of_week)]
+    if bars.empty or len(bars) < 2:
         return None
         
-    beyond = (bars['Close'] > mss_price) if direction == 'Bullish' else (bars['Close'] < mss_price)
-    hits = bars[beyond]
-    return hits['End'].iloc[0] if not hits.empty else None
+    if direction == 'Bullish':
+        condition = bars['Close'] > mss_price
+    else:
+        condition = bars['Close'] < mss_price
+        
+    # Check for two consecutive True closes
+    consecutive = condition & condition.shift(1)
+    hits = bars[consecutive]
+    
+    return hits.index[0] if not hits.empty else None
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +169,6 @@ def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction
             h = highs[i]
             if h <= entry_price:
                 continue
-            # Target considered if and only if it offers RR >= 1:1
             if (h - entry_price) < (MIN_RR * risk_dist):
                 continue
             if h > highs[i - n:i].max() and h > highs[i + 1:i + n + 1].max() and highs[i + 1:].max() < h:
@@ -177,7 +177,6 @@ def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction
             lo = lows[i]
             if lo >= entry_price:
                 continue
-            # Target considered if and only if it offers RR >= 1:1
             if (entry_price - lo) < (MIN_RR * risk_dist):
                 continue
             if lo < lows[i - n:i].min() and lo < lows[i + 1:i + n + 1].min() and lows[i + 1:].min() > lo:
@@ -384,7 +383,8 @@ def build_setup(ticker, direction, sweep_bar_dt, df_15m, df_75m, zone_method, ri
     if mss_idx is None:
         return None
 
-    activation_idx = find_activation(df_75m, sweep_bar_dt, mss_val, direction)
+    # Find activation using 2 consecutive 15m closes
+    activation_idx = find_activation(df_15m, sweep_bar_dt, mss_val, direction)
     if activation_idx is None:
         return None
 
@@ -434,7 +434,7 @@ def build_setup(ticker, direction, sweep_bar_dt, df_15m, df_75m, zone_method, ri
 
 
 def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method, app_mode,
-                    trading_window, cap_rr, zone_position=ZONE_NEAREST):
+                    trading_window, cap_rr, sweep_exhaustion_mode, zone_position=ZONE_NEAREST):
     raw_setups = []
     internal_start = start_date_val - timedelta(days=10) if app_mode == "Today's Live Trades" else start_date_val - timedelta(days=20)
 
@@ -454,6 +454,7 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 
     exhausted_pwl_monday = None
     exhausted_pwh_monday = None
+    enforce_exhaustion = (sweep_exhaustion_mode == MODE_SINGLE_SWEEP)
 
     for sweep_bar_dt, sweep_row in scan_bars.iterrows():
         current_monday = (sweep_bar_dt.normalize() - pd.Timedelta(days=sweep_bar_dt.weekday())).replace(hour=0, minute=0, second=0)
@@ -462,16 +463,19 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
             continue
 
         pwl, pwh = past_weekly['Low'].iloc[-1], past_weekly['High'].iloc[-1]
-
         setup = None
         
-        if sweep_row['Low'] <= pwl and current_monday != exhausted_pwl_monday:
-            exhausted_pwl_monday = current_monday  
-            setup = build_setup(ticker, 'Bullish', sweep_bar_dt, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
+        if sweep_row['Low'] <= pwl:
+            if not enforce_exhaustion or current_monday != exhausted_pwl_monday:
+                if enforce_exhaustion:
+                    exhausted_pwl_monday = current_monday  
+                setup = build_setup(ticker, 'Bullish', sweep_bar_dt, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
         
-        if setup is None and sweep_row['High'] >= pwh and current_monday != exhausted_pwh_monday:
-            exhausted_pwh_monday = current_monday  
-            setup = build_setup(ticker, 'Bearish', sweep_bar_dt, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
+        if setup is None and sweep_row['High'] >= pwh:
+            if not enforce_exhaustion or current_monday != exhausted_pwh_monday:
+                if enforce_exhaustion:
+                    exhausted_pwh_monday = current_monday  
+                setup = build_setup(ticker, 'Bearish', sweep_bar_dt, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
 
         if setup is not None:
             raw_setups.append(setup)
@@ -542,10 +546,11 @@ if app_mode == "Backtester":
     with r1c3: universe_selection = st.selectbox("Stock Universe", ["Nifty 200", "Nifty 500"])
     with r1c4: zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
 
-    r2c1, r2c2, r2c3 = st.columns(3)
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     with r2c1: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
     with r2c2: trading_window = st.selectbox("Entry Window", ["Full Day (09:15 - 15:30)", "09:45 - 13:30"])
     with r2c3: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
+    with r2c4: sweep_exhaustion_mode = st.selectbox("Weekly Liquidity Mode", [MODE_SINGLE_SWEEP, MODE_MULTI_SWEEP])
 else:
     r1c1, r1c2, r1c3 = st.columns(3)
     today = datetime.now(ist).date()
@@ -554,9 +559,10 @@ else:
     with r1c2: zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
     with r1c3: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
 
-    r2c1, r2c2 = st.columns(2)
+    r2c1, r2c2, r2c3 = st.columns(3)
     with r2c1: trading_window = st.selectbox("Entry Window", ["Full Day (09:15 - 15:30)", "09:45 - 13:30"])
     with r2c2: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
+    with r2c3: sweep_exhaustion_mode = st.selectbox("Weekly Liquidity Mode", [MODE_SINGLE_SWEEP, MODE_MULTI_SWEEP])
 
 zone_position = st.selectbox(
     "15m Zone Condition vs MSS Line",
@@ -571,7 +577,7 @@ if st.button("🚀 Execute Scan", type="primary"):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method,
-                                       app_mode, trading_window, cap_rr, zone_position): t for t in tickers}
+                                       app_mode, trading_window, cap_rr, sweep_exhaustion_mode, zone_position): t for t in tickers}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 try:
