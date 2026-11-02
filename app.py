@@ -22,22 +22,20 @@ custom_css = """
     div[data-baseweb="tab"][aria-selected="true"]:nth-child(2) { background-color: #EF4444 !important; border-color: #DC2626 !important; }
 </style>
 """
-st.title("⚡ Weekly ICT Sweep & MTF Screener")  # rendered first, before any custom CSS
-if st.query_params.get("plain") != "1":  # add ?plain=1 to the app URL to disable the custom CSS
+st.title("⚡ Weekly ICT Sweep & MTF Screener")
+if st.query_params.get("plain") != "1":
     st.markdown(custom_css, unsafe_allow_html=True)
 
-# --- CONSTANTS (Rule 2 / Rule 5 / Rule 7) ---
-MAX_SWEEP_TO_ACTIVATION = pd.Timedelta(days=2)   # Rule 2 validation window
-BASE_BODY_RATIO = 0.5                            # Rule 5 base candle test
-SL_PAD_BULL, SL_PAD_BEAR = 0.999, 1.001          # Rule 5 distal padding
-RR_CAP = 3                                       # Rule 7 RR cap
+# --- CONSTANTS ---
+BASE_BODY_RATIO = 0.5                            
+SL_PAD_BULL, SL_PAD_BEAR = 0.999, 1.001          
 WINDOW_START, WINDOW_END = time(9, 45), time(13, 30)
-MIN_RR = 1.0                                     # skip any setup below 1:1
-SWING_N = 2                                      # 15m swing = extreme vs 2 candles each side
-SWING_LOOKBACK_BARS = 125                        # ~5 sessions of 15m candles
+MIN_RR = 1.0                                     
+SWING_N = 2                                      
+SWING_LOOKBACK_BARS = 125                        
 ZONE_NEAREST = "Nearest to MSS line (above or below)"
 ZONE_STRICT = "Strictly below MSS line (demand) / above (supply)"
-WINDOW_2DAYS = "Within 2 days of sweep"
+WINDOW_OTHERS = "Others (Sweep to MSS from 2nd trading day onwards)"
 WINDOW_SAME_DAY = "Same day only (sweep and MSS activation on one day)"
 
 
@@ -56,7 +54,6 @@ IST_NAME = 'Asia/Kolkata'
 
 @st.cache_data(ttl=900, show_spinner=False, max_entries=1500)
 def _download(ticker, period, interval):
-    """Cached download. Raises on empty data so failures are never cached."""
     df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
     if df is None or df.empty:
         raise ValueError(f"No data for {ticker} ({interval})")
@@ -76,11 +73,7 @@ def fetch_market_data(ticker, period, interval):
         return pd.DataFrame()
 
 
-# ---------------------------------------------------------------------------
-# RULE 3: 75-minute MSS line (completed bars only -> no lookahead)
-# ---------------------------------------------------------------------------
 def build_75m_candles(df_15m):
-    """Groups each session's 15m candles into blocks of 5 (09:15-10:30, ... 14:00-15:15)."""
     rows = []
     for _, group in df_15m.groupby(df_15m.index.normalize()):
         for i in range(0, len(group), 5):
@@ -89,25 +82,20 @@ def build_75m_candles(df_15m):
                 rows.append({'Datetime': chunk.index[0], 'Open': chunk['Open'].iloc[0],
                              'High': chunk['High'].max(), 'Low': chunk['Low'].min(),
                              'Close': chunk['Close'].iloc[-1],
-                             'End': chunk.index[-1],            # last 15m candle inside this 75m bar
-                             'Complete': len(chunk) == 5})      # False for a still-forming bar
+                             'End': chunk.index[-1],            
+                             'Complete': len(chunk) == 5})      
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).set_index('Datetime')
 
 
 def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
-    """
-    Nearest unmitigated 75m fractal swing that was fully confirmed BEFORE the 75m bar
-    containing the sweep (the sweep's own bar is still forming, so it is never used).
-    Bullish MSS -> swing high not yet closed above. Bearish MSS -> swing low not yet closed below.
-    """
     closest_75m_time = df_75m.index.asof(sweep_idx)
     if pd.isna(closest_75m_time):
         return None, None
     loc = df_75m.index.get_loc(closest_75m_time)
 
-    for i in range(loc - 2, 0, -1):  # i+1 <= loc-1 => confirming bar is complete
+    for i in range(loc - 2, 0, -1):  
         if direction == 'high':
             h = df_75m['High'].iloc[i]
             if h > df_75m['High'].iloc[i - 1] and h > df_75m['High'].iloc[i + 1]:
@@ -121,17 +109,15 @@ def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
     return None, None
 
 
-# ---------------------------------------------------------------------------
-# RULE 2 + RULE 4: ONE completed 75m candle closing beyond the MSS line, within 2 days of sweep
-# Activation time = the last 15m candle of that 75m bar (the bar's close). Entry tracking
-# starts on the next candle, so the signal is never used before it exists.
-# ---------------------------------------------------------------------------
-def find_activation(df_75m, sweep_idx, mss_price, direction, activation_window=WINDOW_2DAYS):
+def find_activation(df_75m, sweep_idx, mss_price, direction, activation_window=WINDOW_OTHERS):
     if activation_window == WINDOW_SAME_DAY:
-        deadline = sweep_idx.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)  # end of sweep day
+        deadline = sweep_idx.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        bars = df_75m[df_75m['Complete'] & (df_75m['End'] >= sweep_idx) & (df_75m['End'] <= deadline)]
     else:
-        deadline = sweep_idx + MAX_SWEEP_TO_ACTIVATION
-    bars = df_75m[df_75m['Complete'] & (df_75m['End'] >= sweep_idx) & (df_75m['End'] <= deadline)]
+        # Others: Sweep to MSS activation from 2nd trading day onwards (start_date > sweep day end)
+        sweep_day_end = sweep_idx.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        bars = df_75m[df_75m['Complete'] & (df_75m['End'] > sweep_day_end)]
+        
     if bars.empty:
         return None
     beyond = (bars['Close'] > mss_price) if direction == 'Bullish' else (bars['Close'] < mss_price)
@@ -139,15 +125,11 @@ def find_activation(df_75m, sweep_idx, mss_price, direction, activation_window=W
     return hits['End'].iloc[0] if not hits.empty else None
 
 
-# ---------------------------------------------------------------------------
-# RULE 6: target = most recent UNTESTED 15m swing high (Bullish) / swing low (Bearish)
-#         beyond the entry, using only candles up to the activation candle (no lookahead)
-# ---------------------------------------------------------------------------
 def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction):
     hist = df_15m.loc[:activation_idx].iloc[-SWING_LOOKBACK_BARS:]
     highs, lows = hist['High'].to_numpy(), hist['Low'].to_numpy()
     n, last = SWING_N, len(hist) - 1
-    for i in range(last - n, n - 1, -1):  # newest confirmed swing first
+    for i in range(last - n, n - 1, -1):  
         if direction == 'Bullish':
             h = highs[i]
             if h <= entry_price:
@@ -163,9 +145,6 @@ def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction
     return None
 
 
-# ---------------------------------------------------------------------------
-# RULE 5: Supply & Demand zone
-# ---------------------------------------------------------------------------
 def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone_method,
                  zone_position=ZONE_NEAREST):
     try:
@@ -177,11 +156,6 @@ def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone
         leg_df['Range'] = leg_df['High'] - leg_df['Low']
         leg_df['Is_Base'] = (leg_df['Body'] / leg_df['Range'].replace(0, 0.001)) <= BASE_BODY_RATIO
 
-        # Zone position vs the MSS line.
-        #   ZONE_NEAREST: any base candle may qualify (zone can sit above or below the line).
-        #   ZONE_STRICT : the whole zone must lie below the line for a demand zone (Bullish),
-        #                 or above it for a supply zone (Bearish) - candles that cross or sit on the
-        #                 wrong side of the line are not eligible.
         leg_df['Eligible'] = True
         if zone_position == ZONE_STRICT:
             leg_df['Eligible'] = (leg_df['High'] < mss_price) if direction == 'Bullish' else (leg_df['Low'] > mss_price)
@@ -212,7 +186,6 @@ def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone
             if valid_legout.empty:
                 return None, None
 
-        # Proximal = edge closest to price (entry), Distal = outer edge (stop)
         if direction == 'Bullish':
             return zone_candles['High'].max(), zone_candles['Low'].min()
         return zone_candles['Low'].min(), zone_candles['High'].max()
@@ -220,9 +193,6 @@ def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone
         return None, None
 
 
-# ---------------------------------------------------------------------------
-# RULE 7: execution engine
-# ---------------------------------------------------------------------------
 def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, initial_target, qty,
                                 direction, max_wait_hours, trading_window, cap_rr):
     post_activation_df = df_15m.loc[activation_idx:]
@@ -236,13 +206,11 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     dynamic_target = initial_target
 
     for idx, row in tracking_df_entry.iterrows():
-        # Price blew through the stop before the order ever filled
         if direction == 'Bullish' and row['Low'] <= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
         if direction == 'Bearish' and row['High'] >= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
 
-        # Entry window: candle must START inside [09:45, 13:30)
         in_window = True
         if trading_window == "09:45 - 13:30":
             in_window = WINDOW_START <= idx.time() < WINDOW_END
@@ -256,9 +224,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
             target_touched = row['Low'] <= dynamic_target
             opened_past_target = row['Open'] <= dynamic_target
 
-        # Target traded before the order filled -> the swing is no longer untested: cancel.
-        # If one candle both fills and touches the target, the order inside it is unknown, so we
-        # cancel only when it OPENED beyond the target (then the target provably came first).
         if target_touched and (not fills or opened_past_target):
             return {"Entry Date": "-", "Outcome": "Target Missed", "P&L (₹)": 0.0, "Exit Price": "-"}
 
@@ -269,7 +234,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     if entry_time is None:
         return {"Entry Date": "-", "Outcome": "No Entry", "P&L (₹)": 0.0, "Exit Price": "-"}
 
-    # Broker fill: gap through the limit fills at the open, otherwise at the limit
     if direction == 'Bullish':
         actual_entry = round(open_px if open_px < entry_price else entry_price, 2)
     else:
@@ -278,14 +242,18 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     risk_dist = round(abs(entry_price - active_sl), 2)
     if direction == 'Bullish':
         target_dist = round(dynamic_target - entry_price, 2)
-        if cap_rr == "Yes" and risk_dist > 0 and (target_dist / risk_dist) > RR_CAP:
-            target_dist = round(RR_CAP * risk_dist, 2)
-            dynamic_target = round(entry_price + target_dist, 2)
+        if cap_rr != "No" and risk_dist > 0:
+            max_r = 2.0 if cap_rr == "1:2" else 3.0
+            if (target_dist / risk_dist) > max_r:
+                target_dist = round(max_r * risk_dist, 2)
+                dynamic_target = round(entry_price + target_dist, 2)
     else:
         target_dist = round(entry_price - dynamic_target, 2)
-        if cap_rr == "Yes" and risk_dist > 0 and (target_dist / risk_dist) > RR_CAP:
-            target_dist = round(RR_CAP * risk_dist, 2)
-            dynamic_target = round(entry_price - target_dist, 2)
+        if cap_rr != "No" and risk_dist > 0:
+            max_r = 2.0 if cap_rr == "1:2" else 3.0
+            if (target_dist / risk_dist) > max_r:
+                target_dist = round(max_r * risk_dist, 2)
+                dynamic_target = round(entry_price - target_dist, 2)
 
     actual_rr = round(target_dist / risk_dist, 1) if risk_dist > 0 else 0
 
@@ -296,8 +264,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     exit_price = day_df['Close'].iloc[-1]
 
     for n, (idx, row) in enumerate(day_df.iterrows()):
-        # Entry candle (n == 0): the stop can be hit after the fill, but a target touch
-        # in the same candle is not credited (the order of its high/low is unknown).
         can_target = n > 0
         if direction == 'Bullish':
             if row['Low'] <= active_sl:
@@ -332,11 +298,8 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     }
 
 
-# ---------------------------------------------------------------------------
-# Setup builder (Rules 2-6 for one direction; activation = one 75m close beyond MSS)
-# ---------------------------------------------------------------------------
 def build_setup(ticker, direction, sweep_idx, df_15m, df_75m, zone_method, risk_amt, cap_rr,
-                zone_position=ZONE_NEAREST, activation_window=WINDOW_2DAYS):
+                zone_position=ZONE_NEAREST, activation_window=WINDOW_OTHERS):
     bullish = direction == 'Bullish'
 
     mss_idx, mss_val = get_nearest_untested_75m_swing(df_75m, sweep_idx, 'high' if bullish else 'low')
@@ -357,15 +320,17 @@ def build_setup(ticker, direction, sweep_idx, df_15m, df_75m, zone_method, risk_
 
     target_val = get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction)
     if target_val is None:
-        return None  # no untested swing beyond the entry -> no trade
+        return None  
     active_target = round(target_val, 2)
 
     risk_dist = round(abs(entry_price - active_sl), 2)
     target_dist = round(active_target - entry_price, 2) if bullish else round(entry_price - active_target, 2)
 
-    if cap_rr == "Yes" and risk_dist > 0 and (target_dist / risk_dist) > RR_CAP:
-        target_dist = round(RR_CAP * risk_dist, 2)
-        active_target = round(entry_price + target_dist, 2) if bullish else round(entry_price - target_dist, 2)
+    if cap_rr != "No" and risk_dist > 0:
+        max_r = 2.0 if cap_rr == "1:2" else 3.0
+        if (target_dist / risk_dist) > max_r:
+            target_dist = round(max_r * risk_dist, 2)
+            active_target = round(entry_price + target_dist, 2) if bullish else round(entry_price - target_dist, 2)
 
     if risk_dist <= 0 or target_dist < MIN_RR * risk_dist:
         return None
@@ -382,7 +347,7 @@ def build_setup(ticker, direction, sweep_idx, df_15m, df_75m, zone_method, risk_
 
 def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method, app_mode,
                     max_wait_hours, trading_window, cap_rr, zone_position=ZONE_NEAREST,
-                    activation_window=WINDOW_2DAYS):
+                    activation_window=WINDOW_OTHERS):
     raw_setups = []
 
     internal_start = start_date_val - timedelta(days=10) if app_mode == "Today's Live Trades" else start_date_val - timedelta(days=15)
@@ -396,7 +361,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
     if df_75m.empty:
         return []
 
-    # Rule 1: weekly candles (Monday-anchored)
     weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High': 'max', 'Low': 'min'}).dropna()
     day_groups = {d: g for d, g in df_15m.groupby(df_15m.index.normalize())}
     scan_days = [d for d in day_groups
@@ -423,7 +387,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                 raw_setups.append(setup)
                 break
 
-    # Same activation reached from several sweeps -> keep the latest sweep
     deduped_setups = {}
     for s in raw_setups:
         key = (s['Stock'], s['Type'], s['Activation Time'])
@@ -462,8 +425,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                 except ValueError:
                     pass
 
-    # Rule 7: one trade per stock per calendar day.
-    # Executed trades win over pending ones, and the EARLIEST entry is the one kept.
     def _order(s):
         executed = s.get("Entry Date", "-") != "-"
         return (0 if executed else 1, s["Entry Date"] if executed else s["Activation Time"])
@@ -505,7 +466,7 @@ if app_mode == "Backtester":
     with r2c3:
         max_wait_label = st.selectbox("Max Wait to Entry", list(wait_options_dict.keys()), index=19)
         max_wait_hours = wait_options_dict[max_wait_label]
-    with r2c4: cap_rr = st.selectbox("Cap RR at 1:3?", ["No", "Yes"])
+    with r2c4: cap_rr = st.selectbox("Cap RR?", ["No", "1:2", "Yes"])
 else:
     r1c1, r1c2, r1c3 = st.columns(3)
     today = datetime.now(ist).date()
@@ -519,7 +480,7 @@ else:
     with r2c2:
         max_wait_label = st.selectbox("Max Wait to Entry", list(wait_options_dict.keys()), index=19)
         max_wait_hours = wait_options_dict[max_wait_label]
-    with r2c3: cap_rr = st.selectbox("Cap RR at 1:3?", ["No", "Yes"])
+    with r2c3: cap_rr = st.selectbox("Cap RR?", ["No", "1:2", "Yes"])
 
 zone_position = st.selectbox(
     "15m Zone Condition vs MSS Line",
@@ -530,8 +491,8 @@ zone_position = st.selectbox(
 
 activation_window = st.selectbox(
     "Sweep to MSS Activation Window",
-    [WINDOW_2DAYS, WINDOW_SAME_DAY],
-    help="Within 2 days: the 75m close beyond the MSS line may come up to 2 calendar days after the sweep. "
+    [WINDOW_OTHERS, WINDOW_SAME_DAY],
+    help="Others: the 75m close beyond the MSS line happens from the 2nd trading day onwards after the sweep. "
          "Same day only: the sweep and the 75m MSS close must both happen on the same trading day.")
 
 if st.button("🚀 Execute Scan", type="primary"):
@@ -593,7 +554,7 @@ if st.button("🚀 Execute Scan", type="primary"):
                 m4.metric("Win Rate", f"{win_rate:.1f}%")
                 m5.metric("Net Profit / Loss", f"₹ {total_pnl:,.2f}")
 
-                st.dataframe(df_sub, width="stretch", hide_index=True)
+                st.dataframe(df_sub, use_container_width=True, hide_index=True)
 
             with tab1: render_tab(df_bull)
             with tab2: render_tab(df_bear)
