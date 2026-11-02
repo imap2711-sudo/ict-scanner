@@ -148,7 +148,7 @@ def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction
             h = highs[i]
             if h <= entry_price:
                 continue
-            # Rule 6: Target considered if and only if it offers RR >= 1:1
+            # Target considered if and only if it offers RR >= 1:1
             if (h - entry_price) < (MIN_RR * risk_dist):
                 continue
             if h > highs[i - n:i].max() and h > highs[i + 1:i + n + 1].max() and highs[i + 1:].max() < h:
@@ -157,7 +157,7 @@ def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction
             lo = lows[i]
             if lo >= entry_price:
                 continue
-            # Rule 6: Target considered if and only if it offers RR >= 1:1
+            # Target considered if and only if it offers RR >= 1:1
             if (entry_price - lo) < (MIN_RR * risk_dist):
                 continue
             if lo < lows[i - n:i].min() and lo < lows[i + 1:i + n + 1].min() and lows[i + 1:].min() > lo:
@@ -220,23 +220,23 @@ def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone
 # RULE 6 & 7: Execution Engine with Dynamic New Swing High/Low Target Update
 # ---------------------------------------------------------------------------
 def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, initial_target, qty,
-                                direction, max_wait_hours, trading_window, cap_rr):
+                                direction, trading_window, cap_rr):
     post_activation_df = df_15m.loc[activation_idx:]
     if len(post_activation_df) <= 1:
         return None
     tracking_df = post_activation_df.iloc[1:]
+    
+    # Constrain entry search strictly to the day of activation
+    activation_date = activation_idx.date()
+    tracking_df_entry = tracking_df[tracking_df.index.date == activation_date]
 
     entry_time, open_px = None, None
-    max_wait_candles = int(max_wait_hours * 4)
-    tracking_df_entry = tracking_df.iloc[:max_wait_candles]
-    
     current_target = initial_target
     target_hit_before_entry = False
     new_swing_target_formed = None
     risk_dist = round(abs(entry_price - active_sl), 2)
 
     for i, (idx, row) in enumerate(tracking_df_entry.iterrows()):
-        # SL hit prior to entry fills
         if direction == 'Bullish' and row['Low'] <= active_sl:
             return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
         if direction == 'Bearish' and row['High'] >= active_sl:
@@ -249,7 +249,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
         fills = in_window and ((direction == 'Bullish' and row['Low'] <= entry_price) or
                                (direction == 'Bearish' and row['High'] >= entry_price))
 
-        # Check if original target is tagged before entry
         if direction == 'Bullish':
             if row['High'] >= current_target:
                 target_hit_before_entry = True
@@ -257,7 +256,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
             if row['Low'] <= current_target:
                 target_hit_before_entry = True
 
-        # Rule 6: Track if a NEW 15m swing forms before entry
         history_window = df_15m.loc[:idx]
         if len(history_window) >= (2 * SWING_N + 1):
             check_idx = len(history_window) - 1 - SWING_N
@@ -277,7 +275,6 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
                         new_swing_target_formed = float(l_candidate)
 
         if fills:
-            # If target was hit before entry, evaluate if new swing formed
             if target_hit_before_entry:
                 if new_swing_target_formed is not None:
                     current_target = new_swing_target_formed
@@ -292,13 +289,11 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
     if entry_time is None:
         return {"Entry Date": "-", "Outcome": "No Entry", "P&L (₹)": 0.0, "Exit Price": "-"}
 
-    # Fill execution price
     if direction == 'Bullish':
         actual_entry = round(open_px if open_px < entry_price else entry_price, 2)
     else:
         actual_entry = round(open_px if open_px > entry_price else entry_price, 2)
 
-    # Dynamic RR capping (No, 1:1.5, 1:2, 1:3)
     cap_map = {"1:1.5": 1.5, "1:2": 2.0, "1:3": 3.0}
     if direction == 'Bullish':
         target_dist = round(current_target - entry_price, 2)
@@ -365,19 +360,16 @@ def build_setup(ticker, direction, sweep_bar_dt, df_15m, df_75m, zone_method, ri
                 zone_position=ZONE_NEAREST):
     bullish = direction == 'Bullish'
 
-    # Rule 3: 75m MSS Swing
     mss_idx, mss_val = get_nearest_untested_75m_swing(df_75m, sweep_bar_dt, 'high' if bullish else 'low')
     if mss_idx is None:
         return None
 
-    # Rule 4: Exactly one completed 75m candle closing beyond MSS line (No window limit)
     activation_idx = find_activation(df_75m, sweep_bar_dt, mss_val, direction)
     if activation_idx is None:
         return None
 
     sweep_time = df_75m.loc[sweep_bar_dt, 'Datetime'] if 'Datetime' in df_75m.columns else sweep_bar_dt
 
-    # Rule 5: Zone Extraction
     proximal, distal = find_sd_zone(df_15m, sweep_time, activation_idx, mss_val, direction, zone_method, zone_position)
     if not proximal or not distal:
         return None
@@ -385,7 +377,6 @@ def build_setup(ticker, direction, sweep_bar_dt, df_15m, df_75m, zone_method, ri
     entry_price = round(proximal, 2)
     active_sl = round(distal * (SL_PAD_BULL if bullish else SL_PAD_BEAR), 2)
 
-    # Rule 6: Untested 15m swing target
     target_val = get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction, active_sl)
     if target_val is None:
         return None
@@ -394,7 +385,6 @@ def build_setup(ticker, direction, sweep_bar_dt, df_15m, df_75m, zone_method, ri
     risk_dist = round(abs(entry_price - active_sl), 2)
     target_dist = round(active_target - entry_price, 2) if bullish else round(entry_price - active_target, 2)
 
-    # Pre-cap check
     cap_map = {"1:1.5": 1.5, "1:2": 2.0, "1:3": 3.0}
     if cap_rr in cap_map and risk_dist > 0:
         max_r = cap_map[cap_rr]
@@ -424,7 +414,7 @@ def build_setup(ticker, direction, sweep_bar_dt, df_15m, df_75m, zone_method, ri
 
 
 def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method, app_mode,
-                    max_wait_hours, trading_window, cap_rr, zone_position=ZONE_NEAREST):
+                    trading_window, cap_rr, zone_position=ZONE_NEAREST):
     raw_setups = []
     internal_start = start_date_val - timedelta(days=10) if app_mode == "Today's Live Trades" else start_date_val - timedelta(days=20)
 
@@ -442,7 +432,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
     scan_bars = completed_75m[(completed_75m.index >= pd.Timestamp(internal_start)) & 
                               (completed_75m.index <= pd.Timestamp(end_date_val) + pd.Timedelta(days=1))]
 
-    # Rule 2: 75-Minute Liquidity Sweep
     for sweep_bar_dt, sweep_row in scan_bars.iterrows():
         current_monday = (sweep_bar_dt.normalize() - pd.Timedelta(days=sweep_bar_dt.weekday())).replace(hour=0, minute=0, second=0)
         past_weekly = weekly_hist.loc[weekly_hist.index < current_monday]
@@ -460,7 +449,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
         if setup is not None:
             raw_setups.append(setup)
 
-    # Deduplicate: Keep latest sweep if multiple lead to the same activation
     deduped_setups = {}
     for s in raw_setups:
         key = (s['Stock'], s['Type'], s['Activation Time'])
@@ -472,7 +460,7 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 
     for s in deduped_setups.values():
         exec_data = simulate_intraday_execution(df_15m, s['Activation Time'], s['Entry'], s['SL'], s['Target'],
-                                                s['Qty'], s['Type'], max_wait_hours, trading_window, cap_rr)
+                                                s['Qty'], s['Type'], trading_window, cap_rr)
         if not exec_data:
             continue
 
@@ -499,7 +487,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
                 except ValueError:
                     pass
 
-    # Rule 7: One trade per stock per calendar day
     def _order(s):
         executed = s.get("Entry Date", "-") != "-"
         return (0 if executed else 1, s["Entry Date"] if executed else s["Activation Time"])
@@ -518,13 +505,6 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 # --- UI EXECUTION ---
 st.write("Executing 7-Rule ICT Framework with 75m Sweeps and Dynamic Target Tracking.")
 
-wait_options_dict = {
-    "30 min": 0.5, "1 hr": 1.0, "1:30 hrs": 1.5, "2 hrs": 2.0, "2:30 hrs": 2.5,
-    "3 hrs": 3.0, "3:30 hrs": 3.5, "4 hrs": 4.0, "4:30 hrs": 4.5, "5 hrs": 5.0,
-    "5:30 hrs": 5.5, "6 hrs": 6.0, "6:30 hrs": 6.5, "7 hrs": 7.0, "7:30 hrs": 7.5,
-    "8 hrs": 8.0, "8:30 hrs": 8.5, "9 hrs": 9.0, "9:30 hrs": 9.5, "10 hrs": 10.0
-}
-
 app_mode = st.radio("Operating Mode", ["Today's Live Trades", "Backtester"], horizontal=True)
 
 if app_mode == "Backtester":
@@ -535,13 +515,10 @@ if app_mode == "Backtester":
     with r1c3: universe_selection = st.selectbox("Stock Universe", ["Nifty 200", "Nifty 500"])
     with r1c4: zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
 
-    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    r2c1, r2c2, r2c3 = st.columns(3)
     with r2c1: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
     with r2c2: trading_window = st.selectbox("Entry Window", ["Full Day (09:15 - 15:30)", "09:45 - 13:30"])
-    with r2c3:
-        max_wait_label = st.selectbox("Max Wait to Entry", list(wait_options_dict.keys()), index=19)
-        max_wait_hours = wait_options_dict[max_wait_label]
-    with r2c4: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
+    with r2c3: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
 else:
     r1c1, r1c2, r1c3 = st.columns(3)
     today = datetime.now(ist).date()
@@ -550,12 +527,9 @@ else:
     with r1c2: zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
     with r1c3: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
 
-    r2c1, r2c2, r2c3 = st.columns(3)
+    r2c1, r2c2 = st.columns(2)
     with r2c1: trading_window = st.selectbox("Entry Window", ["Full Day (09:15 - 15:30)", "09:45 - 13:30"])
-    with r2c2:
-        max_wait_label = st.selectbox("Max Wait to Entry", list(wait_options_dict.keys()), index=19)
-        max_wait_hours = wait_options_dict[max_wait_label]
-    with r2c3: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
+    with r2c2: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
 
 zone_position = st.selectbox(
     "15m Zone Condition vs MSS Line",
@@ -570,7 +544,7 @@ if st.button("🚀 Execute Scan", type="primary"):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method,
-                                       app_mode, max_wait_hours, trading_window, cap_rr, zone_position): t for t in tickers}
+                                       app_mode, trading_window, cap_rr, zone_position): t for t in tickers}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 try:
