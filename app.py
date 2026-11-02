@@ -432,6 +432,10 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
     scan_bars = completed_75m[(completed_75m.index >= pd.Timestamp(internal_start)) & 
                               (completed_75m.index <= pd.Timestamp(end_date_val) + pd.Timedelta(days=1))]
 
+    # Track exhaustion of weekly liquidity pools
+    exhausted_pwl_monday = None
+    exhausted_pwh_monday = None
+
     for sweep_bar_dt, sweep_row in scan_bars.iterrows():
         current_monday = (sweep_bar_dt.normalize() - pd.Timedelta(days=sweep_bar_dt.weekday())).replace(hour=0, minute=0, second=0)
         past_weekly = weekly_hist.loc[weekly_hist.index < current_monday]
@@ -441,9 +445,15 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
         pwl, pwh = past_weekly['Low'].iloc[-1], past_weekly['High'].iloc[-1]
 
         setup = None
-        if sweep_row['Low'] <= pwl:
+        
+        # Bullish Sweep (PWL exhaustion check)
+        if sweep_row['Low'] <= pwl and current_monday != exhausted_pwl_monday:
+            exhausted_pwl_monday = current_monday  # Mark PWL as exhausted for this week
             setup = build_setup(ticker, 'Bullish', sweep_bar_dt, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
-        if setup is None and sweep_row['High'] >= pwh:
+        
+        # Bearish Sweep (PWH exhaustion check)
+        if setup is None and sweep_row['High'] >= pwh and current_monday != exhausted_pwh_monday:
+            exhausted_pwh_monday = current_monday  # Mark PWH as exhausted for this week
             setup = build_setup(ticker, 'Bearish', sweep_bar_dt, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
 
         if setup is not None:
@@ -594,7 +604,7 @@ if st.button("🚀 Execute Scan", type="primary"):
                 m4.metric("Win Rate", f"{win_rate:.1f}%")
                 m5.metric("Net Profit / Loss", f"₹ {total_pnl:,.2f}")
 
-                st.dataframe(df_sub, width="stretch", hide_index=True)
+                st.dataframe(df_sub, use_container_width=True, hide_index=True)
 
             with tab1: render_tab(df_bull)
             with tab2: render_tab(df_bear)
