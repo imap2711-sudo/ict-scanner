@@ -35,6 +35,10 @@ WINDOW_START, WINDOW_END = time(9, 45), time(13, 30)
 MIN_RR = 1.0                                     # skip any setup below 1:1
 SWING_N = 2                                      # 15m swing = extreme vs 2 candles each side
 SWING_LOOKBACK_BARS = 125                        # ~5 sessions of 15m candles
+ZONE_NEAREST = "Nearest to MSS line (above or below)"
+ZONE_STRICT = "Strictly below MSS line (demand) / above (supply)"
+WINDOW_2DAYS = "Within 2 days of sweep"
+WINDOW_SAME_DAY = "Same day only (sweep and MSS activation on one day)"
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -84,7 +88,9 @@ def build_75m_candles(df_15m):
             if len(chunk) > 0:
                 rows.append({'Datetime': chunk.index[0], 'Open': chunk['Open'].iloc[0],
                              'High': chunk['High'].max(), 'Low': chunk['Low'].min(),
-                             'Close': chunk['Close'].iloc[-1]})
+                             'Close': chunk['Close'].iloc[-1],
+                             'End': chunk.index[-1],            # last 15m candle inside this 75m bar
+                             'Complete': len(chunk) == 5})      # False for a still-forming bar
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).set_index('Datetime')
@@ -116,17 +122,21 @@ def get_nearest_untested_75m_swing(df_75m, sweep_idx, direction='high'):
 
 
 # ---------------------------------------------------------------------------
-# RULE 2 + RULE 4: 3 consecutive 15m closes beyond MSS, within 2 days of sweep
+# RULE 2 + RULE 4: ONE completed 75m candle closing beyond the MSS line, within 2 days of sweep
+# Activation time = the last 15m candle of that 75m bar (the bar's close). Entry tracking
+# starts on the next candle, so the signal is never used before it exists.
 # ---------------------------------------------------------------------------
-def find_activation(df_15m, sweep_idx, mss_price, direction):
-    window = df_15m.loc[sweep_idx: sweep_idx + MAX_SWEEP_TO_ACTIVATION].iloc[1:]  # candles AFTER the sweep
-    if len(window) < 3:
+def find_activation(df_75m, sweep_idx, mss_price, direction, activation_window=WINDOW_2DAYS):
+    if activation_window == WINDOW_SAME_DAY:
+        deadline = sweep_idx.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)  # end of sweep day
+    else:
+        deadline = sweep_idx + MAX_SWEEP_TO_ACTIVATION
+    bars = df_75m[df_75m['Complete'] & (df_75m['End'] >= sweep_idx) & (df_75m['End'] <= deadline)]
+    if bars.empty:
         return None
-    closes = window['Close']
-    beyond = (closes > mss_price) if direction == 'Bullish' else (closes < mss_price)
-    streak = beyond.astype(int).rolling(window=3).sum()
-    hits = streak[streak == 3]
-    return hits.index[0] if not hits.empty else None
+    beyond = (bars['Close'] > mss_price) if direction == 'Bullish' else (bars['Close'] < mss_price)
+    hits = bars[beyond]
+    return hits['End'].iloc[0] if not hits.empty else None
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +166,8 @@ def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction
 # ---------------------------------------------------------------------------
 # RULE 5: Supply & Demand zone
 # ---------------------------------------------------------------------------
-def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone_method):
+def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone_method,
+                 zone_position=ZONE_NEAREST):
     try:
         leg_df = df_15m.loc[sweep_time:activation_time].copy()
         if len(leg_df) < 3:
@@ -166,7 +177,16 @@ def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone
         leg_df['Range'] = leg_df['High'] - leg_df['Low']
         leg_df['Is_Base'] = (leg_df['Body'] / leg_df['Range'].replace(0, 0.001)) <= BASE_BODY_RATIO
 
-        base_candles = leg_df[leg_df['Is_Base']].copy()
+        # Zone position vs the MSS line.
+        #   ZONE_NEAREST: any base candle may qualify (zone can sit above or below the line).
+        #   ZONE_STRICT : the whole zone must lie below the line for a demand zone (Bullish),
+        #                 or above it for a supply zone (Bearish) - candles that cross or sit on the
+        #                 wrong side of the line are not eligible.
+        leg_df['Eligible'] = True
+        if zone_position == ZONE_STRICT:
+            leg_df['Eligible'] = (leg_df['High'] < mss_price) if direction == 'Bullish' else (leg_df['Low'] > mss_price)
+
+        base_candles = leg_df[leg_df['Is_Base'] & leg_df['Eligible']].copy()
         if base_candles.empty:
             return None, None
 
@@ -175,7 +195,7 @@ def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone
 
         leg_df['Block'] = (~leg_df['Is_Base']).cumsum()
         target_block = leg_df.loc[closest_base_idx, 'Block']
-        zone_candles = leg_df[(leg_df['Is_Base']) & (leg_df['Block'] == target_block)]
+        zone_candles = leg_df[(leg_df['Is_Base']) & (leg_df['Eligible']) & (leg_df['Block'] == target_block)]
         if zone_candles.empty:
             return None, None
 
@@ -313,20 +333,22 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
 
 
 # ---------------------------------------------------------------------------
-# Setup builder (Rules 2-6 for one direction)
+# Setup builder (Rules 2-6 for one direction; activation = one 75m close beyond MSS)
 # ---------------------------------------------------------------------------
-def build_setup(ticker, direction, sweep_idx, df_15m, df_75m, zone_method, risk_amt, cap_rr):
+def build_setup(ticker, direction, sweep_idx, df_15m, df_75m, zone_method, risk_amt, cap_rr,
+                zone_position=ZONE_NEAREST, activation_window=WINDOW_2DAYS):
     bullish = direction == 'Bullish'
 
     mss_idx, mss_val = get_nearest_untested_75m_swing(df_75m, sweep_idx, 'high' if bullish else 'low')
     if mss_idx is None:
         return None
 
-    activation_idx = find_activation(df_15m, sweep_idx, mss_val, direction)
+    activation_idx = find_activation(df_75m, sweep_idx, mss_val, direction, activation_window)
     if activation_idx is None:
         return None
 
-    proximal, distal = find_sd_zone(df_15m, sweep_idx, activation_idx, mss_val, direction, zone_method)
+    proximal, distal = find_sd_zone(df_15m, sweep_idx, activation_idx, mss_val, direction, zone_method,
+                                    zone_position)
     if not proximal or not distal:
         return None
 
@@ -359,7 +381,8 @@ def build_setup(ticker, direction, sweep_idx, df_15m, df_75m, zone_method, risk_
 
 
 def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method, app_mode,
-                    max_wait_hours, trading_window, cap_rr):
+                    max_wait_hours, trading_window, cap_rr, zone_position=ZONE_NEAREST,
+                    activation_window=WINDOW_2DAYS):
     raw_setups = []
 
     internal_start = start_date_val - timedelta(days=10) if app_mode == "Today's Live Trades" else start_date_val - timedelta(days=15)
@@ -391,9 +414,11 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
         for sweep_idx, sweep_row in day_15m.iterrows():
             setup = None
             if sweep_row['Low'] <= pwl:
-                setup = build_setup(ticker, 'Bullish', sweep_idx, df_15m, df_75m, zone_method, risk_amt, cap_rr)
+                setup = build_setup(ticker, 'Bullish', sweep_idx, df_15m, df_75m, zone_method, risk_amt, cap_rr,
+                                    zone_position, activation_window)
             if setup is None and sweep_row['High'] >= pwh:
-                setup = build_setup(ticker, 'Bearish', sweep_idx, df_15m, df_75m, zone_method, risk_amt, cap_rr)
+                setup = build_setup(ticker, 'Bearish', sweep_idx, df_15m, df_75m, zone_method, risk_amt, cap_rr,
+                                    zone_position, activation_window)
             if setup is not None:
                 raw_setups.append(setup)
                 break
@@ -496,6 +521,19 @@ else:
         max_wait_hours = wait_options_dict[max_wait_label]
     with r2c3: cap_rr = st.selectbox("Cap RR at 1:3?", ["No", "Yes"])
 
+zone_position = st.selectbox(
+    "15m Zone Condition vs MSS Line",
+    [ZONE_NEAREST, ZONE_STRICT],
+    help="Nearest: the base candle(s) closest to the MSS line, above or below it. "
+         "Strictly below: for bullish setups the whole demand zone must be below the MSS line "
+         "(for bearish setups the supply zone must be above it).")
+
+activation_window = st.selectbox(
+    "Sweep to MSS Activation Window",
+    [WINDOW_2DAYS, WINDOW_SAME_DAY],
+    help="Within 2 days: the 75m close beyond the MSS line may come up to 2 calendar days after the sweep. "
+         "Same day only: the sweep and the 75m MSS close must both happen on the same trading day.")
+
 if st.button("🚀 Execute Scan", type="primary"):
     with st.spinner(f"Scanning {universe_selection} across {app_mode}..."):
         tickers = get_stock_symbols(universe_selection)
@@ -504,7 +542,8 @@ if st.button("🚀 Execute Scan", type="primary"):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method,
-                                       app_mode, max_wait_hours, trading_window, cap_rr): t for t in tickers}
+                                       app_mode, max_wait_hours, trading_window, cap_rr,
+                                       zone_position, activation_window): t for t in tickers}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 try:
@@ -541,15 +580,18 @@ if st.button("🚀 Execute Scan", type="primary"):
                     return
 
                 completed_trades = df_sub[df_sub['Outcome'].isin(["Target Hit", "SL Hit", "Time Square Off", "Running (Live)"])]
-                wins = len(completed_trades[completed_trades['P&L (₹)'] > 0])
+                wins = int((completed_trades['P&L (₹)'] > 0).sum())
+                losses = int((completed_trades['P&L (₹)'] < 0).sum())
                 total = len(completed_trades)
                 win_rate = (wins / total) * 100 if total > 0 else 0
                 total_pnl = completed_trades['P&L (₹)'].sum()
 
-                m1, m2, m3 = st.columns(3)
+                m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Active / Completed Trades", total)
-                m2.metric("Win Rate", f"{win_rate:.1f}%")
-                m3.metric("Net Profit / Loss", f"₹ {total_pnl:,.2f}")
+                m2.metric("Winners", wins)
+                m3.metric("Losers", losses)
+                m4.metric("Win Rate", f"{win_rate:.1f}%")
+                m5.metric("Net Profit / Loss", f"₹ {total_pnl:,.2f}")
 
                 st.dataframe(df_sub, width="stretch", hide_index=True)
 
