@@ -32,6 +32,9 @@ BASE_BODY_RATIO = 0.5                            # Rule 5 base candle test
 SL_PAD_BULL, SL_PAD_BEAR = 0.999, 1.001          # Rule 5 distal padding
 RR_CAP = 3                                       # Rule 7 RR cap
 WINDOW_START, WINDOW_END = time(9, 45), time(13, 30)
+MIN_RR = 1.0                                     # skip any setup below 1:1
+SWING_N = 2                                      # 15m swing = extreme vs 2 candles each side
+SWING_LOOKBACK_BARS = 125                        # ~5 sessions of 15m candles
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -127,14 +130,27 @@ def find_activation(df_15m, sweep_idx, mss_price, direction):
 
 
 # ---------------------------------------------------------------------------
-# RULE 6: target = extreme of the displacement leg (sweep -> activation)
+# RULE 6: target = most recent UNTESTED 15m swing high (Bullish) / swing low (Bearish)
+#         beyond the entry, using only candles up to the activation candle (no lookahead)
 # ---------------------------------------------------------------------------
-def get_nearest_15m_target_swing(df_15m, sweep_time, activation_time, direction='high'):
-    try:
-        leg_df = df_15m.loc[sweep_time:activation_time]
-        return leg_df['High'].max() if direction == 'high' else leg_df['Low'].min()
-    except Exception:
-        return None
+def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction):
+    hist = df_15m.loc[:activation_idx].iloc[-SWING_LOOKBACK_BARS:]
+    highs, lows = hist['High'].to_numpy(), hist['Low'].to_numpy()
+    n, last = SWING_N, len(hist) - 1
+    for i in range(last - n, n - 1, -1):  # newest confirmed swing first
+        if direction == 'Bullish':
+            h = highs[i]
+            if h <= entry_price:
+                continue
+            if h > highs[i - n:i].max() and h > highs[i + 1:i + n + 1].max() and highs[i + 1:].max() < h:
+                return float(h)
+        else:
+            lo = lows[i]
+            if lo >= entry_price:
+                continue
+            if lo < lows[i - n:i].min() and lo < lows[i + 1:i + n + 1].min() and lows[i + 1:].min() > lo:
+                return float(lo)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -211,23 +227,24 @@ def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, 
         if trading_window == "09:45 - 13:30":
             in_window = WINDOW_START <= idx.time() < WINDOW_END
 
-        if in_window:
-            if direction == 'Bullish' and row['Low'] <= entry_price:
-                entry_time, open_px = idx, row['Open']
-                break
-            elif direction == 'Bearish' and row['High'] >= entry_price:
-                entry_time, open_px = idx, row['Open']
-                break
-
-        # Rule 6: the target stretches only on candles that finished BEFORE the fill.
-        # The entry candle's own extreme is never used - we cannot know whether it
-        # printed before or after the fill (e.g. an opening spike before the dip).
+        fills = in_window and ((direction == 'Bullish' and row['Low'] <= entry_price) or
+                               (direction == 'Bearish' and row['High'] >= entry_price))
         if direction == 'Bullish':
-            if row['High'] > dynamic_target:
-                dynamic_target = row['High']
+            target_touched = row['High'] >= dynamic_target
+            opened_past_target = row['Open'] >= dynamic_target
         else:
-            if row['Low'] < dynamic_target:
-                dynamic_target = row['Low']
+            target_touched = row['Low'] <= dynamic_target
+            opened_past_target = row['Open'] <= dynamic_target
+
+        # Target traded before the order filled -> the swing is no longer untested: cancel.
+        # If one candle both fills and touches the target, the order inside it is unknown, so we
+        # cancel only when it OPENED beyond the target (then the target provably came first).
+        if target_touched and (not fills or opened_past_target):
+            return {"Entry Date": "-", "Outcome": "Target Missed", "P&L (₹)": 0.0, "Exit Price": "-"}
+
+        if fills:
+            entry_time, open_px = idx, row['Open']
+            break
 
     if entry_time is None:
         return {"Entry Date": "-", "Outcome": "No Entry", "P&L (₹)": 0.0, "Exit Price": "-"}
@@ -313,12 +330,12 @@ def build_setup(ticker, direction, sweep_idx, df_15m, df_75m, zone_method, risk_
     if not proximal or not distal:
         return None
 
-    target_val = get_nearest_15m_target_swing(df_15m, sweep_idx, activation_idx, 'high' if bullish else 'low')
-    if not target_val:
-        return None
-
     entry_price = round(proximal, 2)
     active_sl = round(distal * (SL_PAD_BULL if bullish else SL_PAD_BEAR), 2)
+
+    target_val = get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction)
+    if target_val is None:
+        return None  # no untested swing beyond the entry -> no trade
     active_target = round(target_val, 2)
 
     risk_dist = round(abs(entry_price - active_sl), 2)
@@ -328,7 +345,7 @@ def build_setup(ticker, direction, sweep_idx, df_15m, df_75m, zone_method, risk_
         target_dist = round(RR_CAP * risk_dist, 2)
         active_target = round(entry_price + target_dist, 2) if bullish else round(entry_price - target_dist, 2)
 
-    if risk_dist <= 0 or target_dist < risk_dist:
+    if risk_dist <= 0 or target_dist < MIN_RR * risk_dist:
         return None
 
     qty = int(risk_amt / risk_dist)
@@ -438,7 +455,7 @@ def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method,
 
 
 # --- UI EXECUTION ---
-st.write("Strictly executing the 7-Rule framework with Dynamic Target Tracking.")
+st.write("Strictly executing the 7-Rule framework with untested 15m swing targets (minimum RR 1:1).")
 
 wait_options_dict = {
     "30 min": 0.5, "1 hr": 1.0, "1:30 hrs": 1.5, "2 hrs": 2.0, "2:30 hrs": 2.5,
