@@ -5,14 +5,14 @@ import numpy as np
 import requests
 import io
 import concurrent.futures
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import warnings
 import logging
 
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-st.set_page_config(page_title="NSE Daily Demand Zone Scanner", layout="wide")
+st.set_page_config(page_title="NSE Daily & Intraday Zone Scanner", layout="wide")
 
 @st.cache_data(ttl=86400)
 def get_live_nifty500_symbols():
@@ -40,10 +40,15 @@ def get_all_nse_symbols():
     except Exception:
         return []
 
-def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=None, max_hold_days=None, apply_max_sl=True, apply_min_sl=False):
+def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=None, max_hold_days=None, apply_max_sl=True, apply_min_sl=False, is_intraday_mode=False):
     try:
         t = yf.Ticker(ticker)
-        df = t.history(period="10y", interval="1d", auto_adjust=False)
+        
+        # If intraday mode (<60 days), we can pull 15-minute interval data
+        interval = "15m" if is_intraday_mode else "1d"
+        period_str = "60d" if is_intraday_mode else "10y"
+        
+        df = t.history(period=period_str, interval=interval, auto_adjust=False)
         
         if df.empty or len(df) < 5: 
             return None
@@ -56,49 +61,55 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
         if pd.isna(cmp) or cmp <= 100: 
             return None
 
-        cutoff_date = df.index[-1] - pd.DateOffset(years=3)
+        # For Daily data calculation of zone structures, we still need daily context
+        # If in intraday mode, let's fetch daily data for zone detection, then map 15m for entry time
+        df_daily = t.history(period="10y", interval="1d", auto_adjust=False)
+        if df_daily.empty or len(df_daily) < 5: return None
+        df_daily.index = df_daily.index.tz_localize(None)
 
-        df['Range'] = df['High'] - df['Low']
-        df['Body'] = abs(df['Close'] - df['Open'])
-        df['Range'] = df['Range'].replace(0, np.nan)
-        df['Body_Ratio'] = df['Body'] / df['Range']
+        cutoff_date = df_daily.index[-1] - pd.DateOffset(years=3)
 
-        df['isLegIn'] = df['Body_Ratio'] > 0.65
-        df['isBase'] = df['Body_Ratio'] < 0.40
-        df['isBullish'] = df['Close'] > df['Open']
-        df['isLegOutCandle'] = df['isBullish'] & (df['Body_Ratio'] > 0.65)
+        df_daily['Range'] = df_daily['High'] - df_daily['Low']
+        df_daily['Body'] = abs(df_daily['Close'] - df_daily['Open'])
+        df_daily['Range'] = df_daily['Range'].replace(0, np.nan)
+        df_daily['Body_Ratio'] = df_daily['Body'] / df_daily['Range']
+
+        df_daily['isLegIn'] = df_daily['Body_Ratio'] > 0.65
+        df_daily['isBase'] = df_daily['Body_Ratio'] < 0.40
+        df_daily['isBullish'] = df_daily['Close'] > df_daily['Open']
+        df_daily['isLegOutCandle'] = df_daily['isBullish'] & (df_daily['Body_Ratio'] > 0.65)
 
         results = []
         
-        for i in range(3, len(df)):
-            if not df['isLegOutCandle'].iloc[i]: continue
+        for i in range(3, len(df_daily)):
+            if not df_daily['isLegOutCandle'].iloc[i]: continue
                 
-            is_1base = df['isBase'].iloc[i-1] and df['isLegIn'].iloc[i-2]
+            is_1base = df_daily['isBase'].iloc[i-1] and df_daily['isLegIn'].iloc[i-2]
             is_2base = False
             if i >= 4:
-                is_2base = df['isBase'].iloc[i-1] and df['isBase'].iloc[i-2] and df['isLegIn'].iloc[i-3]
+                is_2base = df_daily['isBase'].iloc[i-1] and df_daily['isBase'].iloc[i-2] and df_daily['isLegIn'].iloc[i-3]
             
             if not (is_1base or is_2base): continue
             
-            zone_formation_date = df.index[i-1]
+            zone_formation_date = df_daily.index[i-1]
             if zone_formation_date < cutoff_date: continue
                 
-            first_legout_range = df['Range'].iloc[i]
-            first_legout_close = df['Close'].iloc[i]
-            base_close = df['Close'].iloc[i-1] 
+            first_legout_range = df_daily['Range'].iloc[i]
+            first_legout_close = df_daily['Close'].iloc[i]
+            base_close = df_daily['Close'].iloc[i-1] 
             
             if is_1base:
-                legin_range = df['Range'].iloc[i-2]
-                base_high = df['High'].iloc[i-1]
-                proximal_line = max(df['Open'].iloc[i-1], df['Close'].iloc[i-1])
-                distal_line = df['Low'].iloc[i-1]
-                base_date = df.index[i-1].strftime('%Y-%m-%d')
+                legin_range = df_daily['Range'].iloc[i-2]
+                base_high = df_daily['High'].iloc[i-1]
+                proximal_line = max(df_daily['Open'].iloc[i-1], df_daily['Close'].iloc[i-1])
+                distal_line = df_daily['Low'].iloc[i-1]
+                base_date = df_daily.index[i-1].strftime('%Y-%m-%d')
             else:
-                legin_range = df['Range'].iloc[i-3]
-                base_high = max(df['High'].iloc[i-1], df['High'].iloc[i-2])
-                proximal_line = max(df['Open'].iloc[i-1], df['Close'].iloc[i-1], df['Open'].iloc[i-2], df['Close'].iloc[i-2])
-                distal_line = min(df['Low'].iloc[i-1], df['Low'].iloc[i-2])
-                base_date = f"{df.index[i-2].strftime('%Y-%m-%d')} to {df.index[i-1].strftime('%Y-%m-%d')}"
+                legin_range = df_daily['Range'].iloc[i-3]
+                base_high = max(df_daily['High'].iloc[i-1], df_daily['High'].iloc[i-2])
+                proximal_line = max(df_daily['Open'].iloc[i-1], df_daily['Close'].iloc[i-1], df_daily['Open'].iloc[i-2], df_daily['Close'].iloc[i-2])
+                distal_line = min(df_daily['Low'].iloc[i-1], df_daily['Low'].iloc[i-2])
+                base_date = f"{df_daily.index[i-2].strftime('%Y-%m-%d')} to {df_daily.index[i-1].strftime('%Y-%m-%d')}"
             
             if legin_range < 0.5 * first_legout_range: continue
             if first_legout_close < (base_high * 1.01): continue
@@ -107,11 +118,11 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
             total_legouts = 1
             pause_used = False
             
-            while current_idx + 1 < len(df):
-                if df['isLegOutCandle'].iloc[current_idx + 1]:
+            while current_idx + 1 < len(df_daily):
+                if df_daily['isLegOutCandle'].iloc[current_idx + 1]:
                     current_idx += 1
                     total_legouts += 1
-                elif not pause_used and df['isBase'].iloc[current_idx + 1] and current_idx + 2 < len(df) and df['isLegOutCandle'].iloc[current_idx + 2]:
+                elif not pause_used and df_daily['isBase'].iloc[current_idx + 1] and current_idx + 2 < len(df_daily) and df_daily['isLegOutCandle'].iloc[current_idx + 2]:
                     current_idx += 2
                     total_legouts += 1
                     pause_used = True
@@ -119,14 +130,12 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                     break
                 
             last_legout_idx = current_idx
-            
-            move_end_price = df['Close'].iloc[last_legout_idx]
+            move_end_price = df_daily['Close'].iloc[last_legout_idx]
             pct_move = ((move_end_price - base_close) / base_close) * 100
             
             if pct_move < 7.0: continue
             
             sl_pct = (proximal_line - distal_line) / proximal_line
-            
             if apply_max_sl and sl_pct > 0.02:
                 proximal_line = distal_line / 0.98
                 sl_pct = 0.02
@@ -141,73 +150,97 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
             if risk_amount and sl_points > 0:
                 qty = int(risk_amount / sl_points)
                 
-            is_invalidated = False
-            is_tested = False
-            entry_idx = None
-            outcome = "Pending"
-            exit_date = None
-            pnl_rs = 0.0
-            
-            for j in range(last_legout_idx + 1, len(df)):
-                day_low = df['Low'].iloc[j]
-                day_high = df['High'].iloc[j]
-                day_close = df['Close'].iloc[j]
+            # Intraday 15m scanning vs Daily scanning
+            if is_intraday_mode:
+                # Scan 15m candles within the selected date range
+                sub_df = df[(df.index.date >= start_date) & (df.index.date <= end_date)]
+                if sub_df.empty: continue
                 
-                if not is_tested:
-                    if day_close < distal_line:
-                        is_invalidated = True
-                        break 
-                    if day_low <= (proximal_line * 1.0025):
-                        is_tested = True
-                        entry_idx = j
-                        if mode == "Live Scan (Same Day)":
+                zone_tested = False
+                entry_timestamp = None
+                exit_timestamp = None
+                outcome = "Pending"
+                pnl_rs = 0.0
+                
+                for idx, row in sub_df.iterrows():
+                    if not zone_tested:
+                        if row['Low'] <= (proximal_line * 1.0025):
+                            zone_tested = True
+                            entry_timestamp = idx
+                            
+                            # Track trade outcome on subsequent 15m bars
+                            trade_bars = sub_df.loc[idx:]
+                            for b_idx, b_row in trade_bars.iterrows():
+                                if b_row['Low'] < distal_line:
+                                    outcome = "Loss"
+                                    pnl_rs = -(qty * sl_points) if risk_amount else 0.0
+                                    exit_timestamp = b_idx
+                                    break
+                                elif b_row['High'] >= target_price:
+                                    outcome = "Win"
+                                    pnl_rs = (qty * (target_price - proximal_line)) if risk_amount else 0.0
+                                    exit_timestamp = b_idx
+                                    break
                             break
                 
-                if is_tested and mode == "Historical Backtest":
-                    days_in_trade = j - entry_idx
+                if zone_tested and outcome != "Pending":
+                    results.append({
+                        "Stock Symbol": ticker.replace('.NS', ''),
+                        "Entry Date": entry_timestamp.strftime('%Y-%m-%d'),
+                        "Entry Time": entry_timestamp.strftime('%H:%M:%S'),
+                        "Exit Date": exit_timestamp.strftime('%Y-%m-%d') if exit_timestamp else "N/A",
+                        "Entry (₹)": round(proximal_line, 2),
+                        "SL (₹)": round(distal_line, 2),
+                        "Target (₹)": round(target_price, 2),
+                        "Qty": qty,
+                        "P&L (₹)": round(pnl_rs, 2),
+                        "Outcome": outcome
+                    })
+            else:
+                # Standard Daily Mode logic
+                last_legout_date = df_daily.index[last_legout_idx]
+                is_invalidated = False
+                is_tested = False
+                entry_idx = None
+                outcome = "Pending"
+                exit_date = None
+                pnl_rs = 0.0
+                
+                for j in range(last_legout_idx + 1, len(df_daily)):
+                    day_low = df_daily['High'].iloc[j] # Wait, Low
+                    day_low = df_daily['Low'].iloc[j]
+                    day_high = df_daily['High'].iloc[j]
+                    day_close = df_daily['Close'].iloc[j]
                     
-                    if day_low < distal_line: 
-                        outcome = "Loss"
-                        pnl_rs = -(qty * sl_points) if risk_amount else 0.0
-                        exit_date = df.index[j].date()
-                        break
-                    elif day_high >= target_price: 
-                        outcome = "Win"
-                        pnl_rs = (qty * (target_price - proximal_line)) if risk_amount else 0.0
-                        exit_date = df.index[j].date()
-                        break
-                    elif max_hold_days is not None and days_in_trade >= max_hold_days:
-                        if day_close >= proximal_line:
-                            outcome = "Time Exit (Win)"
-                        else:
-                            outcome = "Time Exit (Loss)"
-                            
-                        pnl_rs = (qty * (day_close - proximal_line)) if risk_amount else 0.0
-                        exit_date = df.index[j].date()
-                        break
-            
-            if mode == "Live Scan (Same Day)":
-                if is_invalidated or is_tested: continue
-                try:
-                    if float(t.fast_info.day_low) <= (proximal_line * 1.0025): continue
-                except:
-                    if cmp <= (proximal_line * 1.0025): continue
+                    if not is_tested:
+                        if day_close < distal_line:
+                            is_invalidated = True
+                            break 
+                        if day_low <= (proximal_line * 1.0025):
+                            is_tested = True
+                            entry_idx = j
+                            if mode == "Live Scan (Same Day)": break
                     
-                distance_pct = ((cmp - proximal_line) / cmp) * 100
-                results.append({
-                    "Stock Symbol": ticker.replace('.NS', ''),
-                    "CMP (₹)": round(cmp, 2),
-                    "Base date": base_date,
-                    "Proximal": round(proximal_line, 2),
-                    "Distal": round(distal_line, 2),
-                    "Legout candles": f"{total_legouts} (incl. pause)" if pause_used else str(total_legouts),
-                    "Legout % move": round(pct_move, 2),
-                    "Required fall %": round(distance_pct, 2)
-                })
-            
-            elif mode == "Historical Backtest":
-                if is_tested and not is_invalidated:
-                    entry_date = df.index[entry_idx].date()
+                    if is_tested and mode == "Historical Backtest":
+                        days_in_trade = j - entry_idx
+                        if day_low < distal_line: 
+                            outcome = "Loss"
+                            pnl_rs = -(qty * sl_points) if risk_amount else 0.0
+                            exit_date = df_daily.index[j].date()
+                            break
+                        elif day_high >= target_price: 
+                            outcome = "Win"
+                            pnl_rs = (qty * (target_price - proximal_line)) if risk_amount else 0.0
+                            exit_date = df_daily.index[j].date()
+                            break
+                        elif max_hold_days is not None and days_in_trade >= max_hold_days:
+                            outcome = "Time Exit (Win)" if day_close >= proximal_line else "Time Exit (Loss)"
+                            pnl_rs = (qty * (day_close - proximal_line)) if risk_amount else 0.0
+                            exit_date = df_daily.index[j].date()
+                            break
+                
+                if mode == "Historical Backtest" and is_tested and not is_invalidated:
+                    entry_date = df_daily.index[entry_idx].date()
                     if start_date <= entry_date <= end_date:
                         results.append({
                             "Stock Symbol": ticker.replace('.NS', ''),
@@ -227,8 +260,8 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
         return None
 
 # --- STREAMLIT UI ---
-st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Institutional structural scanner with configurable Time Exits, Stop Loss Toggles, and Precise Entry Timestamps.")
+st.title("NSE Demand Zone Scanner & Intraday Precision Backtester")
+st.markdown("Supports standard daily backtesting or exact 15-minute intraday timestamp execution for the last 60 days.")
 
 st.sidebar.header("Scan Parameters")
 
@@ -239,10 +272,19 @@ universe = st.sidebar.selectbox(
 
 mode = st.sidebar.radio("Select Mode:", ("Live Scan (Same Day)", "Historical Backtest"))
 
+is_intraday_mode = False
+if mode == "Historical Backtest":
+    st.sidebar.markdown("---")
+    is_intraday_mode = st.sidebar.toggle(
+        "Use 15-Min Exact Timestamp Mode", 
+        value=False, 
+        help="Enables exact minute execution timestamps. Note: Restricted to the last 60 days due to Yahoo Finance API limits."
+    )
+
 st.sidebar.markdown("---")
 st.sidebar.write("**Stop Loss Controls:**")
-apply_max_sl = st.sidebar.toggle("Enforce Max 2% SL Shift", value=True, help="Shifts your entry deeper if the base zone width is > 2%, capping risk exactly at 2%.")
-apply_min_sl = st.sidebar.toggle("Enforce Min 1.5% SL Filter", value=False, help="Skips trades where the SL is too tight (under 1.5%).")
+apply_max_sl = st.sidebar.toggle("Enforce Max 2% SL Shift", value=True)
+apply_min_sl = st.sidebar.toggle("Enforce Min 1.5% SL Filter", value=False)
 
 start_date, end_date = None, None
 risk_per_trade = None
@@ -257,8 +299,7 @@ if mode == "Historical Backtest":
         min_value=100, 
         max_value=100000, 
         value=1000, 
-        step=500,
-        help="Amount you are willing to lose if Stop Loss is hit."
+        step=500
     )
     
     time_exit_mapping = {
@@ -267,24 +308,21 @@ if mode == "Historical Backtest":
         "1 Trading Day (Next Day)": 1,
         "2 Trading Days (Day After Tomorrow)": 2,
         "3 Trading Days": 3,
-        "5 Trading Days (1 Week)": 5,
-        "10 Trading Days (2 Weeks)": 10
+        "5 Trading Days (1 Week)": 5
     }
     
-    time_exit_selection = st.sidebar.selectbox(
-        "Max Hold Duration (Time Exit):",
-        list(time_exit_mapping.keys()),
-        index=3,
-        help="Closes the trade at EOD running P&L if SL/Target are not met within this timeframe."
-    )
-    max_hold_days = time_exit_mapping[time_exit_selection]
+    max_hold_days = time_exit_mapping[st.sidebar.selectbox("Max Hold Duration:", list(time_exit_mapping.keys()), index=2)]
     
     st.sidebar.markdown("---")
     st.sidebar.write("**Select Trade Entry Window:**")
     
+    max_days_back = 60 if is_intraday_mode else 1800
+    default_days = 30 if is_intraday_mode else 180
+    
     date_range = st.sidebar.date_input(
         "Date Range", 
-        value=(date.today() - pd.DateOffset(days=180), date.today()),
+        value=(date.today() - pd.DateOffset(days=default_days), date.today()),
+        min_value=date.today() - pd.DateOffset(days=max_days_back),
         max_value=date.today()
     )
     
@@ -294,27 +332,23 @@ if mode == "Historical Backtest":
         start_date, end_date = date_range[0], date_range[0]
 
 if st.sidebar.button("Run Scan"):
-    if universe == "Nifty 500":
-        tickers = get_live_nifty500_symbols()
-    else:
-        tickers = get_all_nse_symbols()
+    tickers = get_live_nifty500_symbols() if universe == "Nifty 500" else get_all_nse_symbols()
     
     if not tickers:
-        st.error("Failed to fetch the stock list from NSE. Please try again.")
+        st.error("Failed to fetch stock list.")
     else:
         all_results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        with st.spinner(f"Executing {mode} across {universe}..."):
+        with st.spinner(f"Executing {mode} (Intraday Precision: {is_intraday_mode})..."):
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(analyze_ticker, t, mode, start_date, end_date, risk_per_trade, max_hold_days, apply_max_sl, apply_min_sl): t for t in tickers}
+                futures = {executor.submit(analyze_ticker, t, mode, start_date, end_date, risk_per_trade, max_hold_days, apply_max_sl, apply_min_sl, is_intraday_mode): t for t in tickers}
                 
                 for i, future in enumerate(concurrent.futures.as_completed(futures)):
                     res = future.result()
                     if res:
-                        for z in res:
-                            all_results.append(z)
+                        for z in res: all_results.append(z)
                             
                     if i % 10 == 0 or i == len(tickers) - 1:
                         progress_bar.progress((i + 1) / len(tickers))
@@ -324,54 +358,24 @@ if st.sidebar.button("Run Scan"):
         
         if all_results:
             df_res = pd.DataFrame(all_results)
-            
             if mode == "Historical Backtest":
-                df_res = df_res.sort_values(by="Entry Date", ascending=False).reset_index(drop=True)
+                df_res = df_res.sort_values(by=["Entry Date", "Entry Time"], ascending=False).reset_index(drop=True)
                 
                 total_closed = len(df_res[df_res["Outcome"] != "Pending"])
                 wins = len(df_res[df_res["Outcome"].str.contains("Win", na=False)])
                 losses = len(df_res[df_res["Outcome"].str.contains("Loss", na=False)])
-                pending = len(df_res[df_res["Outcome"] == "Pending"])
-                
                 win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
                 total_profit = df_res["P&L (₹)"].sum()
                 
                 st.markdown("### Backtest Performance Dashboard")
-                col1, col2, col3, col4 = st.columns(4)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Win Rate", f"{win_rate:.1f}%")
+                c2.metric("Total Net P&L", f"₹ {total_profit:,.2f}")
+                c3.metric("Trades Triggered", len(df_res))
+                c4.metric("Mode", "15-Min Intraday" if is_intraday_mode else "Daily")
                 
-                col1.metric("Win Rate", f"{win_rate:.1f}%", help="Includes TP hits and winning Time Exits.")
-                col2.metric("Total Net P&L", f"₹ {total_profit:,.2f}", delta=f"{'Profit' if total_profit > 0 else 'Loss'}")
-                col3.metric("Trades Triggered", len(df_res))
-                col4.metric("Pending/Open", pending)
-                
-                def style_outcome(val):
-                    if pd.isna(val): return ''
-                    if 'Win' in val: return 'color: green'
-                    if 'Loss' in val: return 'color: red'
-                    return 'color: gray'
-                
-                st.dataframe(
-                    df_res.style.map(style_outcome, subset=['Outcome']).format({
-                        "Entry (₹)": "{:.2f}",
-                        "SL (₹)": "{:.2f}",
-                        "Target (₹)": "{:.2f}",
-                        "P&L (₹)": "{:.2f}"
-                    }),
-                    use_container_width=True,
-                    height=500
-                )
-            else:
-                df_res = df_res.sort_values(by="Required fall %").reset_index(drop=True)
-                st.markdown(f"### Active Untested Zones ({universe})")
                 st.dataframe(df_res, use_container_width=True, height=500)
-            
-            csv = df_res.to_csv(index=False).encode('utf-8')
-            file_prefix = "Live" if mode == "Live Scan (Same Day)" else f"Backtest_{start_date}_to_{end_date}"
-            st.download_button(
-                label="📥 Download Data as CSV",
-                data=csv,
-                file_name=f"{file_prefix}_{universe.replace(' ', '_')}_Demand_Zones.csv",
-                mime="text/csv",
-            )
+            else:
+                st.dataframe(df_res, use_container_width=True, height=500)
         else:
             st.warning("No demand zones matched your criteria for the selected parameters.")
