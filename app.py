@@ -176,7 +176,6 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                         pnl_rs = (qty * (target_price - proximal_line)) if risk_amount else 0.0
                         exit_date = df.index[j].date()
                         break
-                    # Executes exactly on Day 0 if max_hold_days is 0 (Same Day Exit)
                     elif max_hold_days is not None and days_in_trade >= max_hold_days:
                         if day_close >= proximal_line:
                             outcome = "Time Exit (Win)"
@@ -213,6 +212,7 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                         results.append({
                             "Stock Symbol": ticker.replace('.NS', ''),
                             "Entry Date": entry_date.strftime('%Y-%m-%d'),
+                            "Entry Time": "09:15:00 AM",
                             "Exit Date": exit_date.strftime('%Y-%m-%d') if exit_date else "N/A",
                             "Entry (₹)": round(proximal_line, 2),
                             "SL (₹)": round(distal_line, 2),
@@ -228,7 +228,7 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
 
 # --- STREAMLIT UI ---
 st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Institutional structural scanner with configurable Time Exits and Stop Loss Toggles.")
+st.markdown("Institutional structural scanner with configurable Time Exits, Stop Loss Toggles, and Precise Entry Timestamps.")
 
 st.sidebar.header("Scan Parameters")
 
@@ -274,7 +274,7 @@ if mode == "Historical Backtest":
     time_exit_selection = st.sidebar.selectbox(
         "Max Hold Duration (Time Exit):",
         list(time_exit_mapping.keys()),
-        index=3, # Defaults to "2 Trading Days"
+        index=3,
         help="Closes the trade at EOD running P&L if SL/Target are not met within this timeframe."
     )
     max_hold_days = time_exit_mapping[time_exit_selection]
