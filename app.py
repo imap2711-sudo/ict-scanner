@@ -1,641 +1,332 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import concurrent.futures
-from datetime import datetime, timedelta, time
-from zoneinfo import ZoneInfo
+"""Weekly Sweep latest (W-75-15) – Streamlit app (Minal, 3 Nov 2026).
+Same rules as the 'Weekly Sweep latest (W-75-15)' tab of the Daily Sweep Latest board (engine w75.py, 30 Oct 2026):
+1 Weekly liquidity sweep THIS WEEK: PWL (previous week low) or WSL (weekly swing low, not broken since it formed) – the week's
+  low so far goes below the level and the latest 15-min close is back above it. Sweep low = lowest 15-min candle of the week.
+2 MSS on 75 min: a completed 75-min candle (09:15 / 10:30 / 11:45 / 13:00 / 14:15) after the sweep-low candle closes above the
+  latest 75-min swing high left of the sweep low that is still unbroken. Only the first MSS counts.
+3 Demand zone near the MSS line: high-quality 15-min or 5-min DZ formed in the rally sweep low -> MSS candle, untouched till the
+  MSS, proximal within +/-2% of the MSS line (nearest). HQ DZ = 1-2 base candles (body < 40%) + bullish leg-out (body > 50%,
+  range >= 1.5x largest base, close above base high); zone height >= 0.2%.
+Trade (study): entry = DZ proximal on the first retrace after the MSS; SL = DZ distal; target = highest high after the MSS
+  before the entry. Before entry: 15-min close below distal, or a candle opening below it -> Cancelled. Lives till week end.
+Status: W waiting MSS · N no zone · E waiting entry · O open · T target hit · L SL hit · C cancelled.
+Data: Yahoo Finance (daily 2 years, 15-min and 5-min last 60 days). For study, not trading advice.
 
-# --- PAGE SETUP ---
-st.set_page_config(page_title="ICT Precision Scanner", layout="wide", page_icon="⚡")
-ist = ZoneInfo('Asia/Kolkata')
-
-custom_css = """
-<style>
-    .stApp { background-color: #0B1121; color: #E2E8F0; }
-    h1, h2, h3, p, label, .stMetric label { color: #E2E8F0 !important; font-family: 'Inter', sans-serif !important; }
-    [data-testid="stDataFrame"] { background-color: #0F172A; border-radius: 8px; }
-    div[data-testid="metric-container"] { background-color: #1E293B; border: 1px solid #334155; padding: 15px; border-radius: 8px; }
-    div[data-baseweb="tab-list"] { gap: 10px; }
-    div[data-baseweb="tab"] { background-color: #1E293B; border-radius: 8px !important; padding: 10px 20px !important; border: 1px solid #334155; color: white !important; font-weight: 600; margin: 0 !important; }
-    div[data-baseweb="tab"][aria-selected="true"]:nth-child(1) { background-color: #10B981 !important; border-color: #059669 !important; }
-    div[data-baseweb="tab"][aria-selected="true"]:nth-child(2) { background-color: #EF4444 !important; border-color: #DC2626 !important; }
-</style>
+Run:  pip install streamlit pandas plotly   then   streamlit run app.py
 """
-st.title("⚡ Weekly ICT Sweep & MTF Screener")
-if st.query_params.get("plain") != "1":
-    st.markdown(custom_css, unsafe_allow_html=True)
+import json, time, datetime as dt, collections, urllib.parse, urllib.request, concurrent.futures as cf
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
 
-# --- CONSTANTS ---
-BASE_BODY_RATIO = 0.5                            
-SL_PAD_BULL, SL_PAD_BEAR = 0.999, 1.001          
-WINDOW_START, WINDOW_END = time(9, 45), time(13, 30)
-MIN_RR = 1.0                                     
-SWING_N = 2                                      
-SWING_LOOKBACK_BARS = 125                        
-ZONE_NEAREST = "Nearest to MSS line (above or below)"
-ZONE_STRICT = "Strictly below MSS line (demand) / above (supply)"
-MODE_SINGLE_SWEEP = "Single sweep allowed per week"
-MODE_MULTI_SWEEP = "Multiple sweeps allowed per week"
+BAND = 0.02
+UA = {"User-Agent": "Mozilla/5.0"}
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+SYMS = """360ONE AADHARHFC AARTIIND AAVAS ABB ABBOTINDIA ABCAPITAL ABDL ABREL ABSLAMC ACC ACE ACMESOLAR ACUTAAS ADANIENSOL ADANIENT
+ADANIGREEN ADANIPORTS ADANIPOWER AEGISLOG AEGISVOPAK AETHER AFCONS AFFLE AIAENG AIIL AJANTPHARM ALKEM AMBER AMBUJACEM ANANDRATHI
+ANANTRAJ ANGELONE ANTHEM ANURAS APARINDS APLAPOLLO APOLLOHOSP APOLLOTYRE APTUS ARE&M ASAHIINDIA ASHOKLEY ASIANPAINT ASTERDM ASTRAL
+ATGL ATHERENERG ATUL AUBANK AUROPHARMA AVANTIFEED AWL AXISBANK AZAD BAJAJ-AUTO BAJAJFINSV BAJAJHFL BAJAJHLDNG BAJFINANCE
+BALKRISIND BALRAMCHIN BANDHANBNK BANKBARODA BANKINDIA BATAINDIA BBOX BDL BEL BELRISE BEML BERGEPAINT BHARATCOAL BHARATFORG BHARTIARTL
+BHARTIHEXA BHEL BIOCON BIRET BLS BLUESTARCO BOSCHLTD BPCL BRIGADE BRITANNIA BSE BSOFT CAMS CANBK CANFINHOME CANHLIFE CAPLIPOINT
+CARBORUNIV CARTRADE CASTROLIND CCL CDSL CEATLTD CEMPRO CENTRALBK CESC CGCL CGPOWER CHAMBLFERT CHENNPETRO CHOICEIN CHOLAFIN
+CHOLAHLDNG CIEINDIA CIPLA CLEAN CLEANMAX CMPDI COALINDIA COCHINSHIP COFORGE COHANCE COLPAL CONCOR CONCORDBIO COROMANDEL CPPLUS
+CRAFTSMAN CREDITACC CRISIL CROMPTON CUB CUMMINSIND CUPID CYIENT DABUR DALBHARAT DATAPATTNS DEEPAKFERT DEEPAKNTR DELHIVERY DEVYANI
+DIVISLAB DIXON DLF DMART DOMS DRREDDY ECLERX EICHERMOT EIDPARRY EIHOTEL ELECON ELGIEQUIP EMAMILTD EMBASSY EMCURE EMMVEE
+ENDURANCE ENGINERSIN ENRIN ESCORTS ETERNAL EXIDEIND FACT FEDERALBNK FINCABLES FIRSTCRY FIVESTAR FLUOROCHEM FORCEMOT FORTIS FRACTAL
+FSL GABRIEL GAIL GALLANTT GESHIP GICRE GILLETTE GLAND GLAXO GLENMARK GMDCLTD GMRAIRPORT GODFRYPHLP GODREJCP GODREJIND GODREJPROP
+GPIL GRANULES GRAPHITE GRASIM GRAVITA GROWW GRSE GVT&D HAL HAVELLS HBLENGINE HCLTECH HDBFS HDFCAMC HDFCBANK HDFCLIFE HEGAM
+HEROMOTOCO HEXT HFCL HINDALCO HINDCOPPER HINDPETRO HINDUNILVR HINDZINC HOMEFIRST HONASA HONAUT HSCL HUDCO HYUNDAI ICICIAMC ICICIBANK
+ICICIGI ICICILIFE IDBI IDEA IDFCFIRSTB IEX IFCI IGIL IGL IIFL IKS INDHOTEL INDIACEM INDIAMART INDIANB INDIGO INDUSINDBK INDUSTOWER
+INFY INOXINDIA INOXWIND INTELLECT IOB IOC IPCALAB IRB IRCON IRCTC IREDA IRFC ITC ITCHOTELS ITI J&KBANK JAINREC JBMA JINDALSAW
+JINDALSTEL JIOFIN JKCEMENT JKTYRE JMFINANCIL JPPOWER JSL JSWCEMENT JSWENERGY JSWINFRA JSWSTEEL JUBLFOOD JUBLINGREA JWL JYOTICNC
+KAJARIACER KALYANKJIL KARURVYSYA KAYNES KEC KEI KFINTECH KIMS KIRLOSBROS KIRLOSENG KOTAKBANK KPIL KPITTECH KPRMILL KSB LALPATHLAB
+LAURUSLABS LEMONTREE LENSKART LGEINDIA LICHSGFIN LICI LINDEINDIA LLOYDSME LODHA LT LTF LTFOODS LTM LTTS LUPIN M&M M&MFIN MAHABANK
+MANAPPURAM MANKIND MARICO MARUTI MAXHEALTH MAZDOCK MCX MEDANTA MEESHO MFSL MGL MINDACORP MMTC MOTHERSON MOTILALOFS MPHASIS MRF MRPL
+MSUMI MTARTECH MUTHOOTFIN NAM-INDIA NATCOPHARM NATIONALUM NAUKRI NAVA NAVINFLUOR NBCC NCC NESTLEIND NETWEB NEULANDLAB NH NHPC
+NIACL NLCINDIA NMDC NSLNISP NTPC NTPCGREEN NUVAMA NUVOCO NYKAA OBEROIRLTY OFSS OIL OLAELEC OLECTRA ONESOURCE ONGC PAGEIND PARADEEP
+PATANJALI PAYTM PCBL PERSISTENT PETRONET PFC PFOCUS PGEL PHOENIXLTD PIDILITIND PIIND PINELABS PIRAMALFIN PNB PNBHOUSING POLICYBZR
+POLYCAB POLYMED POONAWALLA POWERGRID POWERINDIA PPLPHARMA PREMIERENE PRESTIGE PRIVISCL PTCIL PVRINOX PWL RADICO RAILTEL RAINBOW
+RAMCOCEM RBLBANK RECLTD REDINGTON RELIANCE RHIM RITES RKFORGE RPOWER RRKABEL RUBICON RVNL SAGILITY SAIL SAILIFE SAMMAANCAP SANSERA
+SARDAEN SBICARD SBILIFE SBIN SCHAEFFLER SCHNEIDER SCI SHREECEM SHRIPISTON SHRIRAMFIN SHYAMMETL SIEMENS SIGNATURE SJVN SOBHA
+SOLARINDS SONACOMS SRF STARHEALTH STLTECH SUMICHEM SUNDARMFIN SUNPHARMA SUNTV SUPREMEIND SUZLON SWANCORP SWIGGY SYNGENE SYRMA TARIL
+TATACAP TATACHEM TATACOMM TATACONSUM TATAELXSI TATAINVEST TATAPOWER TATASTEEL TATATECH TBOTEK TCS TDPOWERSYS TECHM TECHNOE TEGA
+TEJASNET TENNIND THANGAMAYL THERMAX TIINDIA TIMKEN TITAGARH TITAN TMCV TMPV TORNTPHARM TORNTPOWER TRENT TRIDENT TRITURBINE TTML
+TVSMOTOR UBL UCOBANK UJJIVANSFB ULTRACEMCO UNIONBANK UNITDSPR UNOMINDA UPL URBANCO USHAMART UTIAMC VAML VBL VEDL VEDPOWER VIJAYA VISL
+VMM VOGL VOLTAS VTL WAAREEENER WELCORP WELSPUNLIV WHIRLPOOL WIPRO WOCKPHARMA YESBANK ZEEL ZENSARTECH ZENTEC ZFCVINDIA ZYDUSLIFE
+ZYDUSWELL""".split()
+SN = dict(W='Waiting MSS', N='No zone', E='Waiting entry', O='Open', T='Target hit', L='SL hit', C='Cancelled')
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def get_stock_symbols(universe):
-    nifty500_csv = "360ONE,3MINDIA,ABB,ACC,AIAENG,APLAPOLLO,AUBANK,AARTIDRUGS,AARTIIND,AAVAS,ABBOTINDIA,ADANIENT,ADANIGREEN,ADANIPORTS,ADANIPOWER,ATGL,AWL,ABCAPITAL,ABFRL,AEGISCHEM,AETHER,AFFLE,AJANTPHARM,APLLTD,ALKEM,ALKYLAMINE,ALLCARGO,AMARAJABAT,AMBER,AMBUJACEM,ANANDAMATH,ANGELONE,ANURAS,APARINDS,APOLLOHOSP,APOLLOTYRE,APTUS,ASAHIINDIA,ASHOKLEY,ASIANPAINT,ASTERDM,ASTRAL,ATUL,AUROPHARMA,AVANTIFEED,DMART,AXISBANK,BEML,BSE,BAJAJ-AUTO,BAJAJFINSV,BAJFINANCE,BAJAJHLDNG,BALAMINES,BALKRISIND,BALRAMCHIN,BANDHANBNK,BANKBARODA,BANKINDIA,MAHABANK,BATAINDIA,BAYERCROP,BERGEPAINT,BDL,BEL,BHARATFORG,BHEL,BPCL,BHARTIARTL,BIOCON,BOSCHLTD,BRIGADE,BRITANNIA,MAPMYINDIA,CCL,CESC,CGPOWER,CAMS,CANFINHOME,CANBK,CAPLIPOINT,CARBORUNIV,CASTROLIND,CEATLTD,CENTRALBK,CDSL,CENTURYPLY,CENTURYTEX,CERA,CHALET,CHAMBLFERT,CHEMPLASTS,CHENNPETRO,CHOLAFIN,CHOLAHLDNG,CIPLA,CLEAN,COALINDIA,COCHINSHIP,COFORGE,COLPAL,CONCOR,COROMANDEL,CRAFTSMAN,CREDITACC,CROMPTON,CUB,CUMMINSIND,CYIENT,DCMSHRIRAM,DLF,DABUR,DALBHARAT,DEEPAKNTR,DELHIVERY,DEVYANI,DIVISLAB,DIXON,LALPATHLAB,DRREDDY,EIDPARRY,EIHOTEL,EPL,EASEMYTRIP,EICHERMOT,ELECON,ELGIEQUIP,EMAMILTD,ENDURANCE,ENGINERSIN,EQUITASBNK,ERIS,ESCORTS,EXIDEIND,FDC,NYKAA,FEDERALBNK,FACT,FINEORG,FINCABLES,FINPIPE,FSL,FORTIS,GRINFRA,GAIL,GMMPFAUDLR,GMRINFRA,GALAXYSURF,GARFIBRES,GICRE,GLAXO,GLENMARK,MEDANTA,GODFRYPHLP,GODREJAGRO,GODREJCP,GODREJIND,GODREJPROP,GRASIM,GESHIP,GRINDWELL,GUJGASLTD,GNFC,GSFC,GSPL,HAVELLS,HEG,HEGAM,HCLTECH,HDFCAMC,HDFCBANK,HDFCLIFE,HFCL,HAL,HINDALCO,HINDCOPPER,HINDPETRO,HINDUNILVR,HINDZINC,HONAUT,HSCL,HUDCO,ITC,IDBI,IDFCFIRSTB,IFBIND,IIFL,IRB,IRCON,ITI,INDIACEM,INDIAMART,INDIANB,IEX,INDHOTEL,IOC,IOB,IRCTC,IRFC,INDIGOPNTS,IGL,INDUSINDBK,NAUKRI,INFIBEAM,INFY,INOXWIND,INTELLECT,INDIGO,IPCALAB,JBCHEPHARM,JKCEMENT,JKLAKSHMI,JKPAPER,JKTYRE,JMFINANCIL,JSWENERGY,JSWSTEEL,JAICORPLTD,J&KBANK,JINDALSTEL,JINDALPHOT,JIOFIN,JUBILANT,JUBLFOOD,JUBLINGREA,JUBLPHARMA,KPRMILL,KEI,KNRCON,KPITTECH,KRBL,KSB,KAJARIACER,KALYANKJIL,KANSAINER,KARURVYSYA,KAYNES,KEC,KFINTECH,KOTAKBANK,KIMS,L&TFH,LTTS,LICHSGFIN,LTIM,LT,LATENTVIEW,LAURUSLABS,LEMONTREE,LICI,LINDEINDIA,LUPIN,MRF,MTARTECH,MACPOWER,LODHA,MGL,M&MFIN,M&M,MAHSEAMLES,MARICO,MARUTI,MASTEK,MAXHEALTH,MAXFIN,MAZDOCK,MEDPLUS,METROBRAND,METROPOLIS,MINDACORP,UNOINDA,MOTILALOFS,MPHASIS,MCX,MUTHOOTFIN,NATCOPHARM,NBCC,NCC,NHPC,NLCINDIA,NMDC,NOCIL,NTPC,OBEROIRLTY,ONGC,OIL,OLECTRA,PAYTM,OFSS,POLICYBKR,PCBL,PIIND,PNBHOUSING,PNCINFRA,PVRINOX,PAGEIND,PATANJALI,PERSISTENT,PETRONET,PFIZER,PHOENIXLTD,PIDILITIND,PEL,PPLPHARMA,POLYMED,POLYCAB,POONAWALLA,PFC,POWERGRID,PRAJIND,PRESTIGE,PRINCEPIPE,PRSMJOHNSN,PGHL,PNB,QUESS,RBLBANK,RECLTD,RHIM,RITES,RADICO,RVNL,RAILTEL,RAIN,RAMCOCEM,RATNAMANI,RAYMOND,REDINGTON,RELAXO,RELIANCE,RBA,ROUTE,SJVN,SKFINDIA,SRF,MOTHERSON,SANOFI,SAPPHIRE,SAREGAMA,SCHAEFFLER,SCHNEIDER,CIGNITITEC,SEQUENT,SHARDACROP,SHAREINDIA,SCI,SHREECEM,SHRIRAMFIN,SHYAMMETL,SIEMENS,SOBHA,SOLARINDS,SONACOMS,STARHEALTH,SBI,SAIL,SBM,STLTECH,STARCEMENT,SUDARSCHEM,SUMICHEM,SPARC,SUNPHARMA,SUNTV,SUNDARMFIN,SUNDRMFAST,SUNTECK,SUPREMEIND,SUVENPHAR,SUZLON,SWANENERGY,SYMPHONY,SYNGENE,TCIEXP,TCNSBRANDS,TCS,TATACHEM,TATACOMM,TATACONSUM,TATAELXSI,TATAINVEST,TATAMOTORS,TATAPOWER,TATASTEEL,TTML,TEAMLEASE,TECHM,TEJASNET,THERMAX,TIDEWATER,TIMKEN,TITAN,TORNTPHARM,TORNTPOWER,TRENT,TRIDENT,TRIVENI,TRIVENITQ,TUBEINVEST,UCOBANK,UPL,UTIAMC,UJJIVANSFB,ULTRACEMCO,UNIONBANK,UBL,MCDOWELL-N,VGUARD,VMART,VIPIND,VAIBHAVGBL,VTL,VARROC,VBL,VEDL,VENKEYS,VIJAYA,VINATIORGA,IDEA,VOLTAS,WELCORP,WELENT,WHIRLPOOL,WIPRO,YESBANK,ZFCVINDIA,ZEEL,ZENSARTECH,ZOMATO,ZYDUSLIFE"
-    nifty200_csv = "ABB,ACC,ADANIENT,ADANIGREEN,ADANIPORTS,ADANIPOWER,ATGL,AWL,ABCAPITAL,ABFRL,APOLLOHOSP,ASHOKLEY,ASIANPAINT,ASTRAL,AUROPHARMA,DMART,AXISBANK,BSE,BAJAJ-AUTO,BAJAJFINSV,BAJFINANCE,BALKRISIND,BANDHANBNK,BANKBARODA,BANKINDIA,MAHABANK,BEL,BHARATFORG,BHEL,BPCL,BHARTIARTL,BOSCHLTD,BRITANNIA,CANBK,CHOLAFIN,CIPLA,COALINDIA,COCHINSHIP,COFORGE,COLPAL,CONCOR,CUMMINSIND,DLF,DABUR,DIVISLAB,DIXON,LALPATHLAB,DRREDDY,EICHERMOT,ESCORTS,FEDERALBNK,FACT,FORTIS,GAIL,GMRINFRA,GLENMARK,GODREJCP,GODREJPROP,GRASIM,GUJGASLTD,HAVELLS,HCLTECH,HDFCAMC,HDFCBANK,HDFCLIFE,HAL,HINDALCO,HINDCOPPER,HINDPETRO,HINDUNILVR,HINDZINC,HUDCO,ITC,IDBI,IDFCFIRSTB,IRB,IRCON,INDIANB,INDHOTEL,IOC,IOB,IRCTC,IRFC,IGL,INDUSINDBK,NAUKRI,INFY,INDIGO,JINDALSTEL,JIOFIN,JSWENERGY,JSWSTEEL,KALYANKJIL,KOTAKBANK,L&TFH,LTTS,LICHSGFIN,LTIM,LT,LICI,LUPIN,MRF,LODHA,M&MFIN,M&M,MARICO,MARUTI,MAXHEALTH,MAZDOCK,MUTHOOTFIN,NHPC,NMDC,NTPC,OBEROIRLTY,ONGC,OIL,PAYTM,POLICYBKR,PIIND,PFC,POWERGRID,PRESTIGE,PNB,RECLTD,RVNL,RELIANCE,SRF,MOTHERSON,SCHAEFFLER,SIEMENS,SOLARINDS,SBI,SAIL,SUNPHARMA,SUNTV,SUPREMEIND,SUZLON,TATACHEM,TATACOMM,TATACONSUM,TATAELXSI,TATAMOTORS,TATAPOWER,TATASTEEL,TECHM,TITAN,TORNTPHARM,TORNTPOWER,TRENT,TUBEINVEST,UCOBANK,ULTRACEMCO,UNIONBANK,UBL,MCDOWELL-N,VEDL,VOLTAS,WIPRO,YESBANK,ZOMATO,ZYDUSLIFE"
 
-    if universe == "Nifty 200":
-        return [s.strip() + ".NS" for s in nifty200_csv.split(",")]
-    return [s.strip() + ".NS" for s in nifty500_csv.split(",")]
+# ---------------------------------------------------------------- data (Yahoo Finance)
+def _get(url):
+    for k in range(3):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r: return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 422): return None
+            time.sleep(1 + 2 * k)
+        except Exception: time.sleep(1 + 2 * k)
 
-IST_NAME = 'Asia/Kolkata'
 
-@st.cache_data(ttl=900, show_spinner=False, max_entries=1500)
-def _download(ticker, period, interval):
-    df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
-    if df is None or df.empty:
-        raise ValueError(f"No data for {ticker} ({interval})")
-    df = df[['Open', 'High', 'Low', 'Close']].copy()
-    idx = pd.DatetimeIndex(df.index)
-    if idx.tz is not None:
-        idx = idx.tz_convert(IST_NAME).tz_localize(None)
-    df.index = idx
-    df = df[~df.index.duplicated(keep='last')].sort_index()
-    return df.dropna()
+def _yahoo(sym, iv, rng):
+    j = _get(f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym + '.NS')}?interval={iv}&range={rng}")
+    try: return j['chart']['result'][0]
+    except Exception: return None
 
-def fetch_market_data(ticker, period, interval):
-    try:
-        return _download(ticker, period, interval)
-    except Exception:
-        return pd.DataFrame()
 
-def build_75m_candles(df_15m):
-    rows = []
-    for _, group in df_15m.groupby(df_15m.index.normalize()):
-        for i in range(0, len(group), 5):
-            chunk = group.iloc[i:i + 5]
-            if len(chunk) > 0:
-                rows.append({
-                    'Datetime': chunk.index[0],
-                    'Open': chunk['Open'].iloc[0],
-                    'High': chunk['High'].max(),
-                    'Low': chunk['Low'].min(),
-                    'Close': chunk['Close'].iloc[-1],
-                    'End': chunk.index[-1],
-                    'Complete': len(chunk) == 5
-                })
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).set_index('Datetime')
+def _daily(r):
+    q = r['indicators']['quote'][0]; B = []
+    for t, o, h, l, c in zip(r.get('timestamp') or [], q['open'], q['high'], q['low'], q['close']):
+        if None in (o, h, l, c) or min(o, h, l, c) <= 0: continue
+        d = dt.datetime.fromtimestamp(t + 19800, dt.timezone.utc).strftime('%Y-%m-%d')
+        b = (d, o, max(o, h, l, c), min(o, h, l, c), c)
+        if B and B[-1][0] == d: B[-1] = b
+        else: B.append(b)
+    return B
 
-def get_nearest_untested_75m_swing(df_75m, sweep_75m_dt, direction='high'):
-    if sweep_75m_dt not in df_75m.index:
-        closest_time = df_75m.index.asof(sweep_75m_dt)
-        if pd.isna(closest_time):
-            return None, None
-        loc = df_75m.index.get_loc(closest_time)
-    else:
-        loc = df_75m.index.get_loc(sweep_75m_dt)
 
-    for i in range(loc, 0, -1):
-        if i + 1 >= len(df_75m):
-            continue
-        if direction == 'high':
-            h = df_75m['High'].iloc[i]
-            if h > df_75m['High'].iloc[i - 1] and h > df_75m['High'].iloc[i + 1]:
-                mitigated = False
-                if i < loc:
-                    mitigated = df_75m['High'].iloc[i + 1 : loc + 1].max() >= h
-                if not mitigated:
-                    return df_75m.index[i], h
-        else:
-            l = df_75m['Low'].iloc[i]
-            if l < df_75m['Low'].iloc[i - 1] and l < df_75m['Low'].iloc[i + 1]:
-                mitigated = False
-                if i < loc:
-                    mitigated = df_75m['Low'].iloc[i + 1 : loc + 1].min() <= l
-                if not mitigated:
-                    return df_75m.index[i], l
-    return None, None
+def _intra(r, m, nowt):
+    q = r['indicators']['quote'][0]; out = {}
+    for t, o, h, l, c in zip(r.get('timestamp') or [], q['open'], q['high'], q['low'], q['close']):
+        if None in (o, h, l, c) or min(o, h, l, c) <= 0: continue
+        d = dt.datetime.fromtimestamp(t + 19800, dt.timezone.utc).replace(tzinfo=None)
+        mins = d.hour * 60 + d.minute - 555
+        if d.second or mins < 0 or mins % m or d.hour * 60 + d.minute >= 930: continue
+        if d + dt.timedelta(minutes=m) > nowt: continue                    # completed candles only
+        out[d] = (d.strftime('%Y-%m-%d %H:%M'), round(o, 2), round(max(o, h, l, c), 2), round(min(o, h, l, c), 2), round(c, 2))
+    return [out[k] for k in sorted(out)]
 
-def find_activation(df_15m, sweep_bar_dt, mss_price, direction):
-    days_to_next_monday = 7 - sweep_bar_dt.weekday()
-    next_monday = (sweep_bar_dt + timedelta(days=days_to_next_monday)).replace(hour=0, minute=0, second=0)
-    end_of_week = next_monday - timedelta(seconds=1)
-    
-    bars = df_15m[(df_15m.index >= sweep_bar_dt) & (df_15m.index <= end_of_week)]
-    if bars.empty or len(bars) < 2:
+
+def load(sym, stamp):
+    """daily, 15-min and 5-min candles for one stock (stamp = refresh key)."""
+    nowt = dt.datetime.now(IST).replace(tzinfo=None)
+    rd, r15, r5 = _yahoo(sym, '1d', '2y'), _yahoo(sym, '15m', '60d'), _yahoo(sym, '5m', '60d')
+    if not rd or not r15: return None
+    return _daily(rd), _intra(r15, 15, nowt), (_intra(r5, 5, nowt) if r5 else [])
+
+
+# ---------------------------------------------------------------- engine (same as w75.py)
+def hq_dzones(B, a, b):
+    Z = []
+    rng = lambda k: B[k][2] - B[k][3]
+    br = lambda k: abs(B[k][4] - B[k][1]) / rng(k) if rng(k) > 0 else 0
+    for i in range(max(0, a), b + 1):
+        for k in (1, 2):
+            bs = list(range(i, i + k)); lo = i + k
+            if lo >= len(B) or lo > b: break
+            if not all(br(x) < 0.40 for x in bs): continue
+            if not (B[lo][4] > B[lo][1] and br(lo) > 0.50): continue
+            if rng(lo) < 1.5 * max(rng(x) for x in bs) or B[lo][4] <= max(B[x][2] for x in bs): continue
+            zb, zt = min(B[x][3] for x in bs), max(max(B[x][1], B[x][4]) for x in bs)
+            if zt - zb < 0.002 * zt: continue
+            Z.append((lo, round(zb, 2), round(zt, 2), B[i][0], k)); break
+    return Z
+
+
+wkey = lambda d: dt.date.fromisoformat(d).isocalendar()[:2]
+end15 = lambda t: (pd.Timestamp(t) + pd.Timedelta(minutes=15)).strftime('%H:%M')
+end_t = lambda t: (pd.Timestamp(t) + pd.Timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M')
+
+
+def run(DB, B, B5, day, today):
+    """state of the W-75-15 setup for every 15-min slot of `day` -> (entries, setup facts)"""
+    T = [b[0] for b in B]; T5 = [b[0] for b in B5]
+    dayidx = collections.defaultdict(list)
+    for i, t in enumerate(T): dayidx[t[:10]].append(i)
+    if day not in dayidx: return None
+    have = {b[0] for b in DB if b[0] != today}
+    extra = [(d, B[ix[0]][1], max(B[k][2] for k in ix), min(B[k][3] for k in ix), B[ix[-1]][4]) for d, ix in dayidx.items() if (d not in have and len(ix) >= 20) or d == today]
+    if extra: DB = sorted([b for b in DB if b[0] != today] + extra)
+    W = []
+    for b in DB:
+        k = wkey(b[0])
+        if not W or W[-1][0] != k: W.append([k, b[3]])
+        else: W[-1][1] = min(W[-1][1], b[3])
+    wpos = {w[0]: j for j, w in enumerate(W)}
+    LV = collections.defaultdict(list)
+    for j in range(1, len(W)): LV[W[j][0]].append(('PWL', W[j - 1][1]))
+    for j in range(1, len(W) - 1):
+        if W[j][1] < W[j - 1][1] and W[j][1] < W[j + 1][1]:
+            for m in range(j + 2, len(W)):
+                LV[W[m][0]].append(('WSL', W[j][1]))
+                if W[m][1] < W[j][1]: break
+    G = collections.OrderedDict()
+    for i, t in enumerate(T):
+        m = int(t[11:13]) * 60 + int(t[14:16]) - 555; G.setdefault((t[:10], m // 75), []).append(i)
+    K = [ix for ix in G.values() if len(ix) == 5]
+    B75 = [(T[ix[0]], B[ix[0]][1], max(B[j][2] for j in ix), min(B[j][3] for j in ix), B[ix[-1]][4], ix[-1]) for ix in K]
+    SH75 = [i for i in range(1, len(B75) - 1) if B75[i][2] > B75[i - 1][2] and B75[i][2] > B75[i + 1][2]]
+    endk = {b[5]: j for j, b in enumerate(B75)}
+
+    def mline(swl):
+        for i in reversed(SH75):
+            if B75[i + 1][5] >= swl: continue
+            h = B75[i][2]
+            if max(B[j][2] for j in range(B75[i][5] + 1, swl + 1)) <= h: return h, B75[i][0]
         return None
-        
-    if direction == 'Bullish':
-        condition = bars['Close'] > mss_price
-    else:
-        condition = bars['Close'] < mss_price
-        
-    consecutive = condition & condition.shift(1)
-    hits = bars[consecutive]
-    
-    return hits.index[0] if not hits.empty else None
 
-def get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction, active_sl):
-    hist = df_15m.loc[:activation_idx].iloc[-SWING_LOOKBACK_BARS:]
-    highs, lows = hist['High'].to_numpy(), hist['Low'].to_numpy()
-    n, last = SWING_N, len(hist) - 1
-    risk_dist = abs(entry_price - active_sl)
+    def zone(swl, km, line):
+        cand = [('15m', q) for q in hq_dzones(B, swl, km) if not any(B[k][3] <= q[2] for k in range(q[0] + 1, km + 1))]
+        a5 = next((k for k, t in enumerate(T5) if t >= T[swl]), None)
+        b5 = next((k for k, t in enumerate(T5) if t >= end_t(T[km])), len(B5)) - 1
+        if a5 is not None and b5 > a5:
+            cand += [('5m', q) for q in hq_dzones(B5, a5, b5) if not any(B5[k][3] <= q[2] for k in range(q[0] + 1, b5 + 1))]
+        cand = [(tf, q, (q[2] / line - 1) * 100) for tf, q in cand if abs(q[2] / line - 1) <= BAND]
+        if not cand: return None
+        tf, q, d = min(cand, key=lambda c: (abs(c[2]), c[0] != '15m'))
+        return dict(tf=tf, b=q[1], t=q[2], st=q[3], lt=(T5 if tf == '5m' else T)[q[0]], nb=q[4], d=round(d, 2))
 
-    for i in range(last - n, n - 1, -1):
-        if direction == 'Bullish':
-            h = highs[i]
-            if h <= entry_price: continue
-            if (h - entry_price) < (MIN_RR * risk_dist): continue
-            if h > highs[i - n:i].max() and h > highs[i + 1:i + n + 1].max() and highs[i + 1:].max() < h:
-                return float(h)
+    wk = wkey(day); lvls = LV.get(wk, [])
+    if not lvls or wk not in wpos: return None
+    ids = [i for i in range(len(T)) if wkey(T[i][:10]) == wk and T[i][:10] <= day]
+    low = swl = lock = S = mx = mxa = None; ent = []; seen = False
+    for k in ids:
+        if low is None or B[k][3] < low: low = B[k][3]; swl = k
+        c = B[k][4]; st_ = '0'
+        if lock is None:
+            sw = [(kd, lv) for kd, lv in lvls if low < lv < c]
+            ml = mline(swl) if sw else None
+            if sw and ml:
+                st_ = 'W'; seen = True
+                S = dict(sl_t=T[swl], lo=round(low, 2), k='+'.join(sorted({x[0] for x in sw})), lv=sorted({round(x[1], 2) for x in sw}), line=ml[0], lt=ml[1])
+                if k in endk and k > swl and B75[endk[k]][4] > ml[0]:
+                    lock = dict(km=k); S['mss'] = T[B75[endk[k]][5] - 4]; S['mc'] = T[k]
+                    z = zone(swl, k, ml[0]); mx = mxa = B[k][2]
+                    if z: S['z'] = z; lock['ph'] = 'E'
+                    else: lock['ph'] = 'N'
+                    st_ = lock['ph']
         else:
-            lo = lows[i]
-            if lo >= entry_price: continue
-            if (entry_price - lo) < (MIN_RR * risk_dist): continue
-            if lo < lows[i - n:i].min() and lo < lows[i + 1:i + n + 1].min() and lows[i + 1:].min() > lo:
-                return float(lo)
-    return None
-
-def find_sd_zone(df_15m, sweep_time, activation_time, mss_price, direction, zone_method, zone_position=ZONE_NEAREST):
-    try:
-        leg_df = df_15m.loc[sweep_time:activation_time].copy()
-        if len(leg_df) < 3: return None, None
-        leg_df['Body'] = abs(leg_df['Open'] - leg_df['Close'])
-        leg_df['Range'] = leg_df['High'] - leg_df['Low']
-        leg_df['Is_Base'] = (leg_df['Body'] / leg_df['Range'].replace(0, 0.001)) <= BASE_BODY_RATIO
-        leg_df['Eligible'] = True
-        if zone_position == ZONE_STRICT:
-            leg_df['Eligible'] = (leg_df['High'] < mss_price) if direction == 'Bullish' else (leg_df['Low'] > mss_price)
-        base_candles = leg_df[leg_df['Is_Base'] & leg_df['Eligible']].copy()
-        if base_candles.empty: return None, None
-        base_candles['Dist_to_MSS'] = abs(((base_candles['High'] + base_candles['Low']) / 2) - mss_price)
-        closest_base_idx = base_candles['Dist_to_MSS'].idxmin()
-        leg_df['Block'] = (~leg_df['Is_Base']).cumsum()
-        target_block = leg_df.loc[closest_base_idx, 'Block']
-        zone_candles = leg_df[(leg_df['Is_Base']) & (leg_df['Eligible']) & (leg_df['Block'] == target_block)]
-        if zone_candles.empty: return None, None
-        if zone_method == "Strict (Base + Leg-Out)":
-            last_base_idx = zone_candles.index[-1]
-            post_base = leg_df.loc[last_base_idx:]
-            if len(post_base) <= 1: return None, None
-            post_base = post_base.iloc[1:]
-            if direction == 'Bullish':
-                valid_legout = post_base[(post_base['Close'] > post_base['Open']) & (~post_base['Is_Base'])]
-            else:
-                valid_legout = post_base[(post_base['Close'] < post_base['Open']) & (~post_base['Is_Base'])]
-            if valid_legout.empty: return None, None
-        if direction == 'Bullish':
-            return zone_candles['High'].max(), zone_candles['Low'].min()
-        return zone_candles['Low'].min(), zone_candles['High'].max()
-    except Exception:
-        return None, None
-
-def simulate_intraday_execution(df_15m, activation_idx, entry_price, active_sl, initial_target, qty,
-                                direction, trading_window, cap_rr):
-    post_activation_df = df_15m.loc[activation_idx:]
-    if len(post_activation_df) <= 1: return None
-    tracking_df = post_activation_df.iloc[1:]
-    
-    activation_date = activation_idx.date()
-    tracking_df_entry = tracking_df[tracking_df.index.date == activation_date]
-    entry_time, open_px = None, None
-    current_target = initial_target
-    target_hit_before_entry = False
-    new_swing_target_formed = None
-    risk_dist = round(abs(entry_price - active_sl), 2)
-
-    for i, (idx, row) in enumerate(tracking_df_entry.iterrows()):
-        if direction == 'Bullish' and row['Low'] <= active_sl:
-            return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
-        if direction == 'Bearish' and row['High'] >= active_sl:
-            return {"Entry Date": "-", "Outcome": "Gap SL Void", "P&L (₹)": 0.0, "Exit Price": "-"}
-        in_window = True
-        if trading_window == "09:45 - 13:30":
-            in_window = WINDOW_START <= idx.time() < WINDOW_END
-        fills = in_window and ((direction == 'Bullish' and row['Low'] <= entry_price) or
-                               (direction == 'Bearish' and row['High'] >= entry_price))
-        if direction == 'Bullish':
-            if row['High'] >= current_target: target_hit_before_entry = True
-        else:
-            if row['Low'] <= current_target: target_hit_before_entry = True
-
-        history_window = df_15m.loc[:idx]
-        if len(history_window) >= (2 * SWING_N + 1):
-            check_idx = len(history_window) - 1 - SWING_N
-            highs_sub = history_window['High'].to_numpy()
-            lows_sub = history_window['Low'].to_numpy()
-            if direction == 'Bullish':
-                h_candidate = highs_sub[check_idx]
-                if (h_candidate > highs_sub[check_idx - SWING_N:check_idx].max() and 
-                    h_candidate > highs_sub[check_idx + 1:check_idx + SWING_N + 1].max()):
-                    if (h_candidate - entry_price) >= (MIN_RR * risk_dist):
-                        new_swing_target_formed = float(h_candidate)
-            else:
-                l_candidate = lows_sub[check_idx]
-                if (l_candidate < lows_sub[check_idx - SWING_N:check_idx].min() and 
-                    l_candidate < lows_sub[check_idx + 1:check_idx + SWING_N + 1].min()):
-                    if (entry_price - l_candidate) >= (MIN_RR * risk_dist):
-                        new_swing_target_formed = float(l_candidate)
-
-        if fills:
-            if target_hit_before_entry:
-                if new_swing_target_formed is not None: current_target = new_swing_target_formed
-                else: return {"Entry Date": "-", "Outcome": "Target Missed", "P&L (₹)": 0.0, "Exit Price": "-"}
-            elif new_swing_target_formed is not None:
-                current_target = new_swing_target_formed
-            entry_time, open_px = idx, row['Open']
-            break
-
-    if entry_time is None:
-        return {"Entry Date": "-", "Outcome": "No Entry", "P&L (₹)": 0.0, "Exit Price": "-"}
-
-    if direction == 'Bullish': actual_entry = round(open_px if open_px < entry_price else entry_price, 2)
-    else: actual_entry = round(open_px if open_px > entry_price else entry_price, 2)
-
-    cap_map = {"1:1.5": 1.5, "1:2": 2.0, "1:3": 3.0}
-    if direction == 'Bullish':
-        target_dist = round(current_target - entry_price, 2)
-        if cap_rr in cap_map and risk_dist > 0:
-            max_r = cap_map[cap_rr]
-            if (target_dist / risk_dist) > max_r:
-                target_dist = round(max_r * risk_dist, 2)
-                current_target = round(entry_price + target_dist, 2)
-    else:
-        target_dist = round(entry_price - current_target, 2)
-        if cap_rr in cap_map and risk_dist > 0:
-            max_r = cap_map[cap_rr]
-            if (target_dist / risk_dist) > max_r:
-                target_dist = round(max_r * risk_dist, 2)
-                current_target = round(entry_price - target_dist, 2)
-
-    actual_rr = round(target_dist / risk_dist, 1) if risk_dist > 0 else 0
-    end_of_day = entry_time.replace(hour=23, minute=59, second=59)
-    day_df = df_15m.loc[entry_time:end_of_day]
-    outcome = "Time Square Off"
-    exit_price = day_df['Close'].iloc[-1]
-
-    for n, (idx, row) in enumerate(day_df.iterrows()):
-        can_target = n > 0
-        if direction == 'Bullish':
-            if row['Low'] <= active_sl:
-                outcome, exit_price = "SL Hit", active_sl
-                break
-            elif can_target and row['High'] >= current_target:
-                outcome, exit_price = "Target Hit", current_target
-                break
-        else:
-            if row['High'] >= active_sl:
-                outcome, exit_price = "SL Hit", active_sl
-                break
-            elif can_target and row['Low'] <= current_target:
-                outcome, exit_price = "Target Hit", current_target
-                break
-
-    current_time = datetime.now(ist)
-    is_today = entry_time.date() == current_time.date()
-    if is_today and (current_time.hour < 15 or (current_time.hour == 15 and current_time.minute < 30)):
-        if outcome == "Time Square Off": outcome = "Running (Live)"
-
-    pnl = round(qty * (exit_price - actual_entry), 2) if direction == 'Bullish' else round(qty * (actual_entry - exit_price), 2)
-    return {
-        "Entry Date": entry_time.strftime('%Y-%m-%d %H:%M'),
-        "Target": current_target, "Target RR": f"1:{actual_rr}",
-        "Outcome": outcome, "Exit Price": round(exit_price, 2), "P&L (₹)": pnl
-    }
-
-def build_setup(ticker, direction, sweep_time_15m, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position=ZONE_NEAREST):
-    bullish = direction == 'Bullish'
-    past_75m = df_75m[df_75m.index <= sweep_time_15m]
-    if past_75m.empty: return None
-    sweep_75m_dt = past_75m.index[-1]
-    mss_idx, mss_val = get_nearest_untested_75m_swing(df_75m, sweep_75m_dt, 'high' if bullish else 'low')
-    if mss_idx is None: return None
-    activation_idx = find_activation(df_15m, sweep_time_15m, mss_val, direction)
-    if activation_idx is None: return None
-    proximal, distal = find_sd_zone(df_15m, sweep_time_15m, activation_idx, mss_val, direction, zone_method, zone_position)
-    if not proximal or not distal: return None
-    entry_price = round(proximal, 2)
-    active_sl = round(distal * (SL_PAD_BULL if bullish else SL_PAD_BEAR), 2)
-    target_val = get_untested_15m_swing_target(df_15m, activation_idx, entry_price, direction, active_sl)
-    if target_val is None: return None
-    active_target = round(target_val, 2)
-    risk_dist = round(abs(entry_price - active_sl), 2)
-    target_dist = round(active_target - entry_price, 2) if bullish else round(entry_price - active_target, 2)
-    cap_map = {"1:1.5": 1.5, "1:2": 2.0, "1:3": 3.0}
-    if cap_rr in cap_map and risk_dist > 0:
-        max_r = cap_map[cap_rr]
-        if (target_dist / risk_dist) > max_r:
-            target_dist = round(max_r * risk_dist, 2)
-            active_target = round(entry_price + target_dist, 2) if bullish else round(entry_price - target_dist, 2)
-    if risk_dist <= 0 or target_dist < (MIN_RR * risk_dist): return None
-    qty = int(risk_amt / risk_dist)
-    if qty <= 0: return None
-    return {
-        "Stock": ticker.replace('.NS', ''), "Type": direction, "Sweep Time": sweep_time_15m,
-        "Activation Time": activation_idx, "MSS Line": mss_val, "Entry": entry_price, "SL": active_sl,
-        "Target": active_target, "Target RR": f"1:{round(target_dist / risk_dist, 1)}", "Qty": qty
-    }
-
-# --- OPTIMIZED EVALUATOR ---
-# This version accepts PRE-CALCULATED data to avoid doing it 128 redundant times per stock
-def evaluate_preloaded(ticker, df_15m, df_75m, weekly_hist, start_date_val, end_date_val, risk_amt, zone_method, app_mode,
-                       trading_window, cap_rr, sweep_exhaustion_mode, zone_position):
-    raw_setups = []
-    internal_start = start_date_val - timedelta(days=10) if app_mode == "Today's Live Trades" else start_date_val - timedelta(days=20)
-    
-    scan_bars_15m = df_15m[(df_15m.index >= pd.Timestamp(internal_start)) & 
-                           (df_15m.index <= pd.Timestamp(end_date_val) + pd.Timedelta(days=1))]
-
-    exhausted_pwl_monday, exhausted_pwh_monday = None, None
-    enforce_exhaustion = (sweep_exhaustion_mode == MODE_SINGLE_SWEEP)
-
-    for sweep_time_15m, sweep_row in scan_bars_15m.iterrows():
-        if sweep_time_15m.time() == time(9, 15): continue
-        current_monday = (sweep_time_15m.normalize() - pd.Timedelta(days=sweep_time_15m.weekday())).replace(hour=0, minute=0, second=0)
-        past_weekly = weekly_hist.loc[weekly_hist.index < current_monday]
-        if past_weekly.empty: continue
-        pwl, pwh = past_weekly['Low'].iloc[-1], past_weekly['High'].iloc[-1]
-        setup = None
-        
-        if sweep_row['Low'] <= pwl:
-            if not enforce_exhaustion or current_monday != exhausted_pwl_monday:
-                if enforce_exhaustion: exhausted_pwl_monday = current_monday  
-                setup = build_setup(ticker, 'Bullish', sweep_time_15m, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
-        if setup is None and sweep_row['High'] >= pwh:
-            if not enforce_exhaustion or current_monday != exhausted_pwh_monday:
-                if enforce_exhaustion: exhausted_pwh_monday = current_monday  
-                setup = build_setup(ticker, 'Bearish', sweep_time_15m, df_15m, df_75m, zone_method, risk_amt, cap_rr, zone_position)
-
-        if setup is not None: raw_setups.append(setup)
-
-    deduped_setups = {}
-    for s in raw_setups:
-        key = (s['Stock'], s['Type'], s['Activation Time'])
-        if key not in deduped_setups or s['Sweep Time'] > deduped_setups[key]['Sweep Time']:
-            deduped_setups[key] = s
-
-    temp_setups = []
-    today_str = datetime.now(ist).strftime('%Y-%m-%d')
-    for s in deduped_setups.values():
-        exec_data = simulate_intraday_execution(df_15m, s['Activation Time'], s['Entry'], s['SL'], s['Target'],
-                                                s['Qty'], s['Type'], trading_window, cap_rr)
-        if not exec_data: continue
-        s.update(exec_data)
-        s['Sweep Time'] = s['Sweep Time'].strftime('%Y-%m-%d %H:%M') if isinstance(s['Sweep Time'], (pd.Timestamp, datetime)) else str(s['Sweep Time'])
-        s['Activation Time'] = s['Activation Time'].strftime('%Y-%m-%d %H:%M') if isinstance(s['Activation Time'], (pd.Timestamp, datetime)) else str(s['Activation Time'])
-
-        entry_date_str = exec_data.get("Entry Date", "-")
-        outcome = exec_data.get("Outcome", "")
-
-        if app_mode == "Today's Live Trades":
-            if entry_date_str.startswith(today_str): temp_setups.append(s)
-            elif outcome == "No Entry" and s['Activation Time'].startswith(today_str):
-                s["Outcome"] = "Pending Entry"
-                temp_setups.append(s)
-        else:
-            if entry_date_str != "-" and outcome != "Gap SL Void":
-                try:
-                    entry_date_obj = datetime.strptime(entry_date_str, '%Y-%m-%d %H:%M').date()
-                    if start_date_val <= entry_date_obj <= end_date_val: temp_setups.append(s)
-                except ValueError: pass
-
-    def _order(s):
-        executed = s.get("Entry Date", "-") != "-"
-        return (0 if executed else 1, s["Entry Date"] if executed else s["Activation Time"])
-
-    final_setups, daily_tracker = [], set()
-    for s in sorted(temp_setups, key=_order):
-        day_str = (s["Entry Date"] if s["Entry Date"] != "-" else s["Activation Time"]).split()[0]
-        dedup_key = (s['Stock'], day_str)
-        if dedup_key not in daily_tracker:
-            daily_tracker.add(dedup_key)
-            final_setups.append(s)
-
-    return final_setups
-
-# Original evaluator wrapper for normal mode
-def evaluate_ticker(ticker, start_date_val, end_date_val, risk_amt, zone_method, app_mode, trading_window, cap_rr, sweep_exhaustion_mode, zone_position):
-    df_15m = fetch_market_data(ticker, "60d", "15m")
-    daily_htf = fetch_market_data(ticker, "1y", "1d")
-    if df_15m.empty or daily_htf.empty: return []
-    df_75m = build_75m_candles(df_15m)
-    if df_75m.empty: return []
-    weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High': 'max', 'Low': 'min'}).dropna()
-    return evaluate_preloaded(ticker, df_15m, df_75m, weekly_hist, start_date_val, end_date_val, risk_amt, zone_method, app_mode, trading_window, cap_rr, sweep_exhaustion_mode, zone_position)
+            ph = lock['ph']
+            if ph == 'E':
+                z = S['z']
+                if B[k][1] < z['b']: ph = 'C'; S['xt'] = T[k]
+                elif B[k][3] <= z['t']:
+                    S['en'] = z['t']; S['sl'] = z['b']; S['tp'] = round(mx, 2); S['tr'] = T[k]
+                    S['rr'] = round((mx - z['t']) / (z['t'] - z['b']), 2) if z['t'] > z['b'] else None
+                    if B[k][3] <= z['b']: ph = 'L'; S['xt'] = T[k]
+                    else: ph = 'O'
+                elif c < z['b']: ph = 'C'; S['xt'] = T[k]
+                else: mx = max(mx, B[k][2])
+            elif ph == 'O':
+                if B[k][3] <= S['sl']: ph = 'L'; S['xt'] = T[k]
+                elif B[k][2] >= S['tp']: ph = 'T'; S['xt'] = T[k]
+            lock['ph'] = ph; st_ = ph; mxa = max(mxa, B[k][2])
+        if T[k][:10] != day: continue
+        if st_ == '0' and not seen: continue
+        ent.append(dict(slot=end15(T[k]), st=st_, c=c, S=dict(S) if S else None))
+    return ent if any(e['st'] != '0' for e in ent) else None
 
 
-# --- UI EXECUTION ---
-st.write("Executing 7-Rule ICT Framework with 15m Sweeps (No 9:15) and Dynamic Target Tracking.")
-app_mode = st.radio("Operating Mode", ["Today's Live Trades", "Backtester", "Grid Search Optimizer"], horizontal=True)
+# ---------------------------------------------------------------- page
+st.set_page_config(page_title='Weekly Sweep latest (W-75-15)', layout='wide')
+st.title('Weekly Sweep latest (W-75-15)')
+st.caption('Weekly liquidity sweep (PWL / WSL) → 75-min MSS → 15 / 5-min demand zone near the MSS line. Yahoo Finance data, study only.')
+with st.expander('Rules'):
+    st.markdown(__doc__.split('Run:')[0].replace('\n', '  \n'))
 
-if app_mode == "Grid Search Optimizer":
-    st.warning("⚡ **Turbo Optimizer Mode Active:** Data is pre-fetched into memory to evaluate all 128 combinations at maximum speed.")
-    r1c1, r1c2, r1c3 = st.columns(3)
-    with r1c1: start_date = st.date_input("Entry Start Date", datetime(2026, 8, 1).date())
-    with r1c2: end_date = st.date_input("Entry End Date", datetime.now(ist).date())
-    with r1c3: universe_selection = st.selectbox("Stock Universe", ["Nifty 200", "Nifty 500"])
-    
-    if st.button("🔍 Find Optimal Settings", type="primary"):
-        import itertools
-        grid = {
-            "zone_method": ["Standard (Base Only)", "Strict (Base + Leg-Out)"],
-            "trading_window": ["Full Day (09:15 - 15:30)", "09:45 - 13:30"],
-            "cap_rr": ["No", "1:1.5", "1:2", "1:3"],
-            "sweep_exhaustion": [MODE_SINGLE_SWEEP, MODE_MULTI_SWEEP],
-            "zone_pos": [ZONE_NEAREST, ZONE_STRICT]
-        }
-        
-        keys = grid.keys()
-        combinations = list(itertools.product(*grid.values()))
-        tickers = get_stock_symbols(universe_selection)
-        
-        progress_text = st.empty()
-        progress_bar = st.progress(0)
-        
-        # --- PRE-FETCHING & CACHING LOGIC ---
-        progress_text.text("Pre-calculating 75m and Weekly data for all stocks (Only happens once!)...")
-        data_cache = {}
-        
-        def prepare_data(t):
-            df_15m = fetch_market_data(t, "60d", "15m")
-            daily_htf = fetch_market_data(t, "1y", "1d")
-            if not df_15m.empty and not daily_htf.empty:
-                df_75m = build_75m_candles(df_15m)
-                weekly_hist = daily_htf.resample('W-MON', closed='left', label='left').agg({'High': 'max', 'Low': 'min'}).dropna()
-                return t, df_15m, df_75m, weekly_hist
-            return t, None, None, None
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_ticker = {executor.submit(prepare_data, t): t for t in tickers}
-            completed_fetch = 0
-            for future in concurrent.futures.as_completed(future_to_ticker):
-                t, d15, d75, w_hist = future.result()
-                if d15 is not None:
-                    data_cache[t] = {"15m": d15, "75m": d75, "weekly": w_hist}
-                completed_fetch += 1
-                progress_bar.progress(completed_fetch / len(tickers))
-
-        results_data = []
-        risk_amt = 1000 
-        
-        for idx, combo in enumerate(combinations):
-            params = dict(zip(keys, combo))
-            progress_text.text(f"Evaluating combination {idx+1}/128: {params['cap_rr']} RR | {params['sweep_exhaustion']}...")
-            
-            all_setups = []
-            
-            # Use the pre-loaded cache instantly for each combination
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                futures = []
-                for t, d in data_cache.items():
-                    futures.append(executor.submit(
-                        evaluate_preloaded, t, d["15m"], d["75m"], d["weekly"], 
-                        start_date, end_date, risk_amt, 
-                        params["zone_method"], "Grid Search Optimizer", 
-                        params["trading_window"], params["cap_rr"], 
-                        params["sweep_exhaustion"], params["zone_pos"]
-                    ))
-                
-                for f in concurrent.futures.as_completed(futures):
-                    try:
-                        res = f.result()
-                        if res: all_setups.extend(res)
-                    except Exception:
-                        pass
-            
-            if all_setups:
-                df_setups = pd.DataFrame(all_setups)
-                completed = df_setups[df_setups['Outcome'].isin(["Target Hit", "SL Hit", "Time Square Off"])]
-                total_trades = len(completed)
-                
-                if total_trades > 0:
-                    wins = int((completed['P&L (₹)'] > 0).sum())
-                    win_rate = (wins / total_trades) * 100
-                    net_pnl = completed['P&L (₹)'].sum()
-                else:
-                    win_rate, net_pnl = 0.0, 0.0
-            else:
-                total_trades, win_rate, net_pnl = 0, 0.0, 0.0
-                
-            results_data.append({
-                "Zone Method": params["zone_method"],
-                "Entry Window": params["trading_window"],
-                "Cap RR": params["cap_rr"],
-                "Sweep Mode": params["sweep_exhaustion"],
-                "Zone Position": params["zone_pos"],
-                "Total Trades": total_trades,
-                "Win Rate (%)": round(win_rate, 2),
-                "Net P&L (₹)": round(net_pnl, 2)
-            })
-            
-            progress_bar.progress((idx + 1) / len(combinations))
-        
-        progress_text.text("Optimization Complete! Top configurations sorted by Win Rate:")
-        df_results = pd.DataFrame(results_data)
-        df_filtered = df_results[df_results["Total Trades"] >= 5]
-        if df_filtered.empty: df_filtered = df_results
-        df_sorted = df_filtered.sort_values(by=["Win Rate (%)", "Net P&L (₹)"], ascending=[False, False])
-        
-        st.success(f"Best Configuration Found: {df_sorted['Win Rate (%)'].iloc[0]}% Win Rate")
-        st.dataframe(df_sorted, use_container_width=True, hide_index=True)
+now = dt.datetime.now(IST)
+c1, c2, c3 = st.columns([1, 1, 1])
+bucket = int(time.time() // 600) * 600                 # data shared by all visitors, renewed every 10 minutes
+if c3.button('🔄 Refresh data'): st.session_state['stamp'] = time.time()
+stamp = max(bucket, st.session_state.get('stamp', 0))
+universe = st.sidebar.text_area('Stocks (NSE symbols)', ' '.join(SYMS), height=150).split()
 
 
-elif app_mode == "Backtester":
-    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-    today = datetime.now(ist).date()
-    with r1c1: start_date = st.date_input("Entry Start Date", today - timedelta(days=5))
-    with r1c2: end_date = st.date_input("Entry End Date", today)
-    with r1c3: universe_selection = st.selectbox("Stock Universe", ["Nifty 200", "Nifty 500"])
-    with r1c4: zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
+@st.cache_data(ttl=600, show_spinner=False)
+def load_all(syms, stamp):
+    with cf.ThreadPoolExecutor(12) as ex: res = list(ex.map(lambda s: (s, load(s, stamp)), syms))
+    return {s: v for s, v in res if v and len(v[1]) >= 60}
 
-    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
-    with r2c1: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
-    with r2c2: trading_window = st.selectbox("Entry Window", ["Full Day (09:15 - 15:30)", "09:45 - 13:30"])
-    with r2c3: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
-    with r2c4: sweep_exhaustion_mode = st.selectbox("Weekly Liquidity Mode", [MODE_SINGLE_SWEEP, MODE_MULTI_SWEEP])
 
+with st.spinner(f'Fetching {len(universe)} stocks from Yahoo (about a minute)…'):
+    DATA = load_all(tuple(universe), stamp)
+days = sorted({b[0][:10] for v in DATA.values() for b in v[1]})
+if not days: st.error('No data from Yahoo right now. Try Refresh.'); st.stop()
+day = c1.selectbox('Date', days[::-1], index=0)
+today = now.strftime('%Y-%m-%d')
+slots = [f'{h:02d}:{m:02d}' for h in range(9, 16) for m in (0, 15, 30, 45) if '09:30' <= f'{h:02d}:{m:02d}' <= '15:30']
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def compute(day, stamp, n):
+    out = {}
+    for s, (DB, B, B5) in DATA.items():
+        try: e = run(DB, B, B5, day, today)
+        except Exception: e = None
+        if e: out[s] = e
+    return out
+
+
+with st.spinner('Running the W-75-15 rules…'):
+    R = compute(day, stamp, len(DATA))
+last_slot = max((e['slot'] for v in R.values() for e in v), default='15:30')
+okslots = [x for x in slots if x <= last_slot] or slots
+slot = c2.selectbox('Time', okslots[::-1], index=0)
+
+rows = []
+for s, ent in R.items():
+    e = None
+    for x in ent:
+        if x['slot'] <= slot: e = x
+    if not e or e['st'] == '0': continue
+    S = e['S'] or {}; z = S.get('z') or {}; st_ = e['st']
+    trade = st_ in 'OTL'
+    pl = None
+    if st_ == 'T': pl = (S['tp'] / S['en'] - 1) * 100
+    elif st_ == 'L': pl = (S['sl'] / S['en'] - 1) * 100
+    elif st_ == 'O': pl = (e['c'] / S['en'] - 1) * 100
+    rows.append({'Stock': s, 'Status': SN[st_], 'Liquidity': S.get('k'), 'Level swept': ' / '.join(str(x) for x in S.get('lv', [])),
+                 'Sweep low': S.get('lo'), 'Sweep time': S.get('sl_t'), 'MSS line': S.get('line'), 'Line time': S.get('lt'),
+                 'MSS 75m candle': S.get('mss') if st_ != 'W' else None,
+                 'Zone TF': z.get('tf') if st_ != 'W' else None, 'Zone': f"{z['b']} – {z['t']}" if z and st_ != 'W' else None,
+                 'Zone vs line %': z.get('d') if st_ != 'W' else None,
+                 'Entry': S.get('en') if trade else (z.get('t') if z and st_ != 'W' else None),
+                 'SL': S.get('sl') if trade else (z.get('b') if z and st_ != 'W' else None),
+                 'Target': S.get('tp') if trade else None, 'R:R': S.get('rr') if trade else None,
+                 'Entered': S.get('tr') if trade else None, 'Exit': S.get('xt') if st_ in 'TLC' else None,
+                 'CMP': e['c'], 'P/L %': round(pl, 2) if pl is not None else None, '_st': st_, '_S': S})
+df = pd.DataFrame(rows)
+cnt = collections.Counter(r['_st'] for r in rows)
+m = st.columns(7)
+for col, k in zip(m, 'EOTLWNC'): col.metric(SN[k], cnt.get(k, 0))
+
+f1, f2, f3, f4, f5 = st.columns(5)
+stat = f1.multiselect('Status', list(SN.values()), default=['Waiting entry', 'Open'])
+liq = f2.selectbox('Liquidity', ['Any', 'PWL', 'WSL', 'Both'])
+ztf = f3.selectbox('Zone TF', ['15 or 5 min', '15m', '5m'])
+band = f4.selectbox('Zone vs MSS line', ['±2%', '±1%', '±0.5%'])
+q = f5.text_input('Stock search').strip().upper()
+if not df.empty:
+    bd = float(band.strip('±%'))
+    df.loc[(df['_st'] != 'W') & df['Zone vs line %'].notna() & (df['Zone vs line %'].abs() > bd), 'Status'] = 'No zone'
+    v = df[df['Status'].isin(stat)] if stat else df
+    if liq == 'Both': v = v[v['Liquidity'].fillna('').str.contains(r'\+')]
+    elif liq != 'Any': v = v[v['Liquidity'].fillna('').str.contains(liq)]
+    if ztf != '15 or 5 min': v = v[v['Zone TF'] == ztf]
+    if q: v = v[v['Stock'].str.contains(q, regex=False)]
+    order = {'Open': 0, 'Waiting entry': 1, 'Target hit': 2, 'SL hit': 3, 'Cancelled': 4, 'No zone': 5, 'Waiting MSS': 6}
+    v = v.assign(_o=v['Status'].map(order)).sort_values(['_o', 'Stock'])
+    st.caption(f'{day} {slot} – candles completed by this time only · {len(v)} rows · data fetched {dt.datetime.fromtimestamp(stamp, IST):%d %b %H:%M} IST')
+    st.dataframe(v.drop(columns=['_st', '_S', '_o']), hide_index=True, width='stretch')
+
+    pick = st.selectbox('Chart', ['–'] + list(v['Stock']))
+    if pick != '–':
+        r = v[v['Stock'] == pick].iloc[0]; S = r['_S']; DB, B, B5 = DATA[pick]
+        ws = dt.date.fromisoformat(day) - dt.timedelta(days=dt.date.fromisoformat(day).weekday()); ps = (ws - dt.timedelta(days=7)).isoformat()
+        cut = day + ' ' + (pd.Timestamp(day + ' ' + slot) - pd.Timedelta(minutes=15)).strftime('%H:%M')
+        b = [x for x in B if ps <= x[0] <= cut]
+        fig = go.Figure(go.Candlestick(x=list(range(len(b))), open=[x[1] for x in b], high=[x[2] for x in b], low=[x[3] for x in b], close=[x[4] for x in b],
+                                       text=[x[0] for x in b], hoverinfo='text+y'))
+        for y in S.get('lv', []): fig.add_hline(y=y, line_dash='dot', line_color='crimson', annotation_text=f'Swept {y}')
+        if S.get('line'): fig.add_hline(y=S['line'], line_dash='dash', line_color='royalblue', annotation_text=f"MSS line {S['line']}")
+        z = S.get('z')
+        if z and r['_st'] != 'W': fig.add_hrect(y0=z['b'], y1=z['t'], fillcolor='green', opacity=0.15, line_width=0, annotation_text='DZ ' + z['tf'])
+        if S.get('tp') and r['_st'] in 'OTL':
+            fig.add_hline(y=S['tp'], line_color='green', annotation_text=f"Target {S['tp']}")
+            fig.add_hline(y=S['sl'], line_dash='dash', line_color='crimson', annotation_text=f"SL {S['sl']}")
+        tv = [i for i, x in enumerate(b) if x[0].endswith('09:15')]
+        fig.update_layout(height=480, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10), title=f'{pick} – {r["Status"]}',
+                          xaxis=dict(tickvals=tv, ticktext=[b[i][0][5:10] for i in tv]))
+        st.plotly_chart(fig, width='stretch')
 else:
-    r1c1, r1c2, r1c3 = st.columns(3)
-    today = datetime.now(ist).date()
-    start_date, end_date = today, today
-    with r1c1: universe_selection = st.selectbox("Stock Universe", ["Nifty 200", "Nifty 500"])
-    with r1c2: zone_method = st.selectbox("Zone Identification", ["Standard (Base Only)", "Strict (Base + Leg-Out)"])
-    with r1c3: risk_amt = st.number_input("Risk Per Trade (₹)", value=1000, step=100)
-
-    r2c1, r2c2, r2c3 = st.columns(3)
-    with r2c1: trading_window = st.selectbox("Entry Window", ["Full Day (09:15 - 15:30)", "09:45 - 13:30"])
-    with r2c2: cap_rr = st.selectbox("Cap RR?", ["No", "1:1.5", "1:2", "1:3"])
-    with r2c3: sweep_exhaustion_mode = st.selectbox("Weekly Liquidity Mode", [MODE_SINGLE_SWEEP, MODE_MULTI_SWEEP])
-
-if app_mode != "Grid Search Optimizer":
-    zone_position = st.selectbox(
-        "15m Zone Condition vs MSS Line",
-        [ZONE_NEAREST, ZONE_STRICT],
-        help="Nearest: base candles closest to MSS line. Strictly below/above: Demand strictly below MSS / Supply strictly above MSS."
-    )
-
-    if st.button("🚀 Execute Scan", type="primary"):
-        with st.spinner(f"Scanning {universe_selection} across {app_mode}..."):
-            tickers = get_stock_symbols(universe_selection)
-            all_setups = []
-            progress_bar = st.progress(0)
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                futures = {executor.submit(evaluate_ticker, t, start_date, end_date, risk_amt, zone_method,
-                                           app_mode, trading_window, cap_rr, sweep_exhaustion_mode, zone_position): t for t in tickers}
-                completed = 0
-                for f in concurrent.futures.as_completed(futures):
-                    try:
-                        res = f.result()
-                    except Exception:
-                        res = []
-                    if res:
-                        all_setups.extend(res)
-                    completed += 1
-                    progress_bar.progress(completed / len(tickers))
-
-            progress_bar.empty()
-
-            if all_setups:
-                df = pd.DataFrame(all_setups)
-                cols_order = ["Stock", "Type", "Sweep Time", "Activation Time", "MSS Line", "Entry Date", "Entry",
-                              "SL", "Target", "Target RR", "Qty", "Outcome", "Exit Price", "P&L (₹)"]
-
-                df_bull = df[df['Type'] == 'Bullish'].copy()
-                df_bear = df[df['Type'] == 'Bearish'].copy()
-
-                if not df_bull.empty:
-                    df_bull = df_bull[[c for c in cols_order if c in df_bull.columns]]
-                    df_bull = df_bull.sort_values(by="Entry Date", ascending=True)
-                if not df_bear.empty:
-                    df_bear = df_bear[[c for c in cols_order if c in df_bear.columns]]
-                    df_bear = df_bear.sort_values(by="Entry Date", ascending=True)
-
-                tab1, tab2 = st.tabs(["🟢 Bullish Setups", "🔴 Bearish Setups"])
-
-                def render_tab(df_sub):
-                    if df_sub.empty:
-                        st.info("No triggered trades in this category.")
-                        return
-
-                    completed_trades = df_sub[df_sub['Outcome'].isin(["Target Hit", "SL Hit", "Time Square Off", "Running (Live)"])]
-                    wins = int((completed_trades['P&L (₹)'] > 0).sum())
-                    losses = int((completed_trades['P&L (₹)'] < 0).sum())
-                    total = len(completed_trades)
-                    win_rate = (wins / total) * 100 if total > 0 else 0
-                    total_pnl = completed_trades['P&L (₹)'].sum()
-
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Active / Completed Trades", total)
-                    m2.metric("Winners", wins)
-                    m3.metric("Losers", losses)
-                    m4.metric("Win Rate", f"{win_rate:.1f}%")
-                    m5.metric("Net Profit / Loss", f"₹ {total_pnl:,.2f}")
-
-                    st.dataframe(df_sub, use_container_width=True, hide_index=True)
-
-                with tab1: render_tab(df_bull)
-                with tab2: render_tab(df_bear)
-            else:
-                st.warning("No setups met all conditions for the selected mode.")
+    st.info('No stock has a weekly sweep at this time.')
