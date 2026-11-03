@@ -125,19 +125,15 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
             
             if pct_move < 7.0: continue
             
-            # --- STOP LOSS TOGGLE CONTROLS ---
             sl_pct = (proximal_line - distal_line) / proximal_line
             
-            # Max 2% Shift
             if apply_max_sl and sl_pct > 0.02:
                 proximal_line = distal_line / 0.98
                 sl_pct = 0.02
                 
-            # Min 1.5% Filter
             if apply_min_sl and sl_pct < 0.015:
                 continue
                 
-            # Recalculate Risk Management values
             sl_points = proximal_line - distal_line
             target_price = proximal_line + (2 * sl_points)
             
@@ -180,6 +176,7 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                         pnl_rs = (qty * (target_price - proximal_line)) if risk_amount else 0.0
                         exit_date = df.index[j].date()
                         break
+                    # Executes exactly on Day 0 if max_hold_days is 0 (Same Day Exit)
                     elif max_hold_days is not None and days_in_trade >= max_hold_days:
                         if day_close >= proximal_line:
                             outcome = "Time Exit (Win)"
@@ -266,6 +263,7 @@ if mode == "Historical Backtest":
     
     time_exit_mapping = {
         "No Time Limit": None,
+        "Same Day Exit (Intraday)": 0,
         "1 Trading Day (Next Day)": 1,
         "2 Trading Days (Day After Tomorrow)": 2,
         "3 Trading Days": 3,
@@ -276,7 +274,7 @@ if mode == "Historical Backtest":
     time_exit_selection = st.sidebar.selectbox(
         "Max Hold Duration (Time Exit):",
         list(time_exit_mapping.keys()),
-        index=2,
+        index=3, # Defaults to "2 Trading Days"
         help="Closes the trade at EOD running P&L if SL/Target are not met within this timeframe."
     )
     max_hold_days = time_exit_mapping[time_exit_selection]
