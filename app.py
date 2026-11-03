@@ -14,50 +14,30 @@ Data: Yahoo Finance (daily 2 years, 15-min and 5-min last 60 days). For study, n
 
 Run:  pip install streamlit pandas plotly   then   streamlit run app.py
 """
-import json, time, datetime as dt, collections, urllib.parse, urllib.request, concurrent.futures as cf
+import json, time, datetime as dt, collections, urllib.parse, urllib.request, concurrent.futures as cf, io
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
 BAND = 0.02
-UA = {"User-Agent": "Mozilla/5.0"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
-SYMS = """360ONE AADHARHFC AARTIIND AAVAS ABB ABBOTINDIA ABCAPITAL ABDL ABREL ABSLAMC ACC ACE ACMESOLAR ACUTAAS ADANIENSOL ADANIENT
-ADANIGREEN ADANIPORTS ADANIPOWER AEGISLOG AEGISVOPAK AETHER AFCONS AFFLE AIAENG AIIL AJANTPHARM ALKEM AMBER AMBUJACEM ANANDRATHI
-ANANTRAJ ANGELONE ANTHEM ANURAS APARINDS APLAPOLLO APOLLOHOSP APOLLOTYRE APTUS ARE&M ASAHIINDIA ASHOKLEY ASIANPAINT ASTERDM ASTRAL
-ATGL ATHERENERG ATUL AUBANK AUROPHARMA AVANTIFEED AWL AXISBANK AZAD BAJAJ-AUTO BAJAJFINSV BAJAJHFL BAJAJHLDNG BAJFINANCE
-BALKRISIND BALRAMCHIN BANDHANBNK BANKBARODA BANKINDIA BATAINDIA BBOX BDL BEL BELRISE BEML BERGEPAINT BHARATCOAL BHARATFORG BHARTIARTL
-BHARTIHEXA BHEL BIOCON BIRET BLS BLUESTARCO BOSCHLTD BPCL BRIGADE BRITANNIA BSE BSOFT CAMS CANBK CANFINHOME CANHLIFE CAPLIPOINT
-CARBORUNIV CARTRADE CASTROLIND CCL CDSL CEATLTD CEMPRO CENTRALBK CESC CGCL CGPOWER CHAMBLFERT CHENNPETRO CHOICEIN CHOLAFIN
-CHOLAHLDNG CIEINDIA CIPLA CLEAN CLEANMAX CMPDI COALINDIA COCHINSHIP COFORGE COHANCE COLPAL CONCOR CONCORDBIO COROMANDEL CPPLUS
-CRAFTSMAN CREDITACC CRISIL CROMPTON CUB CUMMINSIND CUPID CYIENT DABUR DALBHARAT DATAPATTNS DEEPAKFERT DEEPAKNTR DELHIVERY DEVYANI
-DIVISLAB DIXON DLF DMART DOMS DRREDDY ECLERX EICHERMOT EIDPARRY EIHOTEL ELECON ELGIEQUIP EMAMILTD EMBASSY EMCURE EMMVEE
-ENDURANCE ENGINERSIN ENRIN ESCORTS ETERNAL EXIDEIND FACT FEDERALBNK FINCABLES FIRSTCRY FIVESTAR FLUOROCHEM FORCEMOT FORTIS FRACTAL
-FSL GABRIEL GAIL GALLANTT GESHIP GICRE GILLETTE GLAND GLAXO GLENMARK GMDCLTD GMRAIRPORT GODFRYPHLP GODREJCP GODREJIND GODREJPROP
-GPIL GRANULES GRAPHITE GRASIM GRAVITA GROWW GRSE GVT&D HAL HAVELLS HBLENGINE HCLTECH HDBFS HDFCAMC HDFCBANK HDFCLIFE HEGAM
-HEROMOTOCO HEXT HFCL HINDALCO HINDCOPPER HINDPETRO HINDUNILVR HINDZINC HOMEFIRST HONASA HONAUT HSCL HUDCO HYUNDAI ICICIAMC ICICIBANK
-ICICIGI ICICILIFE IDBI IDEA IDFCFIRSTB IEX IFCI IGIL IGL IIFL IKS INDHOTEL INDIACEM INDIAMART INDIANB INDIGO INDUSINDBK INDUSTOWER
-INFY INOXINDIA INOXWIND INTELLECT IOB IOC IPCALAB IRB IRCON IRCTC IREDA IRFC ITC ITCHOTELS ITI J&KBANK JAINREC JBMA JINDALSAW
-JINDALSTEL JIOFIN JKCEMENT JKTYRE JMFINANCIL JPPOWER JSL JSWCEMENT JSWENERGY JSWINFRA JSWSTEEL JUBLFOOD JUBLINGREA JWL JYOTICNC
-KAJARIACER KALYANKJIL KARURVYSYA KAYNES KEC KEI KFINTECH KIMS KIRLOSBROS KIRLOSENG KOTAKBANK KPIL KPITTECH KPRMILL KSB LALPATHLAB
-LAURUSLABS LEMONTREE LENSKART LGEINDIA LICHSGFIN LICI LINDEINDIA LLOYDSME LODHA LT LTF LTFOODS LTM LTTS LUPIN M&M M&MFIN MAHABANK
-MANAPPURAM MANKIND MARICO MARUTI MAXHEALTH MAZDOCK MCX MEDANTA MEESHO MFSL MGL MINDACORP MMTC MOTHERSON MOTILALOFS MPHASIS MRF MRPL
-MSUMI MTARTECH MUTHOOTFIN NAM-INDIA NATCOPHARM NATIONALUM NAUKRI NAVA NAVINFLUOR NBCC NCC NESTLEIND NETWEB NEULANDLAB NH NHPC
-NIACL NLCINDIA NMDC NSLNISP NTPC NTPCGREEN NUVAMA NUVOCO NYKAA OBEROIRLTY OFSS OIL OLAELEC OLECTRA ONESOURCE ONGC PAGEIND PARADEEP
-PATANJALI PAYTM PCBL PERSISTENT PETRONET PFC PFOCUS PGEL PHOENIXLTD PIDILITIND PIIND PINELABS PIRAMALFIN PNB PNBHOUSING POLICYBZR
-POLYCAB POLYMED POONAWALLA POWERGRID POWERINDIA PPLPHARMA PREMIERENE PRESTIGE PRIVISCL PTCIL PVRINOX PWL RADICO RAILTEL RAINBOW
-RAMCOCEM RBLBANK RECLTD REDINGTON RELIANCE RHIM RITES RKFORGE RPOWER RRKABEL RUBICON RVNL SAGILITY SAIL SAILIFE SAMMAANCAP SANSERA
-SARDAEN SBICARD SBILIFE SBIN SCHAEFFLER SCHNEIDER SCI SHREECEM SHRIPISTON SHRIRAMFIN SHYAMMETL SIEMENS SIGNATURE SJVN SOBHA
-SOLARINDS SONACOMS SRF STARHEALTH STLTECH SUMICHEM SUNDARMFIN SUNPHARMA SUNTV SUPREMEIND SUZLON SWANCORP SWIGGY SYNGENE SYRMA TARIL
-TATACAP TATACHEM TATACOMM TATACONSUM TATAELXSI TATAINVEST TATAPOWER TATASTEEL TATATECH TBOTEK TCS TDPOWERSYS TECHM TECHNOE TEGA
-TEJASNET TENNIND THANGAMAYL THERMAX TIINDIA TIMKEN TITAGARH TITAN TMCV TMPV TORNTPHARM TORNTPOWER TRENT TRIDENT TRITURBINE TTML
-TVSMOTOR UBL UCOBANK UJJIVANSFB ULTRACEMCO UNIONBANK UNITDSPR UNOMINDA UPL URBANCO USHAMART UTIAMC VAML VBL VEDL VEDPOWER VIJAYA VISL
-VMM VOGL VOLTAS VTL WAAREEENER WELCORP WELSPUNLIV WHIRLPOOL WIPRO WOCKPHARMA YESBANK ZEEL ZENSARTECH ZENTEC ZFCVINDIA ZYDUSLIFE
-ZYDUSWELL""".split()
 SN = dict(W='Waiting MSS', N='No zone', E='Waiting entry', O='Open', T='Target hit', L='SL hit', C='Cancelled')
 
+# ---------------------------------------------------------------- data (Yahoo Finance & NSE)
+@st.cache_data(ttl=86400)
+def get_nifty500_symbols():
+    """Dynamically fetches the latest Nifty 500 index symbols from the official NSE website."""
+    try:
+        url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+        req = urllib.request.Request(url, headers=UA)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            df = pd.read_csv(io.BytesIO(r.read()))
+        return " ".join(df['Symbol'].tolist())
+    except Exception:
+        # Fallback list if the NSE network request fails
+        return "RELIANCE TCS HDFCBANK ICICIBANK BHARTIARTL SBIN INFY LICI ITC HINDUNILVR"
 
-# ---------------------------------------------------------------- data (Yahoo Finance)
 def _get(url):
     for k in range(3):
         try:
@@ -67,12 +47,10 @@ def _get(url):
             time.sleep(1 + 2 * k)
         except Exception: time.sleep(1 + 2 * k)
 
-
 def _yahoo(sym, iv, rng):
     j = _get(f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym + '.NS')}?interval={iv}&range={rng}")
     try: return j['chart']['result'][0]
     except Exception: return None
-
 
 def _daily(r):
     q = r['indicators']['quote'][0]; B = []
@@ -83,7 +61,6 @@ def _daily(r):
         if B and B[-1][0] == d: B[-1] = b
         else: B.append(b)
     return B
-
 
 def _intra(r, m, nowt):
     q = r['indicators']['quote'][0]; out = {}
@@ -96,14 +73,12 @@ def _intra(r, m, nowt):
         out[d] = (d.strftime('%Y-%m-%d %H:%M'), round(o, 2), round(max(o, h, l, c), 2), round(min(o, h, l, c), 2), round(c, 2))
     return [out[k] for k in sorted(out)]
 
-
 def load(sym, stamp):
     """daily, 15-min and 5-min candles for one stock (stamp = refresh key)."""
     nowt = dt.datetime.now(IST).replace(tzinfo=None)
     rd, r15, r5 = _yahoo(sym, '1d', '2y'), _yahoo(sym, '15m', '60d'), _yahoo(sym, '5m', '60d')
     if not rd or not r15: return None
     return _daily(rd), _intra(r15, 15, nowt), (_intra(r5, 5, nowt) if r5 else [])
-
 
 # ---------------------------------------------------------------- engine (same as w75.py)
 def hq_dzones(B, a, b):
@@ -122,11 +97,9 @@ def hq_dzones(B, a, b):
             Z.append((lo, round(zb, 2), round(zt, 2), B[i][0], k)); break
     return Z
 
-
 wkey = lambda d: dt.date.fromisoformat(d).isocalendar()[:2]
 end15 = lambda t: (pd.Timestamp(t) + pd.Timedelta(minutes=15)).strftime('%H:%M')
 end_t = lambda t: (pd.Timestamp(t) + pd.Timedelta(minutes=15)).strftime('%Y-%m-%d %H:%M')
-
 
 def run(DB, B, B5, day, today):
     """state of the W-75-15 setup for every 15-min slot of `day` -> (entries, setup facts)"""
@@ -216,7 +189,6 @@ def run(DB, B, B5, day, today):
         ent.append(dict(slot=end15(T[k]), st=st_, c=c, S=dict(S) if S else None))
     return ent if any(e['st'] != '0' for e in ent) else None
 
-
 # ---------------------------------------------------------------- page
 st.set_page_config(page_title='Weekly Sweep latest (W-75-15)', layout='wide')
 st.title('Weekly Sweep latest (W-75-15)')
@@ -229,23 +201,23 @@ c1, c2, c3 = st.columns([1, 1, 1])
 bucket = int(time.time() // 600) * 600                 # data shared by all visitors, renewed every 10 minutes
 if c3.button('🔄 Refresh data'): st.session_state['stamp'] = time.time()
 stamp = max(bucket, st.session_state.get('stamp', 0))
-universe = st.sidebar.text_area('Stocks (NSE symbols)', ' '.join(SYMS), height=150).split()
 
+# ---------------------------------------------------------------- Auto fetch Nifty 500
+universe = st.sidebar.text_area('Stocks (NSE symbols)', get_nifty500_symbols(), height=150).split()
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_all(syms, stamp):
-    with cf.ThreadPoolExecutor(12) as ex: res = list(ex.map(lambda s: (s, load(s, stamp)), syms))
+    # Reduced max_workers to 4 to prevent Out-of-Memory crashes when loading 500 stocks on Streamlit Cloud
+    with cf.ThreadPoolExecutor(4) as ex: res = list(ex.map(lambda s: (s, load(s, stamp)), syms))
     return {s: v for s, v in res if v and len(v[1]) >= 60}
 
-
-with st.spinner(f'Fetching {len(universe)} stocks from Yahoo (about a minute)…'):
+with st.spinner(f'Fetching {len(universe)} stocks from Yahoo (this takes a moment for 500 stocks)…'):
     DATA = load_all(tuple(universe), stamp)
 days = sorted({b[0][:10] for v in DATA.values() for b in v[1]})
 if not days: st.error('No data from Yahoo right now. Try Refresh.'); st.stop()
 day = c1.selectbox('Date', days[::-1], index=0)
 today = now.strftime('%Y-%m-%d')
 slots = [f'{h:02d}:{m:02d}' for h in range(9, 16) for m in (0, 15, 30, 45) if '09:30' <= f'{h:02d}:{m:02d}' <= '15:30']
-
 
 @st.cache_data(ttl=600, show_spinner=False)
 def compute(day, stamp, n):
@@ -255,7 +227,6 @@ def compute(day, stamp, n):
         except Exception: e = None
         if e: out[s] = e
     return out
-
 
 with st.spinner('Running the W-75-15 rules…'):
     R = compute(day, stamp, len(DATA))
