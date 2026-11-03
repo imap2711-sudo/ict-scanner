@@ -26,10 +26,9 @@ def get_live_nifty500_symbols():
     except Exception:
         return []
 
-def analyze_ticker(ticker, mode, start_date=None, end_date=None):
+def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=None):
     try:
         t = yf.Ticker(ticker)
-        # Always fetch max data so we can accurately track forward-looking price action for backtesting
         df = t.history(period="10y", interval="1d", auto_adjust=False)
         
         if df.empty or len(df) < 5: 
@@ -43,7 +42,6 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None):
         if pd.isna(cmp) or cmp <= 60: 
             return None
 
-        # 3-Year Cutoff based on today
         cutoff_date = df.index[-1] - pd.DateOffset(years=3)
 
         df['Range'] = df['High'] - df['Low']
@@ -113,48 +111,51 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None):
             
             if pct_move < 7.0: continue
             
-            # Risk Management Mathematics (1:2 RR)
-            risk_pct = ((proximal_line - distal_line) / proximal_line) * 100
-            target_price = proximal_line + 2 * (proximal_line - distal_line)
+            # Risk Management
+            sl_points = proximal_line - distal_line
+            target_price = proximal_line + (2 * sl_points)
+            
+            # P&L Calculation based on fixed Rs risk
+            qty = 0
+            if risk_amount and sl_points > 0:
+                qty = int(risk_amount / sl_points)
                 
-            # Forward Price Simulation
             is_invalidated = False
             is_tested = False
             entry_idx = None
             outcome = "Pending"
             exit_date = None
+            pnl_rs = 0.0
             
             for j in range(last_legout_idx + 1, len(df)):
                 day_low = df['Low'].iloc[j]
                 day_high = df['High'].iloc[j]
                 day_close = df['Close'].iloc[j]
                 
-                # Check for Entry or Invalidation
                 if not is_tested:
                     if day_close < distal_line:
                         is_invalidated = True
-                        break # Destroyed before entry
+                        break 
                     if day_low <= (proximal_line * 1.0025):
                         is_tested = True
                         entry_idx = j
                         if mode == "Live Scan (Same Day)":
-                            break # In live mode, we drop tested zones immediately
+                            break
                 
-                # Post-Entry Simulation (Backtest Only)
                 if is_tested and mode == "Historical Backtest":
-                    if day_low < distal_line: # SL Hit
+                    if day_low < distal_line: 
                         outcome = "Loss"
+                        pnl_rs = -risk_amount if risk_amount else 0.0
                         exit_date = df.index[j].date()
                         break
-                    elif day_high >= target_price: # TP Hit
+                    elif day_high >= target_price: 
                         outcome = "Win"
+                        pnl_rs = (2 * risk_amount) if risk_amount else 0.0
                         exit_date = df.index[j].date()
                         break
             
-            # MODE 1: LIVE SCAN RETURN
             if mode == "Live Scan (Same Day)":
                 if is_invalidated or is_tested: continue
-                # Catch live daily tick test
                 try:
                     if float(t.fast_info.day_low) <= (proximal_line * 1.0025): continue
                 except:
@@ -172,21 +173,19 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None):
                     "Required fall %": round(distance_pct, 2)
                 })
             
-            # MODE 2: BACKTEST RETURN
             elif mode == "Historical Backtest":
                 if is_tested and not is_invalidated:
                     entry_date = df.index[entry_idx].date()
-                    # Only register the trade if it triggered inside the selected date range
                     if start_date <= entry_date <= end_date:
                         results.append({
                             "Stock Symbol": ticker.replace('.NS', ''),
-                            "Base Date": base_date,
                             "Entry Date": entry_date.strftime('%Y-%m-%d'),
                             "Exit Date": exit_date.strftime('%Y-%m-%d') if exit_date else "N/A",
-                            "Proximal (Entry)": round(proximal_line, 2),
-                            "Distal (SL)": round(distal_line, 2),
-                            "Target (1:2)": round(target_price, 2),
-                            "Risk (%)": round(risk_pct, 2),
+                            "Entry (₹)": round(proximal_line, 2),
+                            "SL (₹)": round(distal_line, 2),
+                            "Target (₹)": round(target_price, 2),
+                            "Qty": qty,
+                            "P&L (₹)": round(pnl_rs, 2),
                             "Outcome": outcome
                         })
             
@@ -194,7 +193,6 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None):
     except Exception:
         return None
 
-# --- STREAMLIT UI ---
 st.title("Nifty 500 Daily Demand Zone Scanner")
 st.markdown("Institutional structural scanner with full 1:2 RR backtesting capabilities.")
 
@@ -202,14 +200,26 @@ st.sidebar.header("Scan Parameters")
 mode = st.sidebar.radio("Select Mode:", ("Live Scan (Same Day)", "Historical Backtest"))
 
 start_date, end_date = None, None
+risk_per_trade = None
+
 if mode == "Historical Backtest":
     st.sidebar.markdown("---")
+    
+    risk_per_trade = st.sidebar.number_input(
+        "Risk Per Trade (₹)", 
+        min_value=100, 
+        max_value=100000, 
+        value=1000, 
+        step=500,
+        help="Amount you are willing to lose if Stop Loss is hit."
+    )
+    
+    st.sidebar.markdown("---")
     st.sidebar.write("**Select Trade Entry Window:**")
-    st.sidebar.caption("The engine will evaluate any setups that triggered an entry within this specific date range.")
     
     date_range = st.sidebar.date_input(
         "Date Range", 
-        value=(date.today() - pd.DateOffset(days=90), date.today()),
+        value=(date.today() - pd.DateOffset(days=180), date.today()),
         max_value=date.today()
     )
     
@@ -230,7 +240,7 @@ if st.sidebar.button("Run Scan"):
         
         with st.spinner(f"Executing {mode} across Nifty 500..."):
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(analyze_ticker, t, mode, start_date, end_date): t for t in tickers}
+                futures = {executor.submit(analyze_ticker, t, mode, start_date, end_date, risk_per_trade): t for t in tickers}
                 
                 for i, future in enumerate(concurrent.futures.as_completed(futures)):
                     res = future.result()
@@ -250,23 +260,33 @@ if st.sidebar.button("Run Scan"):
             if mode == "Historical Backtest":
                 df_res = df_res.sort_values(by="Entry Date", ascending=False).reset_index(drop=True)
                 
-                # --- BACKTEST METRICS DASHBOARD ---
-                total_trades = len(df_res)
+                # Metrics Calculation
+                total_closed = len(df_res[df_res["Outcome"] != "Pending"])
                 wins = len(df_res[df_res["Outcome"] == "Win"])
                 losses = len(df_res[df_res["Outcome"] == "Loss"])
                 pending = len(df_res[df_res["Outcome"] == "Pending"])
-                avg_risk = df_res["Risk (%)"].mean()
                 
-                st.markdown("### Backtest Performance (1:2 RR)")
-                col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("Setups Triggered", total_trades)
-                col2.metric("Successful", wins)
-                col3.metric("Failed (SL Hit)", losses)
-                col4.metric("Pending", pending)
-                col5.metric("Avg. Risk / Trade", f"{avg_risk:.2f}%")
+                win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
+                total_profit = df_res["P&L (₹)"].sum()
+                
+                st.markdown("### Backtest Performance Dashboard")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                col1.metric("Win Rate", f"{win_rate:.1f}%", help="Based only on closed trades (Wins + Losses).")
+                col2.metric("Total Net P&L", f"₹ {total_profit:,.2f}", delta=f"{'Profit' if total_profit > 0 else 'Loss'}")
+                col3.metric("Trades Triggered", len(df_res))
+                col4.metric("Pending/Open", pending)
                 
                 st.dataframe(
-                    df_res.style.map(lambda x: 'color: green' if x == 'Win' else ('color: red' if x == 'Loss' else 'color: gray'), subset=['Outcome']),
+                    df_res.style.map(
+                        lambda x: 'color: green' if x == 'Win' else ('color: red' if x == 'Loss' else 'color: gray'), 
+                        subset=['Outcome']
+                    ).format({
+                        "Entry (₹)": "{:.2f}",
+                        "SL (₹)": "{:.2f}",
+                        "Target (₹)": "{:.2f}",
+                        "P&L (₹)": "{:.2f}"
+                    }),
                     use_container_width=True,
                     height=500
                 )
@@ -275,7 +295,6 @@ if st.sidebar.button("Run Scan"):
                 st.markdown("### Active Untested Zones")
                 st.dataframe(df_res, use_container_width=True, height=500)
             
-            # CSV Download
             csv = df_res.to_csv(index=False).encode('utf-8')
             file_prefix = "Live" if mode == "Live Scan (Same Day)" else f"Backtest_{start_date}_to_{end_date}"
             st.download_button(
