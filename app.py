@@ -12,7 +12,7 @@ import logging
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-st.set_page_config(page_title="Nifty & NSE DZ Scanner", layout="wide")
+st.set_page_config(page_title="NSE Daily Demand Zone Scanner", layout="wide")
 
 @st.cache_data(ttl=86400)
 def get_live_nifty500_symbols():
@@ -126,11 +126,17 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
             
             if pct_move < 7.0: continue
             
-            # Risk Management
+            # --- 2% MAX RISK CHECK & ENTRY SHIFT ---
+            sl_pct = (proximal_line - distal_line) / proximal_line
+            if sl_pct > 0.02:
+                # Shift proximal line down so that (Proximal - Distal) / Proximal is exactly 2%
+                proximal_line = distal_line / 0.98
+                
+            # Recalculate Risk Management values based on adjusted entry
             sl_points = proximal_line - distal_line
             target_price = proximal_line + (2 * sl_points)
             
-            # P&L Calculation based on fixed Rs risk
+            # Calculate integer quantity based on exact SL points
             qty = 0
             if risk_amount and sl_points > 0:
                 qty = int(risk_amount / sl_points)
@@ -151,6 +157,7 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                     if day_close < distal_line:
                         is_invalidated = True
                         break 
+                    # Tripwire untested check utilizes the (possibly shifted) proximal line
                     if day_low <= (proximal_line * 1.0025):
                         is_tested = True
                         entry_idx = j
@@ -160,12 +167,13 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                 if is_tested and mode == "Historical Backtest":
                     if day_low < distal_line: 
                         outcome = "Loss"
-                        pnl_rs = -risk_amount if risk_amount else 0.0
+                        # Dynamic P&L strictly bounds exact integer quantities (fixing the 0-qty artifact)
+                        pnl_rs = -(qty * sl_points) if risk_amount else 0.0
                         exit_date = df.index[j].date()
                         break
                     elif day_high >= target_price: 
                         outcome = "Win"
-                        pnl_rs = (2 * risk_amount) if risk_amount else 0.0
+                        pnl_rs = (qty * (target_price - proximal_line)) if risk_amount else 0.0
                         exit_date = df.index[j].date()
                         break
             
@@ -210,11 +218,10 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
 
 # --- STREAMLIT UI ---
 st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Institutional structural scanner with full 1:2 RR backtesting capabilities.")
+st.markdown("Institutional structural scanner with a dynamic 2% Max Stop Loss adjustment and 1:2 RR capability.")
 
 st.sidebar.header("Scan Parameters")
 
-# Universe Selection Dropdown
 universe = st.sidebar.selectbox(
     "Select Stock Universe:",
     ("Nifty 500", "All NSE Equities (Price > ₹100)")
@@ -286,7 +293,6 @@ if st.sidebar.button("Run Scan"):
             if mode == "Historical Backtest":
                 df_res = df_res.sort_values(by="Entry Date", ascending=False).reset_index(drop=True)
                 
-                # Metrics Calculation
                 total_closed = len(df_res[df_res["Outcome"] != "Pending"])
                 wins = len(df_res[df_res["Outcome"] == "Win"])
                 losses = len(df_res[df_res["Outcome"] == "Loss"])
