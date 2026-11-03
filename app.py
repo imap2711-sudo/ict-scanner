@@ -12,7 +12,7 @@ import logging
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-st.set_page_config(page_title="Nifty 500 DZ Scanner", layout="wide")
+st.set_page_config(page_title="Nifty & NSE DZ Scanner", layout="wide")
 
 @st.cache_data(ttl=86400)
 def get_live_nifty500_symbols():
@@ -22,6 +22,20 @@ def get_live_nifty500_symbols():
         response = requests.get(url, headers=headers, timeout=10)
         df = pd.read_csv(io.StringIO(response.text))
         latest_tickers = [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
+        return latest_tickers
+    except Exception:
+        return []
+
+@st.cache_data(ttl=86400)
+def get_all_nse_symbols():
+    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        df = pd.read_csv(io.StringIO(response.text))
+        df.columns = df.columns.str.strip()
+        df = df[df['SERIES'] == 'EQ']
+        latest_tickers = [str(symbol).strip() + '.NS' for symbol in df['SYMBOL']]
         return latest_tickers
     except Exception:
         return []
@@ -39,7 +53,8 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
         try: cmp = float(t.fast_info.last_price)
         except: cmp = float(df['Close'].iloc[-1])
 
-        if pd.isna(cmp) or cmp <= 60: 
+        # Minimum Price Filter updated to > 100 Rs
+        if pd.isna(cmp) or cmp <= 100: 
             return None
 
         cutoff_date = df.index[-1] - pd.DateOffset(years=3)
@@ -193,10 +208,18 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
     except Exception:
         return None
 
-st.title("Nifty 500 Daily Demand Zone Scanner")
+# --- STREAMLIT UI ---
+st.title("NSE Daily Demand Zone Scanner")
 st.markdown("Institutional structural scanner with full 1:2 RR backtesting capabilities.")
 
 st.sidebar.header("Scan Parameters")
+
+# Universe Selection Dropdown
+universe = st.sidebar.selectbox(
+    "Select Stock Universe:",
+    ("Nifty 500", "All NSE Equities (Price > ₹100)")
+)
+
 mode = st.sidebar.radio("Select Mode:", ("Live Scan (Same Day)", "Historical Backtest"))
 
 start_date, end_date = None, None
@@ -229,16 +252,19 @@ if mode == "Historical Backtest":
         start_date, end_date = date_range[0], date_range[0]
 
 if st.sidebar.button("Run Scan"):
-    tickers = get_live_nifty500_symbols()
+    if universe == "Nifty 500":
+        tickers = get_live_nifty500_symbols()
+    else:
+        tickers = get_all_nse_symbols()
     
     if not tickers:
-        st.error("Failed to fetch Nifty 500 list from NSE. Please try again.")
+        st.error("Failed to fetch the stock list from NSE. Please try again.")
     else:
         all_results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        with st.spinner(f"Executing {mode} across Nifty 500..."):
+        with st.spinner(f"Executing {mode} across {universe}..."):
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
                 futures = {executor.submit(analyze_ticker, t, mode, start_date, end_date, risk_per_trade): t for t in tickers}
                 
@@ -292,7 +318,7 @@ if st.sidebar.button("Run Scan"):
                 )
             else:
                 df_res = df_res.sort_values(by="Required fall %").reset_index(drop=True)
-                st.markdown("### Active Untested Zones")
+                st.markdown(f"### Active Untested Zones ({universe})")
                 st.dataframe(df_res, use_container_width=True, height=500)
             
             csv = df_res.to_csv(index=False).encode('utf-8')
@@ -300,7 +326,7 @@ if st.sidebar.button("Run Scan"):
             st.download_button(
                 label="📥 Download Data as CSV",
                 data=csv,
-                file_name=f"{file_prefix}_Demand_Zones.csv",
+                file_name=f"{file_prefix}_{universe.replace(' ', '_')}_Demand_Zones.csv",
                 mime="text/csv",
             )
         else:
