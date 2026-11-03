@@ -40,7 +40,7 @@ def get_all_nse_symbols():
     except Exception:
         return []
 
-def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=None):
+def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=None, max_hold_days=None):
     try:
         t = yf.Ticker(ticker)
         df = t.history(period="10y", interval="1d", auto_adjust=False)
@@ -129,14 +129,11 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
             # --- 2% MAX RISK CHECK & ENTRY SHIFT ---
             sl_pct = (proximal_line - distal_line) / proximal_line
             if sl_pct > 0.02:
-                # Shift proximal line down so that (Proximal - Distal) / Proximal is exactly 2%
                 proximal_line = distal_line / 0.98
                 
-            # Recalculate Risk Management values based on adjusted entry
             sl_points = proximal_line - distal_line
             target_price = proximal_line + (2 * sl_points)
             
-            # Calculate integer quantity based on exact SL points
             qty = 0
             if risk_amount and sl_points > 0:
                 qty = int(risk_amount / sl_points)
@@ -157,7 +154,6 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                     if day_close < distal_line:
                         is_invalidated = True
                         break 
-                    # Tripwire untested check utilizes the (possibly shifted) proximal line
                     if day_low <= (proximal_line * 1.0025):
                         is_tested = True
                         entry_idx = j
@@ -165,15 +161,26 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                             break
                 
                 if is_tested and mode == "Historical Backtest":
+                    days_in_trade = j - entry_idx
+                    
                     if day_low < distal_line: 
                         outcome = "Loss"
-                        # Dynamic P&L strictly bounds exact integer quantities (fixing the 0-qty artifact)
                         pnl_rs = -(qty * sl_points) if risk_amount else 0.0
                         exit_date = df.index[j].date()
                         break
                     elif day_high >= target_price: 
                         outcome = "Win"
                         pnl_rs = (qty * (target_price - proximal_line)) if risk_amount else 0.0
+                        exit_date = df.index[j].date()
+                        break
+                    # --- NEW TIME-BASED EXIT LOGIC ---
+                    elif max_hold_days is not None and days_in_trade >= max_hold_days:
+                        if day_close >= proximal_line:
+                            outcome = "Time Exit (Win)"
+                        else:
+                            outcome = "Time Exit (Loss)"
+                            
+                        pnl_rs = (qty * (day_close - proximal_line)) if risk_amount else 0.0
                         exit_date = df.index[j].date()
                         break
             
@@ -218,7 +225,7 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
 
 # --- STREAMLIT UI ---
 st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Institutional structural scanner with a dynamic 2% Max Stop Loss adjustment and 1:2 RR capability.")
+st.markdown("Institutional structural scanner with a dynamic 2% Max Stop Loss adjustment and Time-Based exits.")
 
 st.sidebar.header("Scan Parameters")
 
@@ -231,6 +238,7 @@ mode = st.sidebar.radio("Select Mode:", ("Live Scan (Same Day)", "Historical Bac
 
 start_date, end_date = None, None
 risk_per_trade = None
+max_hold_days = None
 
 if mode == "Historical Backtest":
     st.sidebar.markdown("---")
@@ -243,6 +251,23 @@ if mode == "Historical Backtest":
         step=500,
         help="Amount you are willing to lose if Stop Loss is hit."
     )
+    
+    time_exit_mapping = {
+        "No Time Limit": None,
+        "1 Trading Day (Next Day)": 1,
+        "2 Trading Days (Day After Tomorrow)": 2,
+        "3 Trading Days": 3,
+        "5 Trading Days (1 Week)": 5,
+        "10 Trading Days (2 Weeks)": 10
+    }
+    
+    time_exit_selection = st.sidebar.selectbox(
+        "Max Hold Duration (Time Exit):",
+        list(time_exit_mapping.keys()),
+        index=2, # Defaults to "2 Trading Days"
+        help="Forces the trade to close at EOD running P&L if SL/Target are not met within this timeframe."
+    )
+    max_hold_days = time_exit_mapping[time_exit_selection]
     
     st.sidebar.markdown("---")
     st.sidebar.write("**Select Trade Entry Window:**")
@@ -273,7 +298,7 @@ if st.sidebar.button("Run Scan"):
         
         with st.spinner(f"Executing {mode} across {universe}..."):
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(analyze_ticker, t, mode, start_date, end_date, risk_per_trade): t for t in tickers}
+                futures = {executor.submit(analyze_ticker, t, mode, start_date, end_date, risk_per_trade, max_hold_days): t for t in tickers}
                 
                 for i, future in enumerate(concurrent.futures.as_completed(futures)):
                     res = future.result()
@@ -294,8 +319,8 @@ if st.sidebar.button("Run Scan"):
                 df_res = df_res.sort_values(by="Entry Date", ascending=False).reset_index(drop=True)
                 
                 total_closed = len(df_res[df_res["Outcome"] != "Pending"])
-                wins = len(df_res[df_res["Outcome"] == "Win"])
-                losses = len(df_res[df_res["Outcome"] == "Loss"])
+                wins = len(df_res[df_res["Outcome"].str.contains("Win", na=False)])
+                losses = len(df_res[df_res["Outcome"].str.contains("Loss", na=False)])
                 pending = len(df_res[df_res["Outcome"] == "Pending"])
                 
                 win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
@@ -304,16 +329,19 @@ if st.sidebar.button("Run Scan"):
                 st.markdown("### Backtest Performance Dashboard")
                 col1, col2, col3, col4 = st.columns(4)
                 
-                col1.metric("Win Rate", f"{win_rate:.1f}%", help="Based only on closed trades (Wins + Losses).")
+                col1.metric("Win Rate", f"{win_rate:.1f}%", help="Includes TP hits and winning Time Exits.")
                 col2.metric("Total Net P&L", f"₹ {total_profit:,.2f}", delta=f"{'Profit' if total_profit > 0 else 'Loss'}")
                 col3.metric("Trades Triggered", len(df_res))
                 col4.metric("Pending/Open", pending)
                 
+                def style_outcome(val):
+                    if pd.isna(val): return ''
+                    if 'Win' in val: return 'color: green'
+                    if 'Loss' in val: return 'color: red'
+                    return 'color: gray'
+                
                 st.dataframe(
-                    df_res.style.map(
-                        lambda x: 'color: green' if x == 'Win' else ('color: red' if x == 'Loss' else 'color: gray'), 
-                        subset=['Outcome']
-                    ).format({
+                    df_res.style.map(style_outcome, subset=['Outcome']).format({
                         "Entry (₹)": "{:.2f}",
                         "SL (₹)": "{:.2f}",
                         "Target (₹)": "{:.2f}",
