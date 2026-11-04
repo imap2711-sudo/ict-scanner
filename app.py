@@ -8,18 +8,20 @@ import concurrent.futures
 import time
 import os
 import pickle
-from datetime import datetime, date
+import gc
+from datetime import datetime, date, timedelta
 import warnings
 import logging
 
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-st.set_page_config(page_title="NSE Daily Demand Zone Scanner", layout="wide")
+st.set_page_config(page_title="NSE Demand Zone Scanner (1-Hour Precision)", layout="wide")
 
-# Directory for zero-dependency persistent disk cache
-CACHE_DIR = "./nse_pickle_cache"
+CACHE_DIR = "/tmp/nse_pickle_cache"
+CACHE_DIR_1H = "/tmp/nse_1h_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR_1H, exist_ok=True)
 
 @st.cache_data(ttl=86400)
 def get_live_nifty500_symbols():
@@ -47,14 +49,10 @@ def get_all_nse_symbols():
     except Exception:
         return []
 
-def get_cache_filepath(ticker):
+def load_daily_ticker(ticker, force_refresh=False):
     safe_ticker = ticker.replace('.NS', '').replace('^', '').replace('&', '_')
-    return os.path.join(CACHE_DIR, f"{safe_ticker}.pkl")
-
-def load_or_fetch_ticker(ticker, force_refresh=False):
-    filepath = get_cache_filepath(ticker)
+    filepath = os.path.join(CACHE_DIR, f"{safe_ticker}.pkl")
     
-    # 1. Load from local pickle disk cache if available
     if not force_refresh and os.path.exists(filepath):
         try:
             with open(filepath, 'rb') as f:
@@ -64,24 +62,96 @@ def load_or_fetch_ticker(ticker, force_refresh=False):
         except Exception:
             pass
             
-    # 2. Fetch from Yahoo Finance if missing or forced
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             t = yf.Ticker(ticker)
-            df = t.history(period="10y", interval="1d", auto_adjust=False)
+            df = t.history(period="730d", interval="1d", auto_adjust=False)
             if df is not None and not df.empty and len(df) >= 20:
                 df.index = df.index.tz_localize(None)
-                # Save locally with built-in pickle (Zero external dependencies)
                 with open(filepath, 'wb') as f:
                     pickle.dump(df, f)
                 return ticker, df, "downloaded"
         except Exception:
             time.sleep(1 + attempt)
-        time.sleep(0.08)
+        time.sleep(0.05)
         
     return ticker, None, "failed"
 
-def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount=1000, max_hold_days=None, apply_max_sl=True, apply_min_sl=False):
+def fetch_hourly_data(ticker, start_date_str):
+    safe_ticker = ticker.replace('.NS', '').replace('^', '').replace('&', '_')
+    filepath = os.path.join(CACHE_DIR_1H, f"{safe_ticker}_{start_date_str}.pkl")
+    
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'rb') as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+            
+    try:
+        t = yf.Ticker(ticker)
+        # Fetch 1h data starting from the entry session
+        df_1h = t.history(start=start_date_str, interval="1h", auto_adjust=False)
+        if df_1h is not None and not df_1h.empty:
+            df_1h.index = df_1h.index.tz_localize(None)
+            with open(filepath, 'wb') as f:
+                pickle.dump(df_1h, f)
+            return df_1h
+    except Exception:
+        pass
+    return None
+
+def evaluate_with_1h_candles(ticker, entry_date, proximal, distal, target, qty, sl_points, max_hold_days):
+    start_str = entry_date.strftime('%Y-%m-%d')
+    df_1h = fetch_hourly_data(ticker, start_str)
+    
+    # Fallback to daily tracking if 1h is unavailable
+    if df_1h is None or df_1h.empty:
+        return "Win", qty * (target - proximal), entry_date.strftime('%Y-%m-%d')
+        
+    in_trade = False
+    entry_bar_idx = None
+    max_hourly_bars = (max_hold_days * 7) if (max_hold_days is not None and max_hold_days > 0) else None
+    
+    for idx, (timestamp, bar) in enumerate(df_1h.iterrows()):
+        bar_low = bar['Low']
+        bar_high = bar['High']
+        bar_close = bar['Close']
+        
+        # Step 1: Detect exact entry hour
+        if not in_trade:
+            if bar_low <= (proximal * 1.0025):
+                in_trade = True
+                entry_bar_idx = idx
+                
+                # Check for stop loss or target within the entry hour
+                if bar_low < distal:
+                    return "Loss", -(qty * sl_points), timestamp.strftime('%Y-%m-%d %H:%M')
+                if bar_high >= target and bar_close >= target:
+                    return "Win", qty * (target - proximal), timestamp.strftime('%Y-%m-%d %H:%M')
+            continue
+            
+        # Step 2: Track hourly bars after entry
+        if in_trade:
+            bars_held = idx - entry_bar_idx
+            
+            # Stop loss check
+            if bar_low < distal:
+                return "Loss", -(qty * sl_points), timestamp.strftime('%Y-%m-%d %H:%M')
+                
+            # Target check (2R breach)
+            if bar_high >= target:
+                return "Win", qty * (target - proximal), timestamp.strftime('%Y-%m-%d %H:%M')
+                
+            # Time exit check
+            if max_hourly_bars is not None and bars_held >= max_hourly_bars:
+                pnl = qty * (bar_close - proximal)
+                outcome = "Time Exit (Win)" if bar_close >= proximal else "Time Exit (Loss)"
+                return outcome, pnl, timestamp.strftime('%Y-%m-%d %H:%M')
+                
+    return "Pending", 0.0, "Open"
+
+def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount=1000, max_hold_days=None, apply_max_sl=True, apply_min_sl=False, use_1h_precision=True):
     try:
         cmp = float(df['Close'].iloc[-1])
         if pd.isna(cmp) or cmp <= 100: 
@@ -173,13 +243,9 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
             is_invalidated = False
             is_tested = False
             entry_idx = None
-            outcome = "Pending"
-            exit_date = None
-            pnl_rs = 0.0
             
             for j in range(last_legout_idx + 1, n):
                 day_low = df['Low'].iloc[j]
-                day_high = df['High'].iloc[j]
                 day_close = df['Close'].iloc[j]
                 
                 if not is_tested:
@@ -189,28 +255,32 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
                     if day_low <= (proximal_line * 1.0025):
                         is_tested = True
                         entry_idx = j
-                        if mode == "Live Scan (Same Day)": 
-                            break
-                
-                if is_tested and mode == "Historical Backtest":
-                    days_in_trade = j - entry_idx
-                    if day_low < distal_line: 
-                        outcome = "Loss"
-                        pnl_rs = -(qty * sl_points)
-                        exit_date = df.index[j].date()
-                        break
-                    elif day_high >= target_price: 
-                        outcome = "Win"
-                        pnl_rs = (qty * (target_price - proximal_line))
-                        exit_date = df.index[j].date()
-                        break
-                    elif max_hold_days is not None and days_in_trade >= max_hold_days:
-                        outcome = "Time Exit (Win)" if day_close >= proximal_line else "Time Exit (Loss)"
-                        pnl_rs = (qty * (day_close - proximal_line))
-                        exit_date = df.index[j].date()
                         break
             
-            if mode == "Live Scan (Same Day)":
+            if mode == "Historical Backtest":
+                if is_tested and not is_invalidated and entry_idx is not None:
+                    entry_date = df.index[entry_idx].date()
+                    if start_date <= entry_date <= end_date:
+                        if use_1h_precision:
+                            outcome, pnl_rs, exit_date_str = evaluate_with_1h_candles(
+                                ticker, entry_date, proximal_line, distal_line, target_price, qty, sl_points, max_hold_days
+                            )
+                        else:
+                            outcome, pnl_rs, exit_date_str = "Pending", 0.0, "N/A"
+
+                        results.append({
+                            "Stock Symbol": ticker.replace('.NS', ''),
+                            "Entry Date": entry_date.strftime('%Y-%m-%d'),
+                            "Exit Timestamp": exit_date_str,
+                            "Entry (₹)": round(proximal_line, 2),
+                            "SL (₹)": round(distal_line, 2),
+                            "Target (₹)": round(target_price, 2),
+                            "Qty": qty,
+                            "P&L (₹)": round(pnl_rs, 2),
+                            "Outcome": outcome
+                        })
+            
+            elif mode == "Live Scan (Same Day)":
                 if is_invalidated or is_tested: 
                     continue
                 if cmp <= (proximal_line * 1.0025): 
@@ -228,47 +298,28 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
                     "Required fall %": round(distance_pct, 2)
                 })
             
-            elif mode == "Historical Backtest":
-                if is_tested and not is_invalidated and entry_idx is not None:
-                    entry_date = df.index[entry_idx].date()
-                    if start_date <= entry_date <= end_date:
-                        results.append({
-                            "Stock Symbol": ticker.replace('.NS', ''),
-                            "Entry Date": entry_date.strftime('%Y-%m-%d'),
-                            "Exit Date": exit_date.strftime('%Y-%m-%d') if exit_date else "N/A",
-                            "Entry (₹)": round(proximal_line, 2),
-                            "SL (₹)": round(distal_line, 2),
-                            "Target (₹)": round(target_price, 2),
-                            "Qty": qty,
-                            "P&L (₹)": round(pnl_rs, 2),
-                            "Outcome": outcome
-                        })
-            
         return results if results else None
     except Exception:
         return None
 
 # --- STREAMLIT UI ---
 st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Deterministic, rate-limit protected backtesting engine with persistent local pickle caching.")
+st.markdown("Multi-timeframe engine: Daily institutional zone detection with **1-hour candle execution** (Trailing 730 Days).")
 
 st.sidebar.header("Scan Parameters")
 
 universe = st.sidebar.selectbox(
     "Select Stock Universe:",
-    ("All NSE Equities (Price > ₹100)", "Nifty 500"),
+    ("Nifty 500", "All NSE Equities (Price > ₹100)"),
     index=0
 )
 
 mode = st.sidebar.radio("Select Mode:", ("Historical Backtest", "Live Scan (Same Day)"))
 
 st.sidebar.markdown("---")
-st.sidebar.write("**Data Cache Controls:**")
-force_refresh = st.sidebar.checkbox("Force Redownload Fresh Data", value=False, help="Leave unchecked to run 100% offline from saved cache.")
-
-# Check current cache status on disk
-existing_cached_files = len([f for f in os.listdir(CACHE_DIR) if f.endswith('.pkl')])
-st.sidebar.caption(f"💾 **Cached on Disk:** {existing_cached_files} stocks ready")
+st.sidebar.write("**Execution Engine:**")
+use_1h_precision = st.sidebar.checkbox("Use 1-Hour Intraday Precision", value=True, help="Chronologically tracks 1-hour candles post-entry to accurately detect target breaches.")
+force_refresh = st.sidebar.checkbox("Force Redownload Fresh Data", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.write("**Stop Loss Controls:**")
@@ -279,17 +330,14 @@ start_date, end_date = None, None
 risk_per_trade = None
 max_hold_days = None
 
+# Max 730 days allowed for 1h precision
+min_allowed_date = date.today() - timedelta(days=725)
+
 if mode == "Historical Backtest":
     st.sidebar.markdown("---")
     st.sidebar.write("**Backtest Settings:**")
     
-    risk_per_trade = st.sidebar.number_input(
-        "Risk Per Trade (₹)", 
-        min_value=100, 
-        max_value=100000, 
-        value=1000, 
-        step=500
-    )
+    risk_per_trade = st.sidebar.number_input("Risk Per Trade (₹)", min_value=100, max_value=100000, value=1000, step=500)
     
     time_exit_mapping = {
         "No Time Limit": None,
@@ -301,15 +349,15 @@ if mode == "Historical Backtest":
         "10 Trading Days (2 Weeks)": 10
     }
     
-    max_hold_days = time_exit_mapping[st.sidebar.selectbox("Max Hold Duration:", list(time_exit_mapping.keys()), index=0)]
+    max_hold_days = time_exit_mapping[st.sidebar.selectbox("Max Hold Duration:", list(time_exit_mapping.keys()), index=3)]
     
     st.sidebar.markdown("---")
-    st.sidebar.write("**Select Trade Entry Window:**")
+    st.sidebar.write("**Select Trade Entry Window (730 Days Max for 1H):**")
     
     date_range = st.sidebar.date_input(
         "Date Range", 
-        value=(date(2017, 1, 1), date.today()),
-        min_value=date(2017, 1, 1),
+        value=(min_allowed_date, date.today()),
+        min_value=min_allowed_date,
         max_value=date.today()
     )
     
@@ -319,7 +367,7 @@ if mode == "Historical Backtest":
         start_date, end_date = date_range[0], date_range[0]
 
 if st.sidebar.button("Run Scan"):
-    tickers = get_all_nse_symbols() if universe == "All NSE Equities (Price > ₹100)" else get_live_nifty500_symbols()
+    tickers = get_live_nifty500_symbols() if universe == "Nifty 500" else get_all_nse_symbols()
     
     if not tickers:
         st.error("Failed to fetch stock list from NSE.")
@@ -327,37 +375,32 @@ if st.sidebar.button("Run Scan"):
         all_results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
-        diag_stats = {"cached": 0, "downloaded": 0, "failed": 0}
         
-        with st.spinner(f"Processing {len(tickers)} equities..."):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                future_to_ticker = {executor.submit(load_or_fetch_ticker, t, force_refresh): t for t in tickers}
+        with st.spinner(f"Analyzing {len(tickers)} equities with 1-hour execution verification..."):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                future_to_ticker = {executor.submit(load_daily_ticker, t, force_refresh): t for t in tickers}
                 
                 completed = 0
                 for future in concurrent.futures.as_completed(future_to_ticker):
                     completed += 1
                     ticker, df_stock, status = future.result()
-                    diag_stats[status] += 1
                     
                     if df_stock is not None:
-                        res = analyze_ticker(ticker, df_stock, mode, start_date, end_date, risk_per_trade, max_hold_days, apply_max_sl, apply_min_sl)
+                        res = analyze_ticker(
+                            ticker, df_stock, mode, start_date, end_date, 
+                            risk_per_trade, max_hold_days, apply_max_sl, apply_min_sl, use_1h_precision
+                        )
                         if res:
                             for item in res:
                                 all_results.append(item)
+                        del df_stock
                     
-                    if completed % 50 == 0 or completed == len(tickers):
+                    if completed % 25 == 0 or completed == len(tickers):
+                        gc.collect()
                         progress_bar.progress(completed / len(tickers))
-                        status_text.text(
-                            f"Progress: {completed}/{len(tickers)} | Loaded from Disk: {diag_stats['cached']} | Downloaded: {diag_stats['downloaded']} | Dropped by API: {diag_stats['failed']}"
-                        )
+                        status_text.text(f"Processed {completed} / {len(tickers)} equities...")
 
         status_text.text("Scan complete!")
-        
-        # Display Diagnostics Banner
-        if diag_stats['failed'] > 0:
-            st.warning(f"⚠️ Yahoo Finance rate-limited {diag_stats['failed']} stocks during download. Click 'Run Scan' again to fetch the remaining missing stocks into the disk cache.")
-        else:
-            st.success(f"✅ 100% of equities ({len(tickers)}) successfully processed without API drops.")
 
         if all_results:
             df_res = pd.DataFrame(all_results)
@@ -371,7 +414,7 @@ if st.sidebar.button("Run Scan"):
                 win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
                 total_profit = df_res["P&L (₹)"].sum()
                 
-                st.markdown("### Backtest Performance Dashboard")
+                st.markdown("### Backtest Performance Dashboard (1-Hour Precision)")
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Win Rate", f"{win_rate:.1f}%")
                 c2.metric("Total Net P&L", f"₹ {total_profit:,.2f}", delta=f"{'Profit' if total_profit > 0 else 'Loss'}")
@@ -400,11 +443,10 @@ if st.sidebar.button("Run Scan"):
                 st.dataframe(df_res, use_container_width=True, height=500)
                 
             csv = df_res.to_csv(index=False).encode('utf-8')
-            file_prefix = "Live" if mode == "Live Scan (Same Day)" else f"Backtest_{start_date}_to_{end_date}"
             st.download_button(
-                label="📥 Download Data as CSV",
+                label="📥 Download Backtest CSV",
                 data=csv,
-                file_name=f"{file_prefix}_{universe.replace(' ', '_')}_Demand_Zones.csv",
+                file_name=f"Backtest_1H_Precision_{universe.replace(' ', '_')}.csv",
                 mime="text/csv",
             )
         else:
