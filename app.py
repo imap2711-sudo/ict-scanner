@@ -5,6 +5,7 @@ import numpy as np
 import requests
 import io
 import concurrent.futures
+import time
 from datetime import datetime, date
 import warnings
 import logging
@@ -21,46 +22,45 @@ def get_live_nifty500_symbols():
     try:
         response = requests.get(url, headers=headers, timeout=10)
         df = pd.read_csv(io.StringIO(response.text))
-        latest_tickers = [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
-        return latest_tickers
+        return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
     except Exception:
         return []
 
 @st.cache_data(ttl=86400)
 def get_all_nse_symbols():
     url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         df = pd.read_csv(io.StringIO(response.text))
         df.columns = df.columns.str.strip()
         df = df[df['SERIES'] == 'EQ']
-        latest_tickers = [str(symbol).strip() + '.NS' for symbol in df['SYMBOL']]
-        return latest_tickers
+        return [str(symbol).strip() + '.NS' for symbol in df['SYMBOL']]
     except Exception:
         return []
 
-def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=None, max_hold_days=None, apply_max_sl=True, apply_min_sl=False):
+def fetch_stock_history(ticker):
     try:
         t = yf.Ticker(ticker)
+        # Fetches 10 years of data to support 2017 onwards
         df = t.history(period="10y", interval="1d", auto_adjust=False)
-        
-        if df.empty or len(df) < 5: 
-            return None
-            
-        df.index = df.index.tz_localize(None)
+        if df is not None and not df.empty and len(df) >= 20:
+            df.index = df.index.tz_localize(None)
+            return ticker, df
+    except Exception:
+        pass
+    return ticker, None
 
-        try: cmp = float(t.fast_info.last_price)
-        except: cmp = float(df['Close'].iloc[-1])
-
+def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount=1000, max_hold_days=None, apply_max_sl=True, apply_min_sl=False):
+    try:
+        cmp = float(df['Close'].iloc[-1])
         if pd.isna(cmp) or cmp <= 100: 
             return None
 
-        cutoff_date = df.index[-1] - pd.DateOffset(years=3)
-
-        df['Range'] = df['High'] - df['Low']
+        df['Range'] = (df['High'] - df['Low']).replace(0, np.nan)
         df['Body'] = abs(df['Close'] - df['Open'])
-        df['Range'] = df['Range'].replace(0, np.nan)
         df['Body_Ratio'] = df['Body'] / df['Range']
 
         df['isLegIn'] = df['Body_Ratio'] > 0.65
@@ -69,19 +69,19 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
         df['isLegOutCandle'] = df['isBullish'] & (df['Body_Ratio'] > 0.65)
 
         results = []
-        
-        for i in range(3, len(df)):
-            if not df['isLegOutCandle'].iloc[i]: continue
+        n = len(df)
+
+        for i in range(3, n - 1):
+            if not df['isLegOutCandle'].iloc[i]: 
+                continue
                 
             is_1base = df['isBase'].iloc[i-1] and df['isLegIn'].iloc[i-2]
             is_2base = False
             if i >= 4:
                 is_2base = df['isBase'].iloc[i-1] and df['isBase'].iloc[i-2] and df['isLegIn'].iloc[i-3]
             
-            if not (is_1base or is_2base): continue
-            
-            zone_formation_date = df.index[i-1]
-            if zone_formation_date < cutoff_date: continue
+            if not (is_1base or is_2base): 
+                continue
                 
             first_legout_range = df['Range'].iloc[i]
             first_legout_close = df['Close'].iloc[i]
@@ -100,18 +100,21 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                 distal_line = min(df['Low'].iloc[i-1], df['Low'].iloc[i-2])
                 base_date = f"{df.index[i-2].strftime('%Y-%m-%d')} to {df.index[i-1].strftime('%Y-%m-%d')}"
             
-            if legin_range < 0.5 * first_legout_range: continue
-            if first_legout_close < (base_high * 1.01): continue
+            if legin_range < 0.5 * first_legout_range: 
+                continue
+            if first_legout_close < (base_high * 1.01): 
+                continue
             
+            # Legout Continuation Chain
             current_idx = i
             total_legouts = 1
             pause_used = False
             
-            while current_idx + 1 < len(df):
+            while current_idx + 1 < n:
                 if df['isLegOutCandle'].iloc[current_idx + 1]:
                     current_idx += 1
                     total_legouts += 1
-                elif not pause_used and df['isBase'].iloc[current_idx + 1] and current_idx + 2 < len(df) and df['isLegOutCandle'].iloc[current_idx + 2]:
+                elif not pause_used and df['isBase'].iloc[current_idx + 1] and current_idx + 2 < n and df['isLegOutCandle'].iloc[current_idx + 2]:
                     current_idx += 2
                     total_legouts += 1
                     pause_used = True
@@ -119,14 +122,14 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                     break
                 
             last_legout_idx = current_idx
-            
             move_end_price = df['Close'].iloc[last_legout_idx]
             pct_move = ((move_end_price - base_close) / base_close) * 100
             
-            if pct_move < 7.0: continue
+            if pct_move < 7.0: 
+                continue
             
+            # Stop Loss Rules
             sl_pct = (proximal_line - distal_line) / proximal_line
-            
             if apply_max_sl and sl_pct > 0.02:
                 proximal_line = distal_line / 0.98
                 sl_pct = 0.02
@@ -135,12 +138,13 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                 continue
                 
             sl_points = proximal_line - distal_line
-            target_price = proximal_line + (2 * sl_points)
-            
-            qty = 0
-            if risk_amount and sl_points > 0:
-                qty = int(risk_amount / sl_points)
+            if sl_points <= 0:
+                continue
                 
+            target_price = proximal_line + (2 * sl_points)
+            qty = int(risk_amount / sl_points) if risk_amount else 0
+
+            # Forward Test of this isolated zone
             is_invalidated = False
             is_tested = False
             entry_idx = None
@@ -148,7 +152,7 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
             exit_date = None
             pnl_rs = 0.0
             
-            for j in range(last_legout_idx + 1, len(df)):
+            for j in range(last_legout_idx + 1, n):
                 day_low = df['Low'].iloc[j]
                 day_high = df['High'].iloc[j]
                 day_close = df['Close'].iloc[j]
@@ -160,39 +164,32 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                     if day_low <= (proximal_line * 1.0025):
                         is_tested = True
                         entry_idx = j
-                        if mode == "Live Scan (Same Day)":
+                        if mode == "Live Scan (Same Day)": 
                             break
                 
                 if is_tested and mode == "Historical Backtest":
                     days_in_trade = j - entry_idx
-                    
                     if day_low < distal_line: 
                         outcome = "Loss"
-                        pnl_rs = -(qty * sl_points) if risk_amount else 0.0
+                        pnl_rs = -(qty * sl_points)
                         exit_date = df.index[j].date()
                         break
                     elif day_high >= target_price: 
                         outcome = "Win"
-                        pnl_rs = (qty * (target_price - proximal_line)) if risk_amount else 0.0
+                        pnl_rs = (qty * (target_price - proximal_line))
                         exit_date = df.index[j].date()
                         break
-                    # Executes exactly on Day 0 if max_hold_days is 0 (Same Day Exit)
                     elif max_hold_days is not None and days_in_trade >= max_hold_days:
-                        if day_close >= proximal_line:
-                            outcome = "Time Exit (Win)"
-                        else:
-                            outcome = "Time Exit (Loss)"
-                            
-                        pnl_rs = (qty * (day_close - proximal_line)) if risk_amount else 0.0
+                        outcome = "Time Exit (Win)" if day_close >= proximal_line else "Time Exit (Loss)"
+                        pnl_rs = (qty * (day_close - proximal_line))
                         exit_date = df.index[j].date()
                         break
             
             if mode == "Live Scan (Same Day)":
-                if is_invalidated or is_tested: continue
-                try:
-                    if float(t.fast_info.day_low) <= (proximal_line * 1.0025): continue
-                except:
-                    if cmp <= (proximal_line * 1.0025): continue
+                if is_invalidated or is_tested: 
+                    continue
+                if cmp <= (proximal_line * 1.0025): 
+                    continue
                     
                 distance_pct = ((cmp - proximal_line) / cmp) * 100
                 results.append({
@@ -207,7 +204,7 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
                 })
             
             elif mode == "Historical Backtest":
-                if is_tested and not is_invalidated:
+                if is_tested and not is_invalidated and entry_idx is not None:
                     entry_date = df.index[entry_idx].date()
                     if start_date <= entry_date <= end_date:
                         results.append({
@@ -228,21 +225,22 @@ def analyze_ticker(ticker, mode, start_date=None, end_date=None, risk_amount=Non
 
 # --- STREAMLIT UI ---
 st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Institutional structural scanner with configurable Time Exits and Stop Loss Toggles.")
+st.markdown("Automated 1:2 RR institutional zone scanner with time-based exits and complete universe support.")
 
 st.sidebar.header("Scan Parameters")
 
 universe = st.sidebar.selectbox(
     "Select Stock Universe:",
-    ("Nifty 500", "All NSE Equities (Price > ₹100)")
+    ("All NSE Equities (Price > ₹100)", "Nifty 500"),
+    index=0
 )
 
-mode = st.sidebar.radio("Select Mode:", ("Live Scan (Same Day)", "Historical Backtest"))
+mode = st.sidebar.radio("Select Mode:", ("Historical Backtest", "Live Scan (Same Day)"))
 
 st.sidebar.markdown("---")
 st.sidebar.write("**Stop Loss Controls:**")
-apply_max_sl = st.sidebar.toggle("Enforce Max 2% SL Shift", value=True, help="Shifts your entry deeper if the base zone width is > 2%, capping risk exactly at 2%.")
-apply_min_sl = st.sidebar.toggle("Enforce Min 1.5% SL Filter", value=False, help="Skips trades where the SL is too tight (under 1.5%).")
+apply_max_sl = st.sidebar.toggle("Enforce Max 2% SL Shift", value=True)
+apply_min_sl = st.sidebar.toggle("Enforce Min 1.5% SL Filter", value=False)
 
 start_date, end_date = None, None
 risk_per_trade = None
@@ -257,8 +255,7 @@ if mode == "Historical Backtest":
         min_value=100, 
         max_value=100000, 
         value=1000, 
-        step=500,
-        help="Amount you are willing to lose if Stop Loss is hit."
+        step=500
     )
     
     time_exit_mapping = {
@@ -271,20 +268,15 @@ if mode == "Historical Backtest":
         "10 Trading Days (2 Weeks)": 10
     }
     
-    time_exit_selection = st.sidebar.selectbox(
-        "Max Hold Duration (Time Exit):",
-        list(time_exit_mapping.keys()),
-        index=3, # Defaults to "2 Trading Days"
-        help="Closes the trade at EOD running P&L if SL/Target are not met within this timeframe."
-    )
-    max_hold_days = time_exit_mapping[time_exit_selection]
+    max_hold_days = time_exit_mapping[st.sidebar.selectbox("Max Hold Duration:", list(time_exit_mapping.keys()), index=0)]
     
     st.sidebar.markdown("---")
     st.sidebar.write("**Select Trade Entry Window:**")
     
     date_range = st.sidebar.date_input(
         "Date Range", 
-        value=(date.today() - pd.DateOffset(days=180), date.today()),
+        value=(date(2017, 1, 1), date.today()),
+        min_value=date(2017, 1, 1),
         max_value=date.today()
     )
     
@@ -294,37 +286,38 @@ if mode == "Historical Backtest":
         start_date, end_date = date_range[0], date_range[0]
 
 if st.sidebar.button("Run Scan"):
-    if universe == "Nifty 500":
-        tickers = get_live_nifty500_symbols()
-    else:
-        tickers = get_all_nse_symbols()
+    tickers = get_all_nse_symbols() if universe == "All NSE Equities (Price > ₹100)" else get_live_nifty500_symbols()
     
     if not tickers:
-        st.error("Failed to fetch the stock list from NSE. Please try again.")
+        st.error("Failed to fetch stock list from NSE.")
     else:
         all_results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        with st.spinner(f"Executing {mode} across {universe}..."):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(analyze_ticker, t, mode, start_date, end_date, risk_per_trade, max_hold_days, apply_max_sl, apply_min_sl): t for t in tickers}
+        with st.spinner(f"Scanning {len(tickers)} equities..."):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+                future_to_ticker = {executor.submit(fetch_stock_history, t): t for t in tickers}
                 
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    res = future.result()
-                    if res:
-                        for z in res:
-                            all_results.append(z)
-                            
-                    if i % 10 == 0 or i == len(tickers) - 1:
-                        progress_bar.progress((i + 1) / len(tickers))
-                        status_text.text(f"Processed {i + 1} / {len(tickers)} equities...")
+                completed = 0
+                for future in concurrent.futures.as_completed(future_to_ticker):
+                    completed += 1
+                    ticker, df_stock = future.result()
+                    
+                    if df_stock is not None:
+                        res = analyze_ticker(ticker, df_stock, mode, start_date, end_date, risk_per_trade, max_hold_days, apply_max_sl, apply_min_sl)
+                        if res:
+                            for item in res:
+                                all_results.append(item)
+                    
+                    if completed % 50 == 0 or completed == len(tickers):
+                        progress_bar.progress(completed / len(tickers))
+                        status_text.text(f"Processed {completed} / {len(tickers)} equities...")
 
         status_text.text("Scan complete!")
         
         if all_results:
             df_res = pd.DataFrame(all_results)
-            
             if mode == "Historical Backtest":
                 df_res = df_res.sort_values(by="Entry Date", ascending=False).reset_index(drop=True)
                 
@@ -332,17 +325,15 @@ if st.sidebar.button("Run Scan"):
                 wins = len(df_res[df_res["Outcome"].str.contains("Win", na=False)])
                 losses = len(df_res[df_res["Outcome"].str.contains("Loss", na=False)])
                 pending = len(df_res[df_res["Outcome"] == "Pending"])
-                
                 win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
                 total_profit = df_res["P&L (₹)"].sum()
                 
                 st.markdown("### Backtest Performance Dashboard")
-                col1, col2, col3, col4 = st.columns(4)
-                
-                col1.metric("Win Rate", f"{win_rate:.1f}%", help="Includes TP hits and winning Time Exits.")
-                col2.metric("Total Net P&L", f"₹ {total_profit:,.2f}", delta=f"{'Profit' if total_profit > 0 else 'Loss'}")
-                col3.metric("Trades Triggered", len(df_res))
-                col4.metric("Pending/Open", pending)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Win Rate", f"{win_rate:.1f}%")
+                c2.metric("Total Net P&L", f"₹ {total_profit:,.2f}", delta=f"{'Profit' if total_profit > 0 else 'Loss'}")
+                c3.metric("Trades Triggered", len(df_res))
+                c4.metric("Pending/Open", pending)
                 
                 def style_outcome(val):
                     if pd.isna(val): return ''
@@ -357,14 +348,14 @@ if st.sidebar.button("Run Scan"):
                         "Target (₹)": "{:.2f}",
                         "P&L (₹)": "{:.2f}"
                     }),
-                    use_container_width=True,
+                    use_container_width=True, 
                     height=500
                 )
             else:
                 df_res = df_res.sort_values(by="Required fall %").reset_index(drop=True)
                 st.markdown(f"### Active Untested Zones ({universe})")
                 st.dataframe(df_res, use_container_width=True, height=500)
-            
+                
             csv = df_res.to_csv(index=False).encode('utf-8')
             file_prefix = "Live" if mode == "Live Scan (Same Day)" else f"Backtest_{start_date}_to_{end_date}"
             st.download_button(
