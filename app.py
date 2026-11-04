@@ -6,6 +6,7 @@ import requests
 import io
 import concurrent.futures
 import time
+import os
 from datetime import datetime, date
 import warnings
 import logging
@@ -14,6 +15,9 @@ warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="NSE Daily Demand Zone Scanner", layout="wide")
+
+CACHE_DIR = "./nse_data_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 @st.cache_data(ttl=86400)
 def get_live_nifty500_symbols():
@@ -41,16 +45,39 @@ def get_all_nse_symbols():
     except Exception:
         return []
 
-def fetch_stock_history(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        # Fetches 10 years of data to support 2017 onwards
-        df = t.history(period="10y", interval="1d", auto_adjust=False)
-        if df is not None and not df.empty and len(df) >= 20:
-            df.index = df.index.tz_localize(None)
-            return ticker, df
-    except Exception:
-        pass
+def get_cached_stock_path(ticker):
+    safe_ticker = ticker.replace('.NS', '').replace('^', '')
+    return os.path.join(CACHE_DIR, f"{safe_ticker}.parquet")
+
+def load_or_fetch_ticker(ticker, force_refresh=False):
+    filepath = get_cached_stock_path(ticker)
+    
+    # 1. Read from local cache if available
+    if not force_refresh and os.path.exists(filepath):
+        try:
+            df = pd.read_parquet(filepath)
+            if not df.empty and len(df) >= 20:
+                return ticker, df
+        except Exception:
+            pass
+            
+    # 2. Fetch from Yahoo Finance if missing or forced
+    for attempt in range(3):
+        try:
+            t = yf.Ticker(ticker)
+            df = t.history(period="10y", interval="1d", auto_adjust=False)
+            if df is not None and not df.empty and len(df) >= 20:
+                df.index = df.index.tz_localize(None)
+                # Save locally so it never needs to be downloaded again
+                try:
+                    df.to_parquet(filepath)
+                except Exception:
+                    pass
+                return ticker, df
+        except Exception:
+            time.sleep(1 + attempt)
+        time.sleep(0.05)
+        
     return ticker, None
 
 def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount=1000, max_hold_days=None, apply_max_sl=True, apply_min_sl=False):
@@ -105,7 +132,6 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
             if first_legout_close < (base_high * 1.01): 
                 continue
             
-            # Legout Continuation Chain
             current_idx = i
             total_legouts = 1
             pause_used = False
@@ -128,7 +154,6 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
             if pct_move < 7.0: 
                 continue
             
-            # Stop Loss Rules
             sl_pct = (proximal_line - distal_line) / proximal_line
             if apply_max_sl and sl_pct > 0.02:
                 proximal_line = distal_line / 0.98
@@ -144,7 +169,6 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
             target_price = proximal_line + (2 * sl_points)
             qty = int(risk_amount / sl_points) if risk_amount else 0
 
-            # Forward Test of this isolated zone
             is_invalidated = False
             is_tested = False
             entry_idx = None
@@ -225,7 +249,7 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
 
 # --- STREAMLIT UI ---
 st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Automated 1:2 RR institutional zone scanner with time-based exits and complete universe support.")
+st.markdown("Deterministic, rate-limit protected demand zone backtesting engine with persistent local caching.")
 
 st.sidebar.header("Scan Parameters")
 
@@ -236,6 +260,10 @@ universe = st.sidebar.selectbox(
 )
 
 mode = st.sidebar.radio("Select Mode:", ("Historical Backtest", "Live Scan (Same Day)"))
+
+st.sidebar.markdown("---")
+st.sidebar.write("**Data Cache Settings:**")
+force_refresh = st.sidebar.checkbox("Force Redownload Fresh Data", value=False, help="Enable only if you want to update historical candles from Yahoo Finance.")
 
 st.sidebar.markdown("---")
 st.sidebar.write("**Stop Loss Controls:**")
@@ -295,9 +323,9 @@ if st.sidebar.button("Run Scan"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        with st.spinner(f"Scanning {len(tickers)} equities..."):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-                future_to_ticker = {executor.submit(fetch_stock_history, t): t for t in tickers}
+        with st.spinner(f"Analyzing {len(tickers)} equities (using persistent local cache)..."):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                future_to_ticker = {executor.submit(load_or_fetch_ticker, t, force_refresh): t for t in tickers}
                 
                 completed = 0
                 for future in concurrent.futures.as_completed(future_to_ticker):
