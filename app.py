@@ -1,514 +1,261 @@
-import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
 import io
 import concurrent.futures
-import time
-import os
-import pickle
-import gc
-from datetime import datetime, date, time as dtime, timedelta
+from datetime import datetime, date
 import warnings
-import logging
 
 warnings.filterwarnings('ignore')
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-st.set_page_config(page_title="NSE Demand Zone Scanner", layout="wide")
-
-CACHE_DIR = "/tmp/nse_pickle_cache"
-CACHE_DIR_1H = "/tmp/nse_1h_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(CACHE_DIR_1H, exist_ok=True)
-
-@st.cache_data(ttl=86400)
-def get_live_nifty500_symbols():
+# -------------------------------------------------------------
+# 1. UNIVERSE FETCH (NIFTY 500 EQUITIES)
+# -------------------------------------------------------------
+def get_nifty500_symbols():
     url = "https://niftyindices.com/IndexConstituent/ind_nifty500list.csv"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        df = pd.read_csv(io.StringIO(response.text))
-        return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
+        res = requests.get(url, headers=headers, timeout=10)
+        df = pd.read_csv(io.StringIO(res.text))
+        return [str(sym).strip() + '.NS' for sym in df['Symbol']]
     except Exception:
-        return []
+        # Fallback list of top liquid symbols if offline
+        return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'BHARTIARTL.NS', 
+                'SBIN.NS', 'INFY.NS', 'LT.NS', 'TATAMOTORS.NS', 'DIXON.NS', 'PERSISTENT.NS']
 
-@st.cache_data(ttl=86400)
-def get_all_nse_symbols():
-    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        df = pd.read_csv(io.StringIO(response.text))
-        df.columns = df.columns.str.strip()
-        df = df[df['SERIES'] == 'EQ']
-        return [str(symbol).strip() + '.NS' for symbol in df['SYMBOL']]
-    except Exception:
-        return []
-
-def load_daily_ticker(ticker, force_refresh=False):
-    safe_ticker = ticker.replace('.NS', '').replace('^', '').replace('&', '_')
-    filepath = os.path.join(CACHE_DIR, f"{safe_ticker}.pkl")
-    
-    if not force_refresh and os.path.exists(filepath):
-        try:
-            with open(filepath, 'rb') as f:
-                df = pickle.load(f)
-            if df is not None and not df.empty and len(df) >= 20:
-                return ticker, df, "cached"
-        except Exception:
-            pass
-            
-    for attempt in range(2):
-        try:
-            t = yf.Ticker(ticker)
-            df = t.history(period="730d", interval="1d", auto_adjust=False)
-            if df is not None and not df.empty and len(df) >= 20:
-                df.index = df.index.tz_localize(None)
-                with open(filepath, 'wb') as f:
-                    pickle.dump(df, f)
-                return ticker, df, "downloaded"
-        except Exception:
-            time.sleep(1 + attempt)
-        time.sleep(0.05)
-        
-    return ticker, None, "failed"
-
-def fetch_hourly_data(ticker, start_date_str):
-    safe_ticker = ticker.replace('.NS', '').replace('^', '').replace('&', '_')
-    filepath = os.path.join(CACHE_DIR_1H, f"{safe_ticker}_{start_date_str}.pkl")
-    
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, 'rb') as f:
-                return pickle.load(f)
-        except Exception:
-            pass
-            
+# -------------------------------------------------------------
+# 2. DATA FETCHER & TIMEFRAME RESAMPLING
+# -------------------------------------------------------------
+def fetch_and_resample(ticker):
     try:
         t = yf.Ticker(ticker)
-        df_1h = t.history(start=start_date_str, interval="1h", auto_adjust=False)
-        if df_1h is not None and not df_1h.empty:
-            df_1h.index = df_1h.index.tz_localize(None)
-            with open(filepath, 'wb') as f:
-                pickle.dump(df_1h, f)
-            return df_1h
+        df_d = t.history(period="3y", interval="1d", auto_adjust=False)
+        if df_d.empty or len(df_d) < 100:
+            return None, None, None
+            
+        df_d.index = df_d.index.tz_localize(None)
+        
+        # Resample Daily to Weekly (ITF)
+        df_w = df_d.resample('W-FRI').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna()
+        
+        # Resample Daily to Monthly (HTF)
+        df_m = df_d.resample('ME').agg({
+            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+        }).dropna()
+        
+        return df_d, df_w, df_m
     except Exception:
-        pass
-    return None
+        return None, None, None
 
-def evaluate_with_1h_candles(ticker, entry_date, proximal, distal, target, qty, sl_points, max_hold_days, only_after_10am=True):
-    start_str = entry_date.strftime('%Y-%m-%d')
-    df_1h = fetch_hourly_data(ticker, start_str)
-    
-    if df_1h is None or df_1h.empty:
-        return "Win", qty * (target - proximal), entry_date.strftime('%Y-%m-%d')
-        
-    in_trade = False
-    entry_bar_idx = None
-    max_hourly_bars = (max_hold_days * 7) if (max_hold_days is not None and max_hold_days > 0) else None
-    
-    for idx, (timestamp, bar) in enumerate(df_1h.iterrows()):
-        bar_low = bar['Low']
-        bar_high = bar['High']
-        bar_close = bar['Close']
-        bar_time = timestamp.time()
-        
-        # Step 1: Detect entry
-        if not in_trade:
-            # Distal breakdown check
-            if bar_low < distal:
-                return "Invalidated Pre-Entry", 0.0, timestamp.strftime('%Y-%m-%d %H:%M')
-            
-            # Check if this candle reaches the demand zone
-            if bar_low <= (proximal * 1.0025):
-                # 10:00 AM Filter: 09:15 bar starts before 10:00 AM
-                if only_after_10am and bar_time < dtime(10, 0):
-                    return "Skipped (Pre-10 AM Touch)", 0.0, timestamp.strftime('%Y-%m-%d %H:%M')
-                
-                # Valid entry after 10:00 AM
-                in_trade = True
-                entry_bar_idx = idx
-                
-                if bar_low < distal:
-                    return "Loss", -(qty * sl_points), timestamp.strftime('%Y-%m-%d %H:%M')
-                if bar_high >= target and bar_close >= target:
-                    return "Win", qty * (target - proximal), timestamp.strftime('%Y-%m-%d %H:%M')
-            continue
-            
-        # Step 2: Track hourly bars after entry
-        if in_trade:
-            bars_held = idx - entry_bar_idx
-            
-            if bar_low < distal:
-                return "Loss", -(qty * sl_points), timestamp.strftime('%Y-%m-%d %H:%M')
-                
-            if bar_high >= target:
-                return "Win", qty * (target - proximal), timestamp.strftime('%Y-%m-%d %H:%M')
-                
-            if max_hourly_bars is not None and bars_held >= max_hourly_bars:
-                pnl = qty * (bar_close - proximal)
-                outcome = "Time Exit (Win)" if bar_close >= proximal else "Time Exit (Loss)"
-                return outcome, pnl, timestamp.strftime('%Y-%m-%d %H:%M')
-                
-    return "Pending", 0.0, "Open"
-
-def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount=1000, 
-                   max_hold_days=None, apply_max_sl=True, apply_min_sl=False, 
-                   use_1h_precision=True, apply_compression=True, max_compression_ratio=0.75,
-                   only_after_10am=True):
+# -------------------------------------------------------------
+# 3. MIT STRATEGY ENGINE
+# -------------------------------------------------------------
+def scan_mit_trades_october(ticker, df_d, df_w, df_m, risk_per_trade=5000):
     try:
-        cmp = float(df['Close'].iloc[-1])
-        if pd.isna(cmp) or cmp <= 100: 
-            return None
+        cmp = float(df_d['Close'].iloc[-1])
+        if cmp < 100:
+            return []
 
-        df['Range'] = (df['High'] - df['Low']).replace(0, np.nan)
-        df['Body'] = abs(df['Close'] - df['Open'])
-        df['Body_Ratio'] = df['Body'] / df['Range']
+        # --- A. MONTHLY CURVE ANALYSIS (HTF) ---
+        # Find 12-month high and low to evaluate if price is in the lower 50% (Low on Curve)
+        m_recent = df_m.iloc[-12:]
+        if len(m_recent) < 6:
+            return []
+        m_high = m_recent['High'].max()
+        m_low = m_recent['Low'].min()
+        curve_range = m_high - m_low
+        if curve_range <= 0:
+            return []
 
-        df['isLegIn'] = df['Body_Ratio'] > 0.65
-        df['isBase'] = df['Body_Ratio'] < 0.40
-        df['isBullish'] = df['Close'] > df['Open']
-        df['isLegOutCandle'] = df['isBullish'] & (df['Body_Ratio'] > 0.65)
+        # --- B. WEEKLY TREND ANALYSIS (ITF) ---
+        # 20 EMA trend filter on weekly chart
+        df_w['EMA20'] = df_w['Close'].ewm(span=20, adjust=False).mean()
 
-        results = []
-        n = len(df)
+        # --- C. DAILY DEMAND ZONE (LTF EXECUTION) ---
+        df_d['Range'] = (df_d['High'] - df_d['Low']).replace(0, np.nan)
+        df_d['Body'] = abs(df_d['Close'] - df_d['Open'])
+        df_d['Body_Ratio'] = df_d['Body'] / df_d['Range']
+        df_d['isLegIn'] = df_d['Body_Ratio'] > 0.60
+        df_d['isBase'] = df_d['Body_Ratio'] < 0.40
+        df_d['isBullish'] = df_d['Close'] > df_d['Open']
+        df_d['isLegOut'] = df_d['isBullish'] & (df_d['Body_Ratio'] > 0.60)
 
-        for i in range(3, n - 1):
-            if not df['isLegOutCandle'].iloc[i]: 
+        trades = []
+        n = len(df_d)
+
+        # Scan for zones formed in the trailing 2 years
+        for i in range(4, n - 1):
+            if not df_d['isLegOut'].iloc[i]:
                 continue
-                
-            is_1base = df['isBase'].iloc[i-1] and df['isLegIn'].iloc[i-2]
+
+            # Identify 1-base or 2-base DBR / RBR
+            is_1base = df_d['isBase'].iloc[i-1] and df_d['isLegIn'].iloc[i-2]
             is_2base = False
-            if i >= 4:
-                is_2base = df['isBase'].iloc[i-1] and df['isBase'].iloc[i-2] and df['isLegIn'].iloc[i-3]
-            
-            if not (is_1base or is_2base): 
-                continue
-                
-            first_legout_range = df['Range'].iloc[i]
-            first_legout_close = df['Close'].iloc[i]
-            base_close = df['Close'].iloc[i-1] 
-            
-            if is_1base:
-                legin_range = df['Range'].iloc[i-2]
-                base_high = df['High'].iloc[i-1]
-                proximal_line = max(df['Open'].iloc[i-1], df['Close'].iloc[i-1])
-                distal_line = df['Low'].iloc[i-1]
-                base_date = df.index[i-1].strftime('%Y-%m-%d')
-            else:
-                legin_range = df['Range'].iloc[i-3]
-                base_high = max(df['High'].iloc[i-1], df['High'].iloc[i-2])
-                proximal_line = max(df['Open'].iloc[i-1], df['Close'].iloc[i-1], df['Open'].iloc[i-2], df['Close'].iloc[i-2])
-                distal_line = min(df['Low'].iloc[i-1], df['Low'].iloc[i-2])
-                base_date = f"{df.index[i-2].strftime('%Y-%m-%d')} to {df.index[i-1].strftime('%Y-%m-%d')}"
-            
-            if legin_range < 0.5 * first_legout_range: 
-                continue
-            if first_legout_close < (base_high * 1.01): 
-                continue
-            
-            current_idx = i
-            total_legouts = 1
-            pause_used = False
-            
-            while current_idx + 1 < n:
-                if df['isLegOutCandle'].iloc[current_idx + 1]:
-                    current_idx += 1
-                    total_legouts += 1
-                elif not pause_used and df['isBase'].iloc[current_idx + 1] and current_idx + 2 < n and df['isLegOutCandle'].iloc[current_idx + 2]:
-                    current_idx += 2
-                    total_legouts += 1
-                    pause_used = True
-                else:
-                    break
-                
-            last_legout_idx = current_idx
-            move_end_price = df['Close'].iloc[last_legout_idx]
-            pct_move = ((move_end_price - base_close) / base_close) * 100
-            
-            if pct_move < 7.0: 
-                continue
-            
-            sl_pct = (proximal_line - distal_line) / proximal_line
-            if apply_max_sl and sl_pct > 0.02:
-                proximal_line = distal_line / 0.98
-                sl_pct = 0.02
-                
-            if apply_min_sl and sl_pct < 0.015:
-                continue
-                
-            sl_points = proximal_line - distal_line
-            if sl_points <= 0:
-                continue
-                
-            target_price = proximal_line + (2 * sl_points)
-            qty = int(risk_amount / sl_points) if risk_amount else 0
+            if i >= 5:
+                is_2base = df_d['isBase'].iloc[i-1] and df_d['isBase'].iloc[i-2] and df_d['isLegIn'].iloc[i-3]
 
-            is_invalidated = False
+            if not (is_1base or is_2base):
+                continue
+
+            # Zone Boundaries
+            if is_1base:
+                base_high = df_d['High'].iloc[i-1]
+                proximal = max(df_d['Open'].iloc[i-1], df_d['Close'].iloc[i-1])
+                distal = df_d['Low'].iloc[i-1]
+                base_date = df_d.index[i-1]
+                legin_range = df_d['Range'].iloc[i-2]
+            else:
+                base_high = max(df_d['High'].iloc[i-1], df_d['High'].iloc[i-2])
+                proximal = max(df_d['Open'].iloc[i-1], df_d['Close'].iloc[i-1], df_d['Open'].iloc[i-2], df_d['Close'].iloc[i-2])
+                distal = min(df_d['Low'].iloc[i-1], df_d['Low'].iloc[i-2])
+                base_date = df_d.index[i-1]
+                legin_range = df_d['Range'].iloc[i-3]
+
+            first_legout_range = df_d['Range'].iloc[i]
+            first_legout_close = df_d['Close'].iloc[i]
+
+            # Quality Check 1: 2x Departure Imbalance
+            if legin_range > (0.50 * first_legout_range):
+                continue
+            # Quality Check 2: 1% Breakout Clearance above base
+            if first_legout_close < (base_high * 1.01):
+                continue
+
+            # Check Departure Momentum (>= 7% move)
+            curr = i
+            while curr + 1 < n and df_d['isLegOut'].iloc[curr + 1]:
+                curr += 1
+            last_legout_idx = curr
+            pct_move = ((df_d['Close'].iloc[last_legout_idx] - proximal) / proximal) * 100
+            if pct_move < 7.0:
+                continue
+
+            # Stop Loss & Risk
+            sl_points = proximal - distal
+            if sl_points <= 0 or (sl_points / proximal) > 0.035: # Cap wide zones > 3.5%
+                continue
+            target_price = proximal + (2 * sl_points)
+            qty = int(risk_per_trade / sl_points)
+
+            # Check Forward Retest
             is_tested = False
+            is_invalidated = False
             entry_idx = None
-            
+
             for j in range(last_legout_idx + 1, n):
-                day_low = df['Low'].iloc[j]
-                day_close = df['Close'].iloc[j]
-                
+                d_low = df_d['Low'].iloc[j]
+                d_close = df_d['Close'].iloc[j]
+
                 if not is_tested:
-                    if day_close < distal_line:
+                    if d_close < distal:
                         is_invalidated = True
-                        break 
-                    if day_low <= (proximal_line * 1.0025):
+                        break
+                    if d_low <= (proximal * 1.0025):
                         is_tested = True
                         entry_idx = j
                         break
-            
-            # --- PULLBACK COMPRESSION CALCULATION ---
-            legout_indices = list(range(i, last_legout_idx + 1))
-            avg_legout_range = df['Range'].iloc[legout_indices].mean()
-            
-            if mode == "Historical Backtest":
-                if is_tested and not is_invalidated and entry_idx is not None:
-                    entry_date = df.index[entry_idx].date()
-                    if start_date <= entry_date <= end_date:
-                        pullback_indices = list(range(last_legout_idx + 1, entry_idx + 1))
-                        avg_pullback_range = df['Range'].iloc[pullback_indices].mean()
-                        max_pullback_range = df['Range'].iloc[pullback_indices].max()
-                        
-                        compression_ratio = avg_pullback_range / avg_legout_range if avg_legout_range > 0 else 1.0
-                        
-                        if apply_compression:
-                            is_compressed = compression_ratio <= max_compression_ratio
-                            no_supply_spike = max_pullback_range <= (first_legout_range * 1.10)
-                            is_gradual = len(pullback_indices) >= len(legout_indices)
-                            if not (is_compressed and no_supply_spike and is_gradual):
-                                continue
 
-                        if use_1h_precision:
-                            outcome, pnl_rs, exit_date_str = evaluate_with_1h_candles(
-                                ticker, entry_date, proximal_line, distal_line, target_price, qty, sl_points, 
-                                max_hold_days, only_after_10am=only_after_10am
-                            )
-                            # If skipped due to pre-10 AM touch, do not execute the trade
-                            if outcome.startswith("Skipped"):
-                                continue
-                        else:
-                            outcome, pnl_rs, exit_date_str = "Pending", 0.0, "N/A"
-
-                        results.append({
-                            "Stock Symbol": ticker.replace('.NS', ''),
-                            "Entry Date": entry_date.strftime('%Y-%m-%d'),
-                            "Exit Timestamp": exit_date_str,
-                            "Entry (₹)": round(proximal_line, 2),
-                            "SL (₹)": round(distal_line, 2),
-                            "Target (₹)": round(target_price, 2),
-                            "Qty": qty,
-                            "Compression Ratio": round(compression_ratio, 2),
-                            "P&L (₹)": round(pnl_rs, 2),
-                            "Outcome": outcome
-                        })
-            
-            elif mode == "Live Scan (Same Day)":
-                if is_invalidated or is_tested: 
-                    continue
-                if cmp <= (proximal_line * 1.0025): 
-                    continue
-                
-                pullback_indices = list(range(last_legout_idx + 1, n))
-                if pullback_indices:
-                    avg_pullback_range = df['Range'].iloc[pullback_indices].mean()
-                    max_pullback_range = df['Range'].iloc[pullback_indices].max()
-                    compression_ratio = avg_pullback_range / avg_legout_range if avg_legout_range > 0 else 1.0
-                else:
-                    compression_ratio = 0.0
-                
-                if apply_compression and pullback_indices:
-                    is_compressed = compression_ratio <= max_compression_ratio
-                    no_supply_spike = max_pullback_range <= (first_legout_range * 1.10)
-                    if not (is_compressed and no_supply_spike):
+            # FILTER FOR OCTOBER 2026 ENTRIES ONLY
+            if is_tested and not is_invalidated and entry_idx is not None:
+                entry_dt = df_d.index[entry_idx]
+                if entry_dt.year == 2026 and entry_dt.month == 10:
+                    
+                    # 1. VERIFY HTF (MONTHLY CURVE) AT TIME OF ENTRY
+                    curve_pos = (proximal - m_low) / curve_range
+                    if curve_pos > 0.60:  # Must be in lower 60% of macro curve
                         continue
-                    
-                distance_pct = ((cmp - proximal_line) / cmp) * 100
-                results.append({
-                    "Stock Symbol": ticker.replace('.NS', ''),
-                    "CMP (₹)": round(cmp, 2),
-                    "Base date": base_date,
-                    "Proximal": round(proximal_line, 2),
-                    "Distal": round(distal_line, 2),
-                    "Compression Ratio": round(compression_ratio, 2) if pullback_indices else "N/A",
-                    "Legout candles": f"{total_legouts} (incl. pause)" if pause_used else str(total_legouts),
-                    "Legout % move": round(pct_move, 2),
-                    "Required fall %": round(distance_pct, 2)
-                })
-            
-        return results if results else None
+
+                    # 2. VERIFY ITF (WEEKLY TREND) AT TIME OF ENTRY
+                    w_slice = df_w[df_w.index <= entry_dt]
+                    if len(w_slice) < 5:
+                        continue
+                    # Price above or near 20-week EMA
+                    weekly_close = w_slice['Close'].iloc[-1]
+                    weekly_ema = w_slice['EMA20'].iloc[-1]
+                    if weekly_close < (weekly_ema * 0.97): # Reject strong downtrends
+                        continue
+
+                    # 3. EVALUATE OUTCOME (Swing holding: up to 30 trading days)
+                    outcome = "Pending"
+                    exit_date = None
+                    pnl = 0.0
+
+                    for k in range(entry_idx, min(entry_idx + 35, n)):
+                        bar_high = df_d['High'].iloc[k]
+                        bar_low = df_d['Low'].iloc[k]
+                        bar_close = df_d['Close'].iloc[k]
+
+                        if bar_low < distal:
+                            outcome = "Loss"
+                            exit_date = df_d.index[k].strftime('%Y-%m-%d')
+                            pnl = -(qty * sl_points)
+                            break
+                        elif bar_high >= target_price:
+                            outcome = "Win (Target 1:2)"
+                            exit_date = df_d.index[k].strftime('%Y-%m-%d')
+                            pnl = qty * (target_price - proximal)
+                            break
+                    else:
+                        # If still holding after 35 days
+                        curr_pnl = qty * (df_d['Close'].iloc[-1] - proximal)
+                        outcome = "Holding / Open"
+                        exit_date = "Active"
+                        pnl = curr_pnl
+
+                    trades.append({
+                        "Symbol": ticker.replace('.NS', ''),
+                        "Entry Date": entry_dt.strftime('%Y-%m-%d'),
+                        "Zone Type": "DBR" if is_1base else "2-Base DBR",
+                        "Entry (₹)": round(proximal, 2),
+                        "SL (₹)": round(distal, 2),
+                        "Target (₹)": round(target_price, 2),
+                        "SL %": round((sl_points / proximal) * 100, 2),
+                        "Curve Pos": f"{round(curve_pos * 100)}% (Low)" if curve_pos < 0.4 else "Equilibrium",
+                        "Outcome": outcome,
+                        "Exit Date": exit_date,
+                        "P&L (₹)": round(pnl, 2)
+                    })
+
+        return trades
     except Exception:
-        return None
+        return []
 
-# --- STREAMLIT UI ---
-st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Multi-timeframe engine: Daily zone detection with **1-hour candle execution**, **pullback compression filtering**, and **10:00 AM timing controls**.")
-
-st.sidebar.header("Scan Parameters")
-
-universe = st.sidebar.selectbox(
-    "Select Stock Universe:",
-    ("Nifty 500", "All NSE Equities (Price > ₹100)"),
-    index=0
-)
-
-mode = st.sidebar.radio("Select Mode:", ("Historical Backtest", "Live Scan (Same Day)"))
-
-st.sidebar.markdown("---")
-st.sidebar.write("**Execution & Timing Controls:**")
-use_1h_precision = st.sidebar.checkbox("Use 1-Hour Intraday Precision", value=True, help="Tracks 1-hour candles post-entry to accurately detect target breaches.")
-only_after_10am = st.sidebar.toggle("Only Allow Entry After 10:00 AM", value=True, help="Avoids taking entries triggered during the opening 45-min volatility (9:15–10:00 AM).")
-force_refresh = st.sidebar.checkbox("Force Redownload Fresh Data", value=False)
-
-st.sidebar.markdown("---")
-st.sidebar.write("**Quality & Compression Controls:**")
-apply_compression = st.sidebar.toggle("Enforce Pullback Compression Filter", value=True, help="Only accepts trades where price approaches the zone in small candles relative to the legout rally.")
-max_compression_ratio = st.sidebar.slider(
-    "Max Pullback Compression Ratio:",
-    min_value=0.40,
-    max_value=1.00,
-    value=0.75,
-    step=0.05,
-    help="0.75 means pullback candles must be at least 25% smaller on average than departure candles. Lower = stricter quality."
-)
-
-st.sidebar.markdown("---")
-st.sidebar.write("**Stop Loss Controls:**")
-apply_max_sl = st.sidebar.toggle("Enforce Max 2% SL Shift", value=True)
-apply_min_sl = st.sidebar.toggle("Enforce Min 1.5% SL Filter", value=False)
-
-start_date, end_date = None, None
-risk_per_trade = None
-max_hold_days = None
-
-min_allowed_date = date.today() - timedelta(days=725)
-
-if mode == "Historical Backtest":
-    st.sidebar.markdown("---")
-    st.sidebar.write("**Backtest Settings:**")
+# -------------------------------------------------------------
+# 4. EXECUTION RUNNER
+# -------------------------------------------------------------
+def run_october_mit_backtest():
+    symbols = get_nifty500_symbols()
+    print(f"Loaded {len(symbols)} stocks. Starting MIT scan for October 2026...")
     
-    risk_per_trade = st.sidebar.number_input("Risk Per Trade (₹)", min_value=100, max_value=100000, value=1000, step=500)
+    all_mit_trades = []
     
-    time_exit_mapping = {
-        "No Time Limit": None,
-        "Same Day Exit (Intraday)": 0,
-        "1 Trading Day (Next Day)": 1,
-        "2 Trading Days (Day After Tomorrow)": 2,
-        "3 Trading Days": 3,
-        "5 Trading Days (1 Week)": 5,
-        "10 Trading Days (2 Weeks)": 10
-    }
-    
-    max_hold_days = time_exit_mapping[st.sidebar.selectbox("Max Hold Duration:", list(time_exit_mapping.keys()), index=3)]
-    
-    st.sidebar.markdown("---")
-    st.sidebar.write("**Select Trade Entry Window (730 Days Max for 1H):**")
-    
-    date_range = st.sidebar.date_input(
-        "Date Range", 
-        value=(min_allowed_date, date.today()),
-        min_value=min_allowed_date,
-        max_value=date.today()
-    )
-    
-    if len(date_range) == 2:
-        start_date, end_date = date_range
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        future_map = {}
+        for s in symbols:
+            future = executor.submit(fetch_and_resample, s)
+            future_map[future] = s
+            
+        for future in concurrent.futures.as_completed(future_map):
+            s = future_map[future]
+            df_d, df_w, df_m = future.result()
+            if df_d is not None:
+                res = scan_mit_trades_october(s, df_d, df_w, df_m)
+                if res:
+                    all_mit_trades.extend(res)
+                    print(f" Found {len(res)} MIT trade(s) in {s.replace('.NS', '')}")
+
+    if all_mit_trades:
+        df_results = pd.DataFrame(all_mit_trades)
+        df_results = df_results.sort_values(by="Entry Date").reset_index(drop=True)
+        print("\n================== OCTOBER 2026 MIT RESULTS ==================")
+        print(df_results.to_string())
+        df_results.to_csv("MIT_October_2026_Trades.csv", index=False)
+        print("\nSaved to 'MIT_October_2026_Trades.csv'")
     else:
-        start_date, end_date = date_range[0], date_range[0]
+        print("\nNo high-scoring MIT trades matched the strict curve + trend + zone filters.")
 
-if st.sidebar.button("Run Scan"):
-    tickers = get_live_nifty500_symbols() if universe == "Nifty 500" else get_all_nse_symbols()
-    
-    if not tickers:
-        st.error("Failed to fetch stock list from NSE.")
-    else:
-        all_results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        with st.spinner(f"Analyzing {len(tickers)} equities..."):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-                future_to_ticker = {executor.submit(load_daily_ticker, t, force_refresh): t for t in tickers}
-                
-                completed = 0
-                for future in concurrent.futures.as_completed(future_to_ticker):
-                    completed += 1
-                    ticker, df_stock, status = future.result()
-                    
-                    if df_stock is not None:
-                        res = analyze_ticker(
-                            ticker, df_stock, mode, start_date, end_date, 
-                            risk_per_trade, max_hold_days, apply_max_sl, apply_min_sl, 
-                            use_1h_precision, apply_compression, max_compression_ratio,
-                            only_after_10am=only_after_10am
-                        )
-                        if res:
-                            for item in res:
-                                all_results.append(item)
-                        del df_stock
-                    
-                    if completed % 25 == 0 or completed == len(tickers):
-                        gc.collect()
-                        progress_bar.progress(completed / len(tickers))
-                        status_text.text(f"Processed {completed} / {len(tickers)} equities...")
-
-        status_text.text("Scan complete!")
-
-        if all_results:
-            df_res = pd.DataFrame(all_results)
-            if mode == "Historical Backtest":
-                df_res = df_res.sort_values(by="Entry Date", ascending=False).reset_index(drop=True)
-                
-                total_closed = len(df_res[df_res["Outcome"] != "Pending"])
-                wins = len(df_res[df_res["Outcome"].str.contains("Win", na=False)])
-                losses = len(df_res[df_res["Outcome"].str.contains("Loss", na=False)])
-                pending = len(df_res[df_res["Outcome"] == "Pending"])
-                win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
-                total_profit = df_res["P&L (₹)"].sum()
-                
-                st.markdown("### Backtest Performance Dashboard")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Win Rate", f"{win_rate:.1f}%")
-                c2.metric("Total Net P&L", f"₹ {total_profit:,.2f}", delta=f"{'Profit' if total_profit > 0 else 'Loss'}")
-                c3.metric("Trades Triggered", len(df_res))
-                c4.metric("Pending/Open", pending)
-                
-                def style_outcome(val):
-                    if pd.isna(val): return ''
-                    if 'Win' in val: return 'color: green'
-                    if 'Loss' in val: return 'color: red'
-                    return 'color: gray'
-                
-                st.dataframe(
-                    df_res.style.map(style_outcome, subset=['Outcome']).format({
-                        "Entry (₹)": "{:.2f}",
-                        "SL (₹)": "{:.2f}",
-                        "Target (₹)": "{:.2f}",
-                        "Compression Ratio": "{:.2f}",
-                        "P&L (₹)": "{:.2f}"
-                    }),
-                    use_container_width=True, 
-                    height=500
-                )
-            else:
-                df_res = df_res.sort_values(by="Required fall %").reset_index(drop=True)
-                st.markdown(f"### Active Untested Zones ({universe})")
-                st.dataframe(df_res, use_container_width=True, height=500)
-                
-            csv = df_res.to_csv(index=False).encode('utf-8')
-            file_label = "Filtered_Backtest" if mode == "Historical Backtest" else "Filtered_Live_Zones"
-            st.download_button(
-                label="📥 Download Data CSV",
-                data=csv,
-                file_name=f"{file_label}_{universe.replace(' ', '_')}.csv",
-                mime="text/csv",
-            )
-        else:
-            st.warning("No demand zones matched your criteria for the selected parameters.")
+if __name__ == "__main__":
+    run_october_mit_backtest()
