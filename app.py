@@ -7,6 +7,7 @@ import io
 import concurrent.futures
 import time
 import os
+import pickle
 from datetime import datetime, date
 import warnings
 import logging
@@ -16,7 +17,8 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="NSE Daily Demand Zone Scanner", layout="wide")
 
-CACHE_DIR = "./nse_data_cache"
+# Directory for zero-dependency persistent disk cache
+CACHE_DIR = "./nse_pickle_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 @st.cache_data(ttl=86400)
@@ -45,19 +47,20 @@ def get_all_nse_symbols():
     except Exception:
         return []
 
-def get_cached_stock_path(ticker):
-    safe_ticker = ticker.replace('.NS', '').replace('^', '')
-    return os.path.join(CACHE_DIR, f"{safe_ticker}.parquet")
+def get_cache_filepath(ticker):
+    safe_ticker = ticker.replace('.NS', '').replace('^', '').replace('&', '_')
+    return os.path.join(CACHE_DIR, f"{safe_ticker}.pkl")
 
 def load_or_fetch_ticker(ticker, force_refresh=False):
-    filepath = get_cached_stock_path(ticker)
+    filepath = get_cache_filepath(ticker)
     
-    # 1. Read from local cache if available
+    # 1. Load from local pickle disk cache if available
     if not force_refresh and os.path.exists(filepath):
         try:
-            df = pd.read_parquet(filepath)
-            if not df.empty and len(df) >= 20:
-                return ticker, df
+            with open(filepath, 'rb') as f:
+                df = pickle.load(f)
+            if df is not None and not df.empty and len(df) >= 20:
+                return ticker, df, "cached"
         except Exception:
             pass
             
@@ -68,17 +71,15 @@ def load_or_fetch_ticker(ticker, force_refresh=False):
             df = t.history(period="10y", interval="1d", auto_adjust=False)
             if df is not None and not df.empty and len(df) >= 20:
                 df.index = df.index.tz_localize(None)
-                # Save locally so it never needs to be downloaded again
-                try:
-                    df.to_parquet(filepath)
-                except Exception:
-                    pass
-                return ticker, df
+                # Save locally with built-in pickle (Zero external dependencies)
+                with open(filepath, 'wb') as f:
+                    pickle.dump(df, f)
+                return ticker, df, "downloaded"
         except Exception:
             time.sleep(1 + attempt)
-        time.sleep(0.05)
+        time.sleep(0.08)
         
-    return ticker, None
+    return ticker, None, "failed"
 
 def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount=1000, max_hold_days=None, apply_max_sl=True, apply_min_sl=False):
     try:
@@ -249,7 +250,7 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
 
 # --- STREAMLIT UI ---
 st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Deterministic, rate-limit protected demand zone backtesting engine with persistent local caching.")
+st.markdown("Deterministic, rate-limit protected backtesting engine with persistent local pickle caching.")
 
 st.sidebar.header("Scan Parameters")
 
@@ -262,8 +263,12 @@ universe = st.sidebar.selectbox(
 mode = st.sidebar.radio("Select Mode:", ("Historical Backtest", "Live Scan (Same Day)"))
 
 st.sidebar.markdown("---")
-st.sidebar.write("**Data Cache Settings:**")
-force_refresh = st.sidebar.checkbox("Force Redownload Fresh Data", value=False, help="Enable only if you want to update historical candles from Yahoo Finance.")
+st.sidebar.write("**Data Cache Controls:**")
+force_refresh = st.sidebar.checkbox("Force Redownload Fresh Data", value=False, help="Leave unchecked to run 100% offline from saved cache.")
+
+# Check current cache status on disk
+existing_cached_files = len([f for f in os.listdir(CACHE_DIR) if f.endswith('.pkl')])
+st.sidebar.caption(f"💾 **Cached on Disk:** {existing_cached_files} stocks ready")
 
 st.sidebar.markdown("---")
 st.sidebar.write("**Stop Loss Controls:**")
@@ -322,15 +327,17 @@ if st.sidebar.button("Run Scan"):
         all_results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
+        diag_stats = {"cached": 0, "downloaded": 0, "failed": 0}
         
-        with st.spinner(f"Analyzing {len(tickers)} equities (using persistent local cache)..."):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with st.spinner(f"Processing {len(tickers)} equities..."):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 future_to_ticker = {executor.submit(load_or_fetch_ticker, t, force_refresh): t for t in tickers}
                 
                 completed = 0
                 for future in concurrent.futures.as_completed(future_to_ticker):
                     completed += 1
-                    ticker, df_stock = future.result()
+                    ticker, df_stock, status = future.result()
+                    diag_stats[status] += 1
                     
                     if df_stock is not None:
                         res = analyze_ticker(ticker, df_stock, mode, start_date, end_date, risk_per_trade, max_hold_days, apply_max_sl, apply_min_sl)
@@ -340,10 +347,18 @@ if st.sidebar.button("Run Scan"):
                     
                     if completed % 50 == 0 or completed == len(tickers):
                         progress_bar.progress(completed / len(tickers))
-                        status_text.text(f"Processed {completed} / {len(tickers)} equities...")
+                        status_text.text(
+                            f"Progress: {completed}/{len(tickers)} | Loaded from Disk: {diag_stats['cached']} | Downloaded: {diag_stats['downloaded']} | Dropped by API: {diag_stats['failed']}"
+                        )
 
         status_text.text("Scan complete!")
         
+        # Display Diagnostics Banner
+        if diag_stats['failed'] > 0:
+            st.warning(f"⚠️ Yahoo Finance rate-limited {diag_stats['failed']} stocks during download. Click 'Run Scan' again to fetch the remaining missing stocks into the disk cache.")
+        else:
+            st.success(f"✅ 100% of equities ({len(tickers)}) successfully processed without API drops.")
+
         if all_results:
             df_res = pd.DataFrame(all_results)
             if mode == "Historical Backtest":
