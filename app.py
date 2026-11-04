@@ -9,7 +9,7 @@ import time
 import os
 import pickle
 import gc
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time as dtime, timedelta
 import warnings
 import logging
 
@@ -100,7 +100,7 @@ def fetch_hourly_data(ticker, start_date_str):
         pass
     return None
 
-def evaluate_with_1h_candles(ticker, entry_date, proximal, distal, target, qty, sl_points, max_hold_days):
+def evaluate_with_1h_candles(ticker, entry_date, proximal, distal, target, qty, sl_points, max_hold_days, only_after_10am=True):
     start_str = entry_date.strftime('%Y-%m-%d')
     df_1h = fetch_hourly_data(ticker, start_str)
     
@@ -115,10 +115,21 @@ def evaluate_with_1h_candles(ticker, entry_date, proximal, distal, target, qty, 
         bar_low = bar['Low']
         bar_high = bar['High']
         bar_close = bar['Close']
+        bar_time = timestamp.time()
         
-        # Step 1: Detect exact entry hour
+        # Step 1: Detect entry
         if not in_trade:
+            # Distal breakdown check
+            if bar_low < distal:
+                return "Invalidated Pre-Entry", 0.0, timestamp.strftime('%Y-%m-%d %H:%M')
+            
+            # Check if this candle reaches the demand zone
             if bar_low <= (proximal * 1.0025):
+                # 10:00 AM Filter: 09:15 bar starts before 10:00 AM
+                if only_after_10am and bar_time < dtime(10, 0):
+                    return "Skipped (Pre-10 AM Touch)", 0.0, timestamp.strftime('%Y-%m-%d %H:%M')
+                
+                # Valid entry after 10:00 AM
                 in_trade = True
                 entry_bar_idx = idx
                 
@@ -132,15 +143,12 @@ def evaluate_with_1h_candles(ticker, entry_date, proximal, distal, target, qty, 
         if in_trade:
             bars_held = idx - entry_bar_idx
             
-            # Stop loss check
             if bar_low < distal:
                 return "Loss", -(qty * sl_points), timestamp.strftime('%Y-%m-%d %H:%M')
                 
-            # Target check (2R breach)
             if bar_high >= target:
                 return "Win", qty * (target - proximal), timestamp.strftime('%Y-%m-%d %H:%M')
                 
-            # Time exit check
             if max_hourly_bars is not None and bars_held >= max_hourly_bars:
                 pnl = qty * (bar_close - proximal)
                 outcome = "Time Exit (Win)" if bar_close >= proximal else "Time Exit (Loss)"
@@ -150,7 +158,8 @@ def evaluate_with_1h_candles(ticker, entry_date, proximal, distal, target, qty, 
 
 def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount=1000, 
                    max_hold_days=None, apply_max_sl=True, apply_min_sl=False, 
-                   use_1h_precision=True, apply_compression=True, max_compression_ratio=0.75):
+                   use_1h_precision=True, apply_compression=True, max_compression_ratio=0.75,
+                   only_after_10am=True):
     try:
         cmp = float(df['Close'].iloc[-1])
         if pd.isna(cmp) or cmp <= 100: 
@@ -270,7 +279,6 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
                         
                         compression_ratio = avg_pullback_range / avg_legout_range if avg_legout_range > 0 else 1.0
                         
-                        # Apply Compression Filter if toggled ON
                         if apply_compression:
                             is_compressed = compression_ratio <= max_compression_ratio
                             no_supply_spike = max_pullback_range <= (first_legout_range * 1.10)
@@ -280,8 +288,12 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
 
                         if use_1h_precision:
                             outcome, pnl_rs, exit_date_str = evaluate_with_1h_candles(
-                                ticker, entry_date, proximal_line, distal_line, target_price, qty, sl_points, max_hold_days
+                                ticker, entry_date, proximal_line, distal_line, target_price, qty, sl_points, 
+                                max_hold_days, only_after_10am=only_after_10am
                             )
+                            # If skipped due to pre-10 AM touch, do not execute the trade
+                            if outcome.startswith("Skipped"):
+                                continue
                         else:
                             outcome, pnl_rs, exit_date_str = "Pending", 0.0, "N/A"
 
@@ -312,7 +324,6 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
                 else:
                     compression_ratio = 0.0
                 
-                # Filter live candidates on ongoing pullback
                 if apply_compression and pullback_indices:
                     is_compressed = compression_ratio <= max_compression_ratio
                     no_supply_spike = max_pullback_range <= (first_legout_range * 1.10)
@@ -338,7 +349,7 @@ def analyze_ticker(ticker, df, mode, start_date=None, end_date=None, risk_amount
 
 # --- STREAMLIT UI ---
 st.title("NSE Daily Demand Zone Scanner")
-st.markdown("Multi-timeframe engine: Daily zone detection with **1-hour candle execution** and **pullback compression filtering**.")
+st.markdown("Multi-timeframe engine: Daily zone detection with **1-hour candle execution**, **pullback compression filtering**, and **10:00 AM timing controls**.")
 
 st.sidebar.header("Scan Parameters")
 
@@ -351,13 +362,14 @@ universe = st.sidebar.selectbox(
 mode = st.sidebar.radio("Select Mode:", ("Historical Backtest", "Live Scan (Same Day)"))
 
 st.sidebar.markdown("---")
-st.sidebar.write("**Execution Engine:**")
-use_1h_precision = st.sidebar.checkbox("Use 1-Hour Intraday Precision", value=True, help="Chronologically tracks 1-hour candles post-entry to accurately detect target breaches.")
+st.sidebar.write("**Execution & Timing Controls:**")
+use_1h_precision = st.sidebar.checkbox("Use 1-Hour Intraday Precision", value=True, help="Tracks 1-hour candles post-entry to accurately detect target breaches.")
+only_after_10am = st.sidebar.toggle("Only Allow Entry After 10:00 AM", value=True, help="Avoids taking entries triggered during the opening 45-min volatility (9:15–10:00 AM).")
 force_refresh = st.sidebar.checkbox("Force Redownload Fresh Data", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.write("**Quality & Compression Controls:**")
-apply_compression = st.sidebar.toggle("Enforce Pullback Compression Filter", value=True, help="Only accepts trades where the price approaches the zone in small candles relative to the legout rally.")
+apply_compression = st.sidebar.toggle("Enforce Pullback Compression Filter", value=True, help="Only accepts trades where price approaches the zone in small candles relative to the legout rally.")
 max_compression_ratio = st.sidebar.slider(
     "Max Pullback Compression Ratio:",
     min_value=0.40,
@@ -421,7 +433,7 @@ if st.sidebar.button("Run Scan"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        with st.spinner(f"Analyzing {len(tickers)} equities with compression & 1-hour verification..."):
+        with st.spinner(f"Analyzing {len(tickers)} equities..."):
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                 future_to_ticker = {executor.submit(load_daily_ticker, t, force_refresh): t for t in tickers}
                 
@@ -434,7 +446,8 @@ if st.sidebar.button("Run Scan"):
                         res = analyze_ticker(
                             ticker, df_stock, mode, start_date, end_date, 
                             risk_per_trade, max_hold_days, apply_max_sl, apply_min_sl, 
-                            use_1h_precision, apply_compression, max_compression_ratio
+                            use_1h_precision, apply_compression, max_compression_ratio,
+                            only_after_10am=only_after_10am
                         )
                         if res:
                             for item in res:
@@ -490,7 +503,7 @@ if st.sidebar.button("Run Scan"):
                 st.dataframe(df_res, use_container_width=True, height=500)
                 
             csv = df_res.to_csv(index=False).encode('utf-8')
-            file_label = "Compression_Backtest" if mode == "Historical Backtest" else "Live_Compressed_Zones"
+            file_label = "Filtered_Backtest" if mode == "Historical Backtest" else "Filtered_Live_Zones"
             st.download_button(
                 label="📥 Download Data CSV",
                 data=csv,
