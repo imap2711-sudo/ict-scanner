@@ -7,6 +7,7 @@ import io
 import warnings
 import logging
 import concurrent.futures
+from datetime import datetime
 
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -39,6 +40,21 @@ def get_nifty500_symbols():
         'M&M.NS', 'BAJAJFINSV.NS', 'ASIANPAINT.NS', 'ADANIENT.NS', 'ADANIPORTS.NS', 
         'WIPRO.NS', 'COALINDIA.NS', 'NESTLEIND.NS', 'GRASIM.NS', 'TECHM.NS', 'HINDALCO.NS'
     ]
+
+def check_ema20_rounded_bottom(ema_series, lookback=15):
+    if len(ema_series) < lookback: return False
+    recent_ema = ema_series.iloc[-lookback:].values
+    
+    roc = np.diff(recent_ema)
+    min_idx = np.argmin(recent_ema)
+    
+    if min_idx < 3 or min_idx > lookback - 3:
+        return False
+        
+    falling_before = np.mean(roc[:min_idx]) < 0
+    rising_after = np.mean(roc[min_idx:]) > 0
+    
+    return falling_before and rising_after
 
 # ==========================================
 # TAB 1: DAILY HTF SETUP
@@ -236,32 +252,8 @@ def find_ict_15m_intraday_setups(ticker):
         return None
 
 # ==========================================
-# TAB 3: EMA 20 RESTING SETUP (Titan Setup)
+# TAB 3: EMA 20 RESTING SETUP (LIVE)
 # ==========================================
-def check_ema20_rounded_bottom(ema_series, lookback=15):
-    """
-    Mathematical check for a 'rounded bottom' U-shape convexity on an EMA curve.
-    """
-    if len(ema_series) < lookback: return False
-    recent_ema = ema_series.iloc[-lookback:].values
-    
-    # Calculate Rate of Change (first derivative)
-    roc = np.diff(recent_ema)
-    
-    # Find the trough (lowest point of the EMA curve)
-    min_idx = np.argmin(recent_ema)
-    
-    # Trough must be in the middle, not at the extreme edges, to form a true 'U' shape
-    if min_idx < 3 or min_idx > lookback - 3:
-        return False
-        
-    # Left side of trough must be generally falling
-    falling_before = np.mean(roc[:min_idx]) < 0
-    # Right side of trough must be generally rising
-    rising_after = np.mean(roc[min_idx:]) > 0
-    
-    return falling_before and rising_after
-
 def find_ema20_resting_setups(ticker):
     try:
         t = yf.Ticker(ticker)
@@ -275,14 +267,11 @@ def find_ema20_resting_setups(ticker):
                 
         if pd.isna(cmp) or cmp <= 60: return None
 
-        # 1. Calculate Daily EMA 20
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
         
-        # 2. Check for smooth rounded bottom shape on the EMA
         if not check_ema20_rounded_bottom(df['EMA20']):
             return None
 
-        # 3. Identify PML Sweep (Last Calendar Month)
         current_month_period = df.index[-1].to_period('M')
         previous_month_period = current_month_period - 1
         
@@ -290,26 +279,21 @@ def find_ema20_resting_setups(ticker):
         if prev_month_data.empty: return None
         pml = prev_month_data['Low'].min()
         
-        # 4. Confirm Sweep happened this month
         curr_month_data = df[df.index.to_period('M') == current_month_period]
         sweep_candidates = curr_month_data[curr_month_data['Low'] < pml]
         if sweep_candidates.empty: return None
         
-        # 5. Confirm Thrust Above EMA 20
-        # Check if daily candle successfully closed above the EMA 20 *after* the sweep
         absolute_sweep_day = sweep_candidates['Low'].idxmin()
         post_sweep_data = df.loc[absolute_sweep_day:]
         breakout_days = post_sweep_data[post_sweep_data['Close'] > post_sweep_data['EMA20']]
         
         if breakout_days.empty: return None
         
-        # 6. The "Resting" Phase Check
-        # Current price must be above the EMA20, but within a tight 1.5% buffer zone to act as support
         current_ema20 = df['EMA20'].iloc[-1]
-        if cmp < current_ema20: return None # Slipped below support
+        if cmp < current_ema20: return None 
         
         buffer_zone_ceiling = current_ema20 * 1.015
-        if cmp > buffer_zone_ceiling: return None # Price ran away, not resting on support
+        if cmp > buffer_zone_ceiling: return None 
         
         distance_to_ema = ((cmp - current_ema20) / current_ema20) * 100
 
@@ -323,12 +307,79 @@ def find_ema20_resting_setups(ticker):
     except Exception:
         return None
 
+# ==========================================
+# TAB 4: EMA 20 RESTING BACKTESTER
+# ==========================================
+def backtest_ema20_setups(ticker, target_year, target_month):
+    try:
+        t = yf.Ticker(ticker)
+        # Fetch up to 2 years to ensure we have enough data to calculate history for the backtest
+        df = t.history(period="2y", interval="1d", auto_adjust=False)
+        if df.empty or len(df) < 50: return []
+        
+        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        
+        # Isolate the dates in the requested target month
+        target_dates = df[(df.index.year == target_year) & (df.index.month == target_month)].index
+        
+        valid_setups = []
+        
+        # Iterate through each trading day of the target month to see if the setup triggered ON that day
+        for current_day in target_dates:
+            idx = df.index.get_loc(current_day)
+            if idx < 30: continue # Need history for PML and EMA calculations
+            
+            cmp_on_day = df['Close'].iloc[idx]
+            if pd.isna(cmp_on_day) or cmp_on_day <= 60: continue
+            
+            # Identify PML for the current simulated day
+            current_period = current_day.to_period('M')
+            prev_period = current_period - 1
+            
+            prev_month_data = df[df.index.to_period('M') == prev_period]
+            if prev_month_data.empty: continue
+            pml = prev_month_data['Low'].min()
+            
+            # Ensure sweep happened in the current simulated month prior to or on current_day
+            curr_month_so_far = df[(df.index.to_period('M') == current_period) & (df.index <= current_day)]
+            sweep_candidates = curr_month_so_far[curr_month_so_far['Low'] < pml]
+            if sweep_candidates.empty: continue
+            
+            # Check EMA Convexity exactly on this day
+            ema_history = df['EMA20'].iloc[idx-15:idx+1]
+            if not check_ema20_rounded_bottom(ema_history): continue
+            
+            # Check Thrust and Resting
+            absolute_sweep_day = sweep_candidates['Low'].idxmin()
+            post_sweep_data = df.loc[absolute_sweep_day:current_day]
+            breakout_days = post_sweep_data[post_sweep_data['Close'] > post_sweep_data['EMA20']]
+            
+            if breakout_days.empty: continue
+            
+            current_ema20 = df['EMA20'].iloc[idx]
+            if cmp_on_day < current_ema20: continue 
+            
+            buffer_zone_ceiling = current_ema20 * 1.015
+            if cmp_on_day > buffer_zone_ceiling: continue 
+            
+            valid_setups.append({
+                "Stock Symbol": ticker.replace('.NS', ''),
+                "Trigger Date": current_day.strftime('%Y-%m-%d'),
+                "PML Swept (₹)": round(pml, 2),
+                "EMA20 Level (₹)": round(current_ema20, 2),
+                "Closing Price (₹)": round(cmp_on_day, 2)
+            })
+            
+        return valid_setups
+    except Exception:
+        return []
+
 # ==============================
 # STREAMLIT UI
 # ==============================
 st.title("ICT Liquidity Screener (Nifty 500)")
 
-tab1, tab2, tab3 = st.tabs(["Daily HTF Setups", "15-Min Intraday Setups", "EMA 20 Resting Setups"])
+tab1, tab2, tab3, tab4 = st.tabs(["Daily HTF Setups", "15-Min Intraday Setups", "EMA 20 Resting Setups", "Backtesting (EMA 20)"])
 
 with tab1:
     st.markdown("### Higher Timeframe Structural Shifts")
@@ -398,10 +449,54 @@ with tab3:
                     
             my_bar.empty()
             if ema_setups:
-                # Sort ascending by how tight price is hugging the EMA
                 ema_setups.sort(key=lambda x: x['Distance to EMA20 (%)'])
                 df_ema = pd.DataFrame(ema_setups)
                 st.success(f"Found {len(df_ema)} EMA Resting setups!")
                 st.dataframe(df_ema, use_container_width=True)
             else:
                 st.warning("No stocks are currently resting tightly on a rounded EMA 20 after a PML sweep.")
+
+with tab4:
+    st.markdown("### Historical Backtester (EMA 20 Resting)")
+    st.markdown("Select a specific month to see which stocks triggered the EMA20 Titan Setup and on what exact dates.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+        selected_month_str = st.selectbox("Select Month", months, index=datetime.now().month - 1)
+        target_month_num = months.index(selected_month_str) + 1
+    with col2:
+        current_year = datetime.now().year
+        selected_year = st.selectbox("Select Year", [current_year, current_year - 1, current_year - 2])
+        
+    if st.button("Run Historical Backtest"):
+        with st.spinner(f"Simulating daily price action across Nifty 500 for {selected_month_str} {selected_year}..."):
+            tickers = get_nifty500_symbols()
+            my_bar = st.progress(0)
+            backtest_results = []
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                futures = {executor.submit(backtest_ema20_setups, t, selected_year, target_month_num): t for t in tickers}
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    res_list = future.result()
+                    if res_list: 
+                        backtest_results.extend(res_list) # Extend because a stock could trigger on multiple days
+                    my_bar.progress((i + 1) / len(tickers))
+                    
+            my_bar.empty()
+            if backtest_results:
+                # Sort by date triggered
+                backtest_results.sort(key=lambda x: x['Trigger Date'])
+                df_backtest = pd.DataFrame(backtest_results)
+                st.success(f"Found {len(df_backtest)} triggers in {selected_month_str} {selected_year}!")
+                st.dataframe(df_backtest, use_container_width=True)
+                
+                csv_bt = df_backtest.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="Download Backtest Data",
+                    data=csv_bt,
+                    file_name=f"EMA20_Backtest_{selected_month_str}_{selected_year}.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.warning(f"No stocks triggered the EMA20 resting setup in {selected_month_str} {selected_year}.")
