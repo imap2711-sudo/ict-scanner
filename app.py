@@ -396,12 +396,11 @@ def backtest_strict_ema20_date_range(ticker, start_date, end_date):
         return []
 
 # ==========================================
-# TAB 6: EXPANDING DIVERGENCE SETUP (HTF SWEEP)
+# TAB 6 & 7: EXPANDING DIVERGENCE SETUP & BACKTESTER
 # ==========================================
 def find_expanding_divergence_setup(ticker):
     try:
         t = yf.Ticker(ticker)
-        # Fetching 2 years to calculate PML, Quarterly, and Half-Yearly lows
         df = t.history(period="2y", interval="1d", auto_adjust=False)
         if df.empty or len(df) < 130: return None
         
@@ -410,27 +409,20 @@ def find_expanding_divergence_setup(ticker):
         if pd.isna(cmp) or cmp <= 60: return None
         
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        
         current_date = df.index[-1]
         
-        # 1. Calculate HTF Liquidity Levels
-        
-        # PML (Previous Month Low)
         curr_month = current_date.to_period('M')
         prev_month_data = df[df.index.to_period('M') == curr_month - 1]
         pml = prev_month_data['Low'].min() if not prev_month_data.empty else np.nan
         
-        # PQL (Previous Quarter Low)
         curr_quarter = current_date.to_period('Q')
         prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
         pql = prev_quarter_data['Low'].min() if not prev_quarter_data.empty else np.nan
         
-        # PHL (Previous Half-Year Low)
         curr_half = 1 if current_date.month <= 6 else 2
         prev_half_year = current_date.year - 1 if curr_half == 1 else current_date.year
         prev_half = 2 if curr_half == 1 else 1
         
-        # Filter for the exact 6 months of the previous half
         prev_half_data = df[(df.index.year == prev_half_year) & 
                             (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
                              ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
@@ -438,7 +430,6 @@ def find_expanding_divergence_setup(ticker):
         
         htf_levels = {'PML': pml, 'PQL': pql, 'PHL': phl}
         
-        # 2. Look for a sweep in the recent window (e.g., last 20 days)
         eval_window = df.iloc[-20:]
         sweep_occurred = False
         swept_level_name = ""
@@ -449,7 +440,6 @@ def find_expanding_divergence_setup(ticker):
             if pd.isna(price): continue
             sweep_candidates = eval_window[eval_window['Low'] < price]
             if not sweep_candidates.empty:
-                # Track the deepest HTF level swept
                 if price < swept_price:  
                     sweep_occurred = True
                     swept_level_name = name
@@ -460,37 +450,27 @@ def find_expanding_divergence_setup(ticker):
         
         sweep_idx = df.index.get_loc(absolute_sweep_day)
         
-        # 3. Check Expanding Divergence prior to sweep
         if sweep_idx < 15: return None
         pre_sweep_df = df.iloc[sweep_idx-15:sweep_idx+1]
         
         ema_start = pre_sweep_df['EMA20'].iloc[0]
         ema_end = pre_sweep_df['EMA20'].iloc[-1]
         
-        # EMA must be sloping downwards
         if ema_end >= ema_start: return None 
         
-        # Distance calculation (EMA20 - Close)
         distances = pre_sweep_df['EMA20'] - pre_sweep_df['Close']
-        
         dist_first_half = distances.iloc[:7].mean()
         dist_second_half = distances.iloc[-7:].mean()
         
-        # The gap between price and EMA must be expanding as it falls
         if dist_second_half <= dist_first_half: return None 
-        
-        # Price should strictly be below EMA before the sweep
         if distances.iloc[-1] < 0: return None 
         
-        # 4. The Upmove & First Close Above EMA 20
         post_sweep_df = df.iloc[sweep_idx:]
         closes_above = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
         
         if closes_above.empty: return None
         
         first_close_above_date = closes_above.index[0]
-        
-        # Ensure this is a FRESH signal (first close above EMA happened within the last 2 trading sessions)
         if first_close_above_date < df.index[-2]: 
             return None 
             
@@ -502,21 +482,107 @@ def find_expanding_divergence_setup(ticker):
             "Breakout Date": first_close_above_date.strftime('%Y-%m-%d'),
             "Live CMP (₹)": round(cmp, 2)
         }
-    except Exception as e:
+    except Exception:
         return None
+
+def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period="3y", interval="1d", auto_adjust=False)
+        if df.empty or len(df) < 200: return []
+        
+        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
+        valid_setups = []
+        
+        for current_day in target_dates:
+            idx = df.index.get_loc(current_day)
+            if idx < 130: continue
+            
+            cmp_on_day = float(df['Close'].iloc[idx])
+            if pd.isna(cmp_on_day) or cmp_on_day <= 60: continue
+            
+            if cmp_on_day <= df['EMA20'].iloc[idx]: continue
+            if df['Close'].iloc[idx-1] > df['EMA20'].iloc[idx-1]: continue
+            
+            curr_month = current_day.to_period('M')
+            prev_month_data = df[df.index.to_period('M') == curr_month - 1]
+            pml = prev_month_data['Low'].min() if not prev_month_data.empty else np.nan
+            
+            curr_quarter = current_day.to_period('Q')
+            prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
+            pql = prev_quarter_data['Low'].min() if not prev_quarter_data.empty else np.nan
+            
+            curr_half = 1 if current_day.month <= 6 else 2
+            prev_half_year = current_day.year - 1 if curr_half == 1 else current_day.year
+            prev_half = 2 if curr_half == 1 else 1
+            
+            prev_half_data = df[(df.index.year == prev_half_year) & 
+                                (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
+                                 ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
+            phl = prev_half_data['Low'].min() if not prev_half_data.empty else np.nan
+            
+            htf_levels = {'PML': pml, 'PQL': pql, 'PHL': phl}
+            
+            eval_window = df.iloc[idx-20:idx+1]
+            sweep_occurred = False
+            swept_level_name = ""
+            swept_price = np.inf
+            absolute_sweep_day = None
+            
+            for name, price in htf_levels.items():
+                if pd.isna(price): continue
+                sweep_candidates = eval_window[eval_window['Low'] < price]
+                if not sweep_candidates.empty:
+                    if price < swept_price:  
+                        sweep_occurred = True
+                        swept_level_name = name
+                        swept_price = price
+                        absolute_sweep_day = sweep_candidates['Low'].idxmin()
+            
+            if not sweep_occurred: continue
+            
+            sweep_idx = df.index.get_loc(absolute_sweep_day)
+            if sweep_idx < 15: continue
+            pre_sweep_df = df.iloc[sweep_idx-15:sweep_idx+1]
+            
+            ema_start = pre_sweep_df['EMA20'].iloc[0]
+            ema_end = pre_sweep_df['EMA20'].iloc[-1]
+            if ema_end >= ema_start: continue 
+            
+            distances = pre_sweep_df['EMA20'] - pre_sweep_df['Close']
+            dist_first_half = distances.iloc[:7].mean()
+            dist_second_half = distances.iloc[-7:].mean()
+            
+            if dist_second_half <= dist_first_half: continue 
+            if distances.iloc[-1] < 0: continue 
+            
+            valid_setups.append({
+                "Stock Symbol": ticker.replace('.NS', ''),
+                "Trigger Date": current_day.strftime('%Y-%m-%d'),
+                "HTF Swept": swept_level_name,
+                "Sweep Level (₹)": round(swept_price, 2),
+                "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
+                "Closing Price (₹)": round(cmp_on_day, 2)
+            })
+            
+        return valid_setups
+    except Exception:
+        return []
 
 # ==============================
 # STREAMLIT UI
 # ==============================
 st.title("ICT Liquidity Screener (Nifty 500)")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Daily HTF Setups", 
     "15-Min Intraday Setups", 
     "EMA 20 Resting Setups", 
     "Backtesting (EMA 20)",
     "Strict EMA 20 Backtest",
-    "Expanding Divergence Setup"
+    "Expanding Div Setup",
+    "Expanding Div Backtester"
 ])
 
 with tab1:
@@ -696,3 +762,46 @@ with tab6:
                 st.dataframe(df_div, use_container_width=True)
             else:
                 st.warning("No stocks triggered the expanding divergence and HTF sweep setup today.")
+
+with tab7:
+    st.markdown("### Expanding Divergence Backtester (Custom Date Range)")
+    st.markdown("Simulates the Expanding Divergence and HTF Sweep setup across a specific date range to find past trigger days.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date_div = st.date_input("From Date (Div Backtest)", datetime.today() - timedelta(days=30))
+    with col2:
+        end_date_div = st.date_input("To Date (Div Backtest)", datetime.today())
+        
+    if st.button("Run Expanding Div Backtester"):
+        if start_date_div > end_date_div:
+            st.error("Start Date must be before End Date.")
+        else:
+            with st.spinner(f"Simulating Expanding Divergence structures between {start_date_div} and {end_date_div}..."):
+                tickers = get_nifty500_symbols()
+                my_bar = st.progress(0)
+                div_backtest_results = []
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                    futures = {executor.submit(backtest_expanding_divergence_date_range, t, start_date_div, end_date_div): t for t in tickers}
+                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                        res_list = future.result()
+                        if res_list: div_backtest_results.extend(res_list)
+                        my_bar.progress((i + 1) / len(tickers))
+                        
+                my_bar.empty()
+                if div_backtest_results:
+                    div_backtest_results.sort(key=lambda x: x['Trigger Date'])
+                    df_div_bt = pd.DataFrame(div_backtest_results)
+                    st.success(f"Found {len(df_div_bt)} Expanding Divergence setups within the selected range!")
+                    st.dataframe(df_div_bt, use_container_width=True)
+                    
+                    csv_div_bt = df_div_bt.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="Download Div Backtest Data",
+                        data=csv_div_bt,
+                        file_name=f"Expanding_Div_Backtest_{start_date_div}_to_{end_date_div}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.warning(f"No stocks triggered the expanding divergence setup between {start_date_div} and {end_date_div}.")
