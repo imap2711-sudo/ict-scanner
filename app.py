@@ -409,6 +409,10 @@ def find_expanding_divergence_setup(ticker):
         if pd.isna(cmp) or cmp <= 60: return None
         
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        
+        # Enforce Curvature Check
+        if not check_ema20_rounded_bottom(df['EMA20']): return None
+
         current_date = df.index[-1]
         
         curr_month = current_date.to_period('M')
@@ -501,6 +505,9 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
             
             cmp_on_day = float(df['Close'].iloc[idx])
             if pd.isna(cmp_on_day) or cmp_on_day <= 60: continue
+            
+            # Enforce Curvature Check for the simulated date
+            if not check_ema20_rounded_bottom(df['EMA20'].iloc[idx-15:idx+1]): continue
             
             if cmp_on_day <= df['EMA20'].iloc[idx]: continue
             if df['Close'].iloc[idx-1] > df['EMA20'].iloc[idx-1]: continue
@@ -740,7 +747,7 @@ with tab5:
 
 with tab6:
     st.markdown("### Expanding Divergence Setup (HTF Sweep)")
-    st.markdown("Identifies price sharply dropping away from a falling EMA 20 (expanding gap), sweeping HTF liquidity (Monthly, Quarterly, or Half-Yearly), and freshly closing above the EMA 20.")
+    st.markdown("Identifies price dropping away from a falling EMA 20, sweeping HTF liquidity (Monthly/Quarterly/Half-Yearly), and breaking above a curvature-checked EMA 20.")
     
     if st.button("Run Expanding Divergence Screener"):
         with st.spinner("Scanning for HTF rubber-band reversals..."):
@@ -758,7 +765,7 @@ with tab6:
             my_bar.empty()
             if divergence_results:
                 df_div = pd.DataFrame(divergence_results)
-                st.success(f"Found {len(df_div)} fresh setups breaking above EMA 20!")
+                st.success(f"Found {len(df_div)} fresh setups breaking above a curved EMA 20!")
                 st.dataframe(df_div, use_container_width=True)
             else:
                 st.warning("No stocks triggered the expanding divergence and HTF sweep setup today.")
