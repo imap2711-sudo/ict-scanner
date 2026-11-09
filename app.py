@@ -656,6 +656,13 @@ def find_doji_resting_setups(ticker):
         
         sweep_idx = df.index.get_loc(absolute_sweep_day)
         
+        # MACRO BOTTOM FILTER: Ensure EMA 20 was in a sustained downtrend prior to sweep
+        if sweep_idx < 40: return None
+        ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
+        ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
+        ema_sweep = df['EMA20'].iloc[sweep_idx]
+        if not (ema_40_pre > ema_20_pre > ema_sweep): return None
+        
         # 4. Daily MSS (Untested Pre-Sweep Swing High)
         pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
         if len(pre_sweep_df) < 5: return None
@@ -690,11 +697,9 @@ def find_doji_resting_setups(ticker):
         body = abs(row['Open'] - row['Close'])
         rng = row['High'] - row['Low']
         
-        # Body <= 35% of total range to qualify as Doji/Spinning top
         is_doji = (rng > 0) and (body <= rng * 0.35)
         if not is_doji: return None
         
-        # Resting proximity: Low must be tightly hovering near EMA20 
         distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
         if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
         
@@ -767,6 +772,13 @@ def backtest_doji_resting_date_range(ticker, start_date, end_date):
             
             sweep_idx = df.index.get_loc(absolute_sweep_day)
             
+            # MACRO BOTTOM FILTER: Ensure EMA 20 was in a sustained downtrend prior to sweep
+            if sweep_idx < 40: continue
+            ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
+            ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
+            ema_sweep = df['EMA20'].iloc[sweep_idx]
+            if not (ema_40_pre > ema_20_pre > ema_sweep): continue
+            
             pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
             if len(pre_sweep_df) < 5: continue
             
@@ -791,28 +803,32 @@ def backtest_doji_resting_date_range(ticker, start_date, end_date):
             
             closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
             if closes_above_ema.empty: continue
+            first_breakout_idx = df.index.get_loc(closes_above_ema.index[0])
             
-            row = df.iloc[idx]
-            ema_val = df['EMA20'].iloc[idx]
-            if row['Close'] <= ema_val: continue 
+            recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
             
-            body = abs(row['Open'] - row['Close'])
-            rng = row['High'] - row['Low']
-            is_doji = (rng > 0) and (body <= rng * 0.35)
+            doji_count = 0
+            for i in range(len(recent_window)):
+                row = recent_window.iloc[i]
+                c_idx = df.index.get_loc(recent_window.index[i])
+                ema_val = df['EMA20'].iloc[c_idx]
+                
+                body = abs(row['Open'] - row['Close'])
+                rng = row['High'] - row['Low']
+                is_doji = (rng > 0) and (body <= rng * 0.35)
+                
+                if is_doji and (row['Close'] > ema_val):
+                    doji_count += 1
             
-            if not is_doji: continue
-            
-            distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
-            if distance_to_ema < -0.5 or distance_to_ema > 1.5: continue
+            if doji_count < 2: continue
             
             valid_setups.append({
                 "Stock Symbol": ticker.replace('.NS', ''),
                 "Trigger Date": current_day.strftime('%Y-%m-%d'),
                 "HTF Swept": swept_name,
                 "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
-                "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
-                "EMA20 Rest Level (₹)": round(ema_val, 2),
-                "Closing Price (₹)": round(row['Close'], 2)
+                "Doji Count": doji_count,
+                "Closing Price (₹)": round(df['Close'].iloc[idx], 2)
             })
             
         return valid_setups
@@ -1058,7 +1074,7 @@ with tab7:
 
 with tab8:
     st.markdown("### Doji Resting Setup & Backtester")
-    st.markdown("Identifies an **untested HTF liquidity sweep**, daily **MSS**, cross above a **rounded EMA 20**, and a **flag pullback** printing at least one **Doji** resting directly on the EMA.")
+    st.markdown("Identifies an **untested HTF liquidity sweep** formed at a **Macro Bottom**, daily **MSS**, cross above a **rounded EMA 20**, and a **flag pullback** printing at least one **Doji** resting directly on the EMA.")
     
     if st.button("Run Live Screener (Doji Rest)"):
         with st.spinner("Scanning Nifty 500 for live Doji structural flags..."):
