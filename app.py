@@ -137,14 +137,12 @@ def find_ict_htf_setups(ticker):
 def find_ict_15m_intraday_setups(ticker):
     try:
         t = yf.Ticker(ticker)
-        # Pull 5 days of 15m data to capture yesterday's PDL and today's intraday structure
         df = t.history(period="5d", interval="15m", auto_adjust=False)
         if df.empty or len(df) < 20: return None
         
         cmp = float(df['Close'].iloc[-1])
         if pd.isna(cmp) or cmp <= 60: return None
         
-        # Ensure we have at least 2 distinct trading days
         unique_dates = pd.Series(df.index.date).unique()
         if len(unique_dates) < 2: return None
         
@@ -165,35 +163,48 @@ def find_ict_15m_intraday_setups(ticker):
         absolute_sweep_time = today_data['Low'].idxmin()
         sweep_low_price = today_data['Low'].min()
         
-        # 3. Intraday MSS: Find the 15m Swing High formed prior to the sweep
+        # 3. Identify STRICTLY UNTESTED 15m Swing Highs prior to sweep
         pre_sweep_data = df.loc[:absolute_sweep_time].iloc[:-1]
         if len(pre_sweep_data) < 3: return None
         
-        swing_highs = [pre_sweep_data['High'].iloc[i] for i in range(1, len(pre_sweep_data)-1) 
-                       if pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i-1] and pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i+1]]
+        swing_highs_info = []
+        for i in range(1, len(pre_sweep_data)-1):
+            if pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i-1] and pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i+1]:
+                swing_highs_info.append({
+                    'price': pre_sweep_data['High'].iloc[i],
+                    'time': pre_sweep_data.index[i]
+                })
+                
+        if not swing_highs_info: return None
         
-        if not swing_highs: return None
-        nearest_pre_sweep_high = swing_highs[-1]
+        valid_pre_sweep_high = None
+        # Iterate backwards to find the first high that wasn't breached before the sweep
+        for sh in reversed(swing_highs_info):
+            # Check price action strictly between this swing high and the sweep
+            subsequent_data = pre_sweep_data.loc[sh['time']:].iloc[1:] 
+            if subsequent_data.empty or subsequent_data['High'].max() <= sh['price']:
+                valid_pre_sweep_high = sh['price']
+                break
+                
+        if valid_pre_sweep_high is None: return None
         
-        # 4. Check for Displacement (15m close above the pre-sweep swing high)
+        # 4. Check for Displacement (15m close above the VALID pre-sweep swing high)
         post_sweep_data = df.loc[absolute_sweep_time:]
-        breakout_candles = post_sweep_data[post_sweep_data['Close'] > nearest_pre_sweep_high]
+        breakout_candles = post_sweep_data[post_sweep_data['Close'] > valid_pre_sweep_high]
         if breakout_candles.empty: return None
         
         displacement_high = post_sweep_data['High'].max()
-        displacement_high_time = post_sweep_data['High'].idxmax()
         
         # 5. Calculate 50% Entry Level
         eq_50_level = sweep_low_price + (displacement_high - sweep_low_price) * 0.5
         
-        # Discard if it already collapsed past the sweep low
         if cmp < sweep_low_price: return None
         
         return {
             "Stock Symbol": ticker.replace('.NS', ''),
             "PDL Swept (₹)": round(pdl, 2),
             "15m Sweep Low (₹)": round(sweep_low_price, 2),
-            "15m Pre-Sweep High (₹)": round(nearest_pre_sweep_high, 2),
+            "15m Pre-Sweep High (₹)": round(valid_pre_sweep_high, 2),
             "15m Displacement High (₹)": round(displacement_high, 2),
             "15m Entry 50% Eq (₹)": round(eq_50_level, 2),
             "Live CMP (₹)": round(cmp, 2),
@@ -236,7 +247,7 @@ with tab1:
 
 with tab2:
     st.markdown("### 15-Minute Intraday Setups")
-    st.markdown("Identifies intraday sweeps of the Previous Day Low (PDL), subsequent 15m MSS, and calculates the 15m entry zone.")
+    st.markdown("Identifies intraday sweeps of the Previous Day Low (PDL), subsequent 15m MSS over **strictly untested** structural highs, and calculates the 15m entry zone.")
     if st.button("Run 15m Intraday Screener"):
         with st.spinner("Fetching 15m Intraday Data for Nifty 500..."):
             tickers = get_nifty500_symbols()
