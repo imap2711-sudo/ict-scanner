@@ -409,10 +409,6 @@ def find_expanding_divergence_setup(ticker):
         if pd.isna(cmp) or cmp <= 60: return None
         
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        
-        # Enforce Curvature Check
-        if not check_ema20_rounded_bottom(df['EMA20']): return None
-
         current_date = df.index[-1]
         
         curr_month = current_date.to_period('M')
@@ -454,14 +450,15 @@ def find_expanding_divergence_setup(ticker):
         
         sweep_idx = df.index.get_loc(absolute_sweep_day)
         
+        # TAB 6 & 7 RULE: EMA must be strictly falling in the 20 days prior to sweep
+        if sweep_idx < 20: return None
+        ema_pre_sweep_start = df['EMA20'].iloc[sweep_idx - 20]
+        ema_at_sweep = df['EMA20'].iloc[sweep_idx]
+        if ema_at_sweep >= ema_pre_sweep_start: return None
+        
+        # Expanding gap check
         if sweep_idx < 15: return None
         pre_sweep_df = df.iloc[sweep_idx-15:sweep_idx+1]
-        
-        ema_start = pre_sweep_df['EMA20'].iloc[0]
-        ema_end = pre_sweep_df['EMA20'].iloc[-1]
-        
-        if ema_end >= ema_start: return None 
-        
         distances = pre_sweep_df['EMA20'] - pre_sweep_df['Close']
         dist_first_half = distances.iloc[:7].mean()
         dist_second_half = distances.iloc[-7:].mean()
@@ -470,13 +467,27 @@ def find_expanding_divergence_setup(ticker):
         if distances.iloc[-1] < 0: return None 
         
         post_sweep_df = df.iloc[sweep_idx:]
-        closes_above = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
         
+        # TAB 6 & 7 RULE: Max 5 touches in 30 days before first touch
+        touches = post_sweep_df[post_sweep_df['High'] >= post_sweep_df['EMA20']]
+        if touches.empty: return None
+        
+        first_touch_idx = df.index.get_loc(touches.index[0])
+        window_start = max(0, first_touch_idx - 30)
+        pre_touch_window = df.iloc[window_start:first_touch_idx]
+        touch_count = len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']])
+        if touch_count > 5: return None
+        
+        closes_above = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
         if closes_above.empty: return None
         
         first_close_above_date = closes_above.index[0]
-        if first_close_above_date < df.index[-2]: 
-            return None 
+        if first_close_above_date < df.index[-2]: return None 
+        
+        breakout_idx = df.index.get_loc(first_close_above_date)
+        
+        # PINPOINT CURVATURE: Check strictly at the moment of breakout
+        if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, breakout_idx-15):breakout_idx+1]): return None
             
         return {
             "Stock Symbol": ticker.replace('.NS', ''),
@@ -506,8 +517,8 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
             cmp_on_day = float(df['Close'].iloc[idx])
             if pd.isna(cmp_on_day) or cmp_on_day <= 60: continue
             
-            # Enforce Curvature Check for the simulated date
-            if not check_ema20_rounded_bottom(df['EMA20'].iloc[idx-15:idx+1]): continue
+            # PINPOINT CURVATURE: Check strictly at the current simulated breakout day
+            if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-15):idx+1]): continue
             
             if cmp_on_day <= df['EMA20'].iloc[idx]: continue
             if df['Close'].iloc[idx-1] > df['EMA20'].iloc[idx-1]: continue
@@ -550,19 +561,34 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
             if not sweep_occurred: continue
             
             sweep_idx = df.index.get_loc(absolute_sweep_day)
+            
+            # TAB 6 & 7 RULE: EMA must be strictly falling in the 20 days prior to sweep
+            if sweep_idx < 20: continue
+            ema_pre_sweep_start = df['EMA20'].iloc[sweep_idx - 20]
+            ema_at_sweep = df['EMA20'].iloc[sweep_idx]
+            if ema_at_sweep >= ema_pre_sweep_start: continue
+            
+            # Expanding gap check
             if sweep_idx < 15: continue
             pre_sweep_df = df.iloc[sweep_idx-15:sweep_idx+1]
-            
-            ema_start = pre_sweep_df['EMA20'].iloc[0]
-            ema_end = pre_sweep_df['EMA20'].iloc[-1]
-            if ema_end >= ema_start: continue 
-            
             distances = pre_sweep_df['EMA20'] - pre_sweep_df['Close']
             dist_first_half = distances.iloc[:7].mean()
             dist_second_half = distances.iloc[-7:].mean()
             
             if dist_second_half <= dist_first_half: continue 
             if distances.iloc[-1] < 0: continue 
+            
+            post_sweep_data = df.iloc[sweep_idx:idx+1]
+            
+            # TAB 6 & 7 RULE: Max 5 touches in 30 days before first touch
+            touches = post_sweep_data[post_sweep_data['High'] >= post_sweep_data['EMA20']]
+            if touches.empty: continue
+            
+            first_touch_idx = df.index.get_loc(touches.index[0])
+            window_start = max(0, first_touch_idx - 30)
+            pre_touch_window = df.iloc[window_start:first_touch_idx]
+            touch_count = len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']])
+            if touch_count > 5: continue
             
             valid_setups.append({
                 "Stock Symbol": ticker.replace('.NS', ''),
