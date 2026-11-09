@@ -7,7 +7,7 @@ import io
 import warnings
 import logging
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -323,80 +323,80 @@ def backtest_ema20_setups(ticker, target_year, target_month):
         return []
 
 # ==========================================
-# TAB 5: STRICT EMA 20 (DATE SELECTOR)
+# TAB 5: STRICT EMA 20 (DATE RANGE BACKTEST)
 # ==========================================
-def find_strict_ema20_date_setup(ticker, target_date):
+def backtest_strict_ema20_date_range(ticker, start_date, end_date):
     try:
         t = yf.Ticker(ticker)
-        df = t.history(period="1y", interval="1d", auto_adjust=False)
-        if df.empty: return None
-        
-        # Filter dataframe up to the target date selected by user
-        df = df[df.index.date <= target_date]
-        if df.empty or len(df) < 50: return None
-        
-        # Grab the target day data (last available row up to selected date)
-        target_timestamp = df.index[-1]
-        target_idx = len(df) - 1
-        cmp_on_day = float(df['Close'].iloc[-1])
-        if pd.isna(cmp_on_day) or cmp_on_day <= 60: return None
+        df = t.history(period="2y", interval="1d", auto_adjust=False)
+        if df.empty or len(df) < 50: return []
         
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
         
-        # Identify PML for that specific month
-        target_period = target_timestamp.to_period('M')
-        prev_month_data = df[df.index.to_period('M') == target_period - 1]
-        if prev_month_data.empty: return None
-        pml = prev_month_data['Low'].min()
+        target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
+        valid_setups = []
         
-        # Find Sweep up to the target date
-        curr_month_so_far = df[(df.index.to_period('M') == target_period)]
-        sweep_candidates = curr_month_so_far[curr_month_so_far['Low'] < pml]
-        if sweep_candidates.empty: return None
-        
-        absolute_sweep_day = sweep_candidates['Low'].idxmin()
-        sweep_idx = df.index.get_loc(absolute_sweep_day)
-        
-        # RULE 1: EMA 20 must be FALLING prior to sweep
-        if sweep_idx < 5: return None
-        ema_pre_sweep_start = df['EMA20'].iloc[sweep_idx - 5]
-        ema_at_sweep = df['EMA20'].iloc[sweep_idx]
-        if ema_at_sweep >= ema_pre_sweep_start: return None # Discard if it was rising or flat
-        
-        # RULE 2: Max 2 touches in the 15 days prior to the first touch AFTER the sweep
-        post_sweep_data = df.iloc[sweep_idx:]
-        touches = post_sweep_data[post_sweep_data['High'] >= post_sweep_data['EMA20']]
-        if touches.empty: return None
-        
-        first_touch_date = touches.index[0]
-        first_touch_idx = df.index.get_loc(first_touch_date)
-        
-        window_start = max(0, first_touch_idx - 15)
-        pre_touch_window = df.iloc[window_start:first_touch_idx]
-        touch_count = len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']])
-        
-        if touch_count > 2: return None
-        
-        # RULE 3: Must be resting tightly on Target Date
-        target_ema = df['EMA20'].iloc[-1]
-        if cmp_on_day < target_ema: return None
-        buffer_zone_ceiling = target_ema * 1.015
-        if cmp_on_day > buffer_zone_ceiling: return None
-        
-        distance_to_ema = ((cmp_on_day - target_ema) / target_ema) * 100
-        
-        return {
-            "Stock Symbol": ticker.replace('.NS', ''),
-            "Trigger Date": target_timestamp.strftime('%Y-%m-%d'),
-            "PML Swept (₹)": round(pml, 2),
-            "First Touch Date": first_touch_date.strftime('%Y-%m-%d'),
-            "Pre-Touch Hits (15d)": touch_count,
-            "EMA20 Level (₹)": round(target_ema, 2),
-            "Closing Price (₹)": round(cmp_on_day, 2),
-            "Distance to EMA20 (%)": round(distance_to_ema, 2)
-        }
+        for current_day in target_dates:
+            idx = df.index.get_loc(current_day)
+            if idx < 30: continue
+            
+            cmp_on_day = float(df['Close'].iloc[idx])
+            if pd.isna(cmp_on_day) or cmp_on_day <= 60: continue
+            
+            target_period = current_day.to_period('M')
+            prev_month_data = df[df.index.to_period('M') == target_period - 1]
+            if prev_month_data.empty: continue
+            pml = prev_month_data['Low'].min()
+            
+            curr_month_so_far = df[(df.index.to_period('M') == target_period) & (df.index <= current_day)]
+            sweep_candidates = curr_month_so_far[curr_month_so_far['Low'] < pml]
+            if sweep_candidates.empty: continue
+            
+            absolute_sweep_day = sweep_candidates['Low'].idxmin()
+            sweep_idx = df.index.get_loc(absolute_sweep_day)
+            
+            # RULE 1: EMA 20 must be FALLING prior to sweep
+            if sweep_idx < 5: continue
+            ema_pre_sweep_start = df['EMA20'].iloc[sweep_idx - 5]
+            ema_at_sweep = df['EMA20'].iloc[sweep_idx]
+            if ema_at_sweep >= ema_pre_sweep_start: continue
+            
+            # RULE 2: Max 2 touches in the 15 days prior to the first touch AFTER the sweep
+            post_sweep_data = df.iloc[sweep_idx:idx+1]
+            touches = post_sweep_data[post_sweep_data['High'] >= post_sweep_data['EMA20']]
+            if touches.empty: continue
+            
+            first_touch_date = touches.index[0]
+            first_touch_idx = df.index.get_loc(first_touch_date)
+            
+            window_start = max(0, first_touch_idx - 15)
+            pre_touch_window = df.iloc[window_start:first_touch_idx]
+            touch_count = len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']])
+            
+            if touch_count > 2: continue
+            
+            # RULE 3: Must be resting tightly on current simulated day
+            target_ema = df['EMA20'].iloc[idx]
+            if cmp_on_day < target_ema: continue
+            buffer_zone_ceiling = target_ema * 1.015
+            if cmp_on_day > buffer_zone_ceiling: continue
+            
+            distance_to_ema = ((cmp_on_day - target_ema) / target_ema) * 100
+            
+            valid_setups.append({
+                "Stock Symbol": ticker.replace('.NS', ''),
+                "Trigger Date": current_day.strftime('%Y-%m-%d'),
+                "PML Swept (₹)": round(pml, 2),
+                "First Touch Date": first_touch_date.strftime('%Y-%m-%d'),
+                "Pre-Touch Hits (15d)": touch_count,
+                "EMA20 Level (₹)": round(target_ema, 2),
+                "Closing Price (₹)": round(cmp_on_day, 2),
+                "Distance to EMA20 (%)": round(distance_to_ema, 2)
+            })
+            
+        return valid_setups
     except Exception:
-        return None
+        return []
 
 # ==============================
 # STREAMLIT UI
@@ -408,7 +408,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "15-Min Intraday Setups", 
     "EMA 20 Resting Setups", 
     "Backtesting (EMA 20)",
-    "Strict EMA 20 (Date Filter)"
+    "Strict EMA 20 Backtest"
 ])
 
 with tab1:
@@ -522,29 +522,44 @@ with tab4:
                 st.warning(f"No stocks triggered the EMA20 resting setup in {selected_month_str} {selected_year}.")
 
 with tab5:
-    st.markdown("### Strict EMA 20 (Date Filter)")
+    st.markdown("### Strict EMA 20 Backtester (Custom Date Range)")
     st.markdown("Enforces a falling EMA 20 prior to sweep and limits pre-touch hits to <= 2 in the 15 days before the first post-sweep touch.")
     
-    selected_date = st.date_input("Select Analysis Date", datetime.today())
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("From Date", datetime.today() - timedelta(days=30))
+    with col2:
+        end_date = st.date_input("To Date", datetime.today())
     
-    if st.button("Run Strict Date Screener"):
-        with st.spinner(f"Analyzing exact historical structures up to {selected_date}..."):
-            tickers = get_nifty500_symbols()
-            my_bar = st.progress(0)
-            strict_date_results = []
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(find_strict_ema20_date_setup, t, selected_date): t for t in tickers}
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    res = future.result()
-                    if res: strict_date_results.append(res)
-                    my_bar.progress((i + 1) / len(tickers))
+    if st.button("Run Strict Date Range Screener"):
+        if start_date > end_date:
+            st.error("Start Date must be before End Date.")
+        else:
+            with st.spinner(f"Simulating exact historical structures between {start_date} and {end_date}..."):
+                tickers = get_nifty500_symbols()
+                my_bar = st.progress(0)
+                strict_date_results = []
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                    futures = {executor.submit(backtest_strict_ema20_date_range, t, start_date, end_date): t for t in tickers}
+                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                        res_list = future.result()
+                        if res_list: strict_date_results.extend(res_list)
+                        my_bar.progress((i + 1) / len(tickers))
+                        
+                my_bar.empty()
+                if strict_date_results:
+                    strict_date_results.sort(key=lambda x: x['Trigger Date'])
+                    df_strict = pd.DataFrame(strict_date_results)
+                    st.success(f"Found {len(df_strict)} strict setups within the selected range!")
+                    st.dataframe(df_strict, use_container_width=True)
                     
-            my_bar.empty()
-            if strict_date_results:
-                strict_date_results.sort(key=lambda x: x['Distance to EMA20 (%)'])
-                df_strict = pd.DataFrame(strict_date_results)
-                st.success(f"Found {len(df_strict)} strict setups resting on {selected_date}!")
-                st.dataframe(df_strict, use_container_width=True)
-            else:
-                st.warning(f"No Nifty 500 stocks met these strict criteria on {selected_date}.")
+                    csv_strict = df_strict.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="Download Strict Backtest Data",
+                        data=csv_strict,
+                        file_name=f"Strict_EMA20_Backtest_{start_date}_to_{end_date}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.warning(f"No Nifty 500 stocks met these strict criteria between {start_date} and {end_date}.")
