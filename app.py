@@ -430,7 +430,7 @@ def find_expanding_divergence_setup(ticker):
         
         htf_levels = {'PML': pml, 'PQL': pql, 'PHL': phl}
         
-        eval_window = df.iloc[-20:]
+        eval_window = df.iloc[-30:]
         sweep_occurred = False
         swept_level_name = ""
         swept_price = np.inf
@@ -450,13 +450,11 @@ def find_expanding_divergence_setup(ticker):
         
         sweep_idx = df.index.get_loc(absolute_sweep_day)
         
-        # TAB 6 & 7 RULE: EMA must be strictly falling in the 20 days prior to sweep
         if sweep_idx < 20: return None
         ema_pre_sweep_start = df['EMA20'].iloc[sweep_idx - 20]
         ema_at_sweep = df['EMA20'].iloc[sweep_idx]
         if ema_at_sweep >= ema_pre_sweep_start: return None
         
-        # Expanding gap check
         if sweep_idx < 15: return None
         pre_sweep_df = df.iloc[sweep_idx-15:sweep_idx+1]
         distances = pre_sweep_df['EMA20'] - pre_sweep_df['Close']
@@ -467,8 +465,6 @@ def find_expanding_divergence_setup(ticker):
         if distances.iloc[-1] < 0: return None 
         
         post_sweep_df = df.iloc[sweep_idx:]
-        
-        # TAB 6 & 7 RULE: Max 5 touches in 30 days before first touch
         touches = post_sweep_df[post_sweep_df['High'] >= post_sweep_df['EMA20']]
         if touches.empty: return None
         
@@ -485,8 +481,6 @@ def find_expanding_divergence_setup(ticker):
         if first_close_above_date < df.index[-2]: return None 
         
         breakout_idx = df.index.get_loc(first_close_above_date)
-        
-        # PINPOINT CURVATURE: Check strictly at the moment of breakout
         if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, breakout_idx-15):breakout_idx+1]): return None
             
         return {
@@ -517,7 +511,6 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
             cmp_on_day = float(df['Close'].iloc[idx])
             if pd.isna(cmp_on_day) or cmp_on_day <= 60: continue
             
-            # PINPOINT CURVATURE: Check strictly at the current simulated breakout day
             if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-15):idx+1]): continue
             
             if cmp_on_day <= df['EMA20'].iloc[idx]: continue
@@ -542,7 +535,7 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
             
             htf_levels = {'PML': pml, 'PQL': pql, 'PHL': phl}
             
-            eval_window = df.iloc[idx-20:idx+1]
+            eval_window = df.iloc[idx-30:idx+1]
             sweep_occurred = False
             swept_level_name = ""
             swept_price = np.inf
@@ -562,13 +555,11 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
             
             sweep_idx = df.index.get_loc(absolute_sweep_day)
             
-            # TAB 6 & 7 RULE: EMA must be strictly falling in the 20 days prior to sweep
             if sweep_idx < 20: continue
             ema_pre_sweep_start = df['EMA20'].iloc[sweep_idx - 20]
             ema_at_sweep = df['EMA20'].iloc[sweep_idx]
             if ema_at_sweep >= ema_pre_sweep_start: continue
             
-            # Expanding gap check
             if sweep_idx < 15: continue
             pre_sweep_df = df.iloc[sweep_idx-15:sweep_idx+1]
             distances = pre_sweep_df['EMA20'] - pre_sweep_df['Close']
@@ -579,8 +570,6 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
             if distances.iloc[-1] < 0: continue 
             
             post_sweep_data = df.iloc[sweep_idx:idx+1]
-            
-            # TAB 6 & 7 RULE: Max 5 touches in 30 days before first touch
             touches = post_sweep_data[post_sweep_data['High'] >= post_sweep_data['EMA20']]
             if touches.empty: continue
             
@@ -603,19 +592,117 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
     except Exception:
         return []
 
+# ==========================================
+# TAB 8: DOJI RESTING BACKTESTER (NEW)
+# ==========================================
+def backtest_doji_resting_date_range(ticker, start_date, end_date):
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period="3y", interval="1d", auto_adjust=False)
+        if df.empty or len(df) < 200: return []
+        
+        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
+        valid_setups = []
+        
+        for current_day in target_dates:
+            idx = df.index.get_loc(current_day)
+            if idx < 130: continue
+            
+            # 1. Curvature check strictly on the current simulated date
+            if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-15):idx+1]): continue
+            
+            # 2. HTF Sweep Check
+            curr_month = current_day.to_period('M')
+            prev_month_data = df[df.index.to_period('M') == curr_month - 1]
+            pml = prev_month_data['Low'].min() if not prev_month_data.empty else np.nan
+            
+            curr_quarter = current_day.to_period('Q')
+            prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
+            pql = prev_quarter_data['Low'].min() if not prev_quarter_data.empty else np.nan
+            
+            curr_half = 1 if current_day.month <= 6 else 2
+            prev_half_year = current_day.year - 1 if curr_half == 1 else current_day.year
+            prev_half = 2 if curr_half == 1 else 1
+            
+            prev_half_data = df[(df.index.year == prev_half_year) & 
+                                (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
+                                 ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
+            phl = prev_half_data['Low'].min() if not prev_half_data.empty else np.nan
+            
+            htf_levels = {'PML': pml, 'PQL': pql, 'PHL': phl}
+            
+            eval_window = df.iloc[idx-40:idx+1]
+            sweep_occurred = False
+            swept_level_name = ""
+            absolute_sweep_day = None
+            
+            for name, price in htf_levels.items():
+                if pd.isna(price): continue
+                sweep_candidates = eval_window[eval_window['Low'] < price]
+                if not sweep_candidates.empty:
+                    sweep_occurred = True
+                    swept_level_name = name
+                    absolute_sweep_day = sweep_candidates['Low'].idxmin()
+            
+            if not sweep_occurred: continue
+            
+            sweep_idx = df.index.get_loc(absolute_sweep_day)
+            
+            # 3. Must have decisively crossed above the EMA20 after the sweep
+            post_sweep_df = df.iloc[sweep_idx:idx+1]
+            closes_above = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
+            if closes_above.empty: continue
+            first_breakout_idx = df.index.get_loc(closes_above.index[0])
+            
+            # 4. Check for at least 2 Dojis closing above EMA20 recently 
+            # We look at the tight window (last 5 days up to current simulated date) for the resting structure
+            recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
+            
+            doji_count = 0
+            for i in range(len(recent_window)):
+                row = recent_window.iloc[i]
+                c_idx = df.index.get_loc(recent_window.index[i])
+                ema_val = df['EMA20'].iloc[c_idx]
+                
+                body = abs(row['Open'] - row['Close'])
+                rng = row['High'] - row['Low']
+                
+                # Doji/Spinning top definition: body is <= 35% of the total range
+                is_doji = (rng > 0) and (body <= rng * 0.35)
+                
+                if is_doji and (row['Close'] > ema_val):
+                    doji_count += 1
+            
+            if doji_count < 2: continue
+            
+            valid_setups.append({
+                "Stock Symbol": ticker.replace('.NS', ''),
+                "Trigger Date": current_day.strftime('%Y-%m-%d'),
+                "HTF Swept": swept_level_name,
+                "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
+                "Doji Count": doji_count,
+                "Closing Price (₹)": round(df['Close'].iloc[idx], 2)
+            })
+            
+        return valid_setups
+    except Exception:
+        return []
+
 # ==============================
 # STREAMLIT UI
 # ==============================
 st.title("ICT Liquidity Screener (Nifty 500)")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "Daily HTF Setups", 
-    "15-Min Intraday Setups", 
-    "EMA 20 Resting Setups", 
-    "Backtesting (EMA 20)",
-    "Strict EMA 20 Backtest",
-    "Expanding Div Setup",
-    "Expanding Div Backtester"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "Daily HTF", 
+    "15-Min Intraday", 
+    "EMA 20 Resting", 
+    "BT: EMA 20",
+    "BT: Strict EMA",
+    "Exp Div Setup",
+    "BT: Exp Div",
+    "BT: Doji Resting"
 ])
 
 with tab1:
@@ -838,3 +925,46 @@ with tab7:
                     )
                 else:
                     st.warning(f"No stocks triggered the expanding divergence setup between {start_date_div} and {end_date_div}.")
+
+with tab8:
+    st.markdown("### Doji Resting Backtester (Custom Date Range)")
+    st.markdown("Identifies an HTF liquidity sweep followed by a cross above a curved EMA 20, where price then prints at least **2 distinct Doji/Spinning Top candles** closing above the EMA.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date_doji = st.date_input("From Date (Doji Backtest)", datetime.today() - timedelta(days=30))
+    with col2:
+        end_date_doji = st.date_input("To Date (Doji Backtest)", datetime.today())
+        
+    if st.button("Run Doji Resting Backtester"):
+        if start_date_doji > end_date_doji:
+            st.error("Start Date must be before End Date.")
+        else:
+            with st.spinner(f"Simulating Doji Resting structures between {start_date_doji} and {end_date_doji}..."):
+                tickers = get_nifty500_symbols()
+                my_bar = st.progress(0)
+                doji_backtest_results = []
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                    futures = {executor.submit(backtest_doji_resting_date_range, t, start_date_doji, end_date_doji): t for t in tickers}
+                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                        res_list = future.result()
+                        if res_list: doji_backtest_results.extend(res_list)
+                        my_bar.progress((i + 1) / len(tickers))
+                        
+                my_bar.empty()
+                if doji_backtest_results:
+                    doji_backtest_results.sort(key=lambda x: x['Trigger Date'])
+                    df_doji_bt = pd.DataFrame(doji_backtest_results)
+                    st.success(f"Found {len(df_doji_bt)} Doji Resting setups within the selected range!")
+                    st.dataframe(df_doji_bt, use_container_width=True)
+                    
+                    csv_doji_bt = df_doji_bt.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="Download Doji Backtest Data",
+                        data=csv_doji_bt,
+                        file_name=f"Doji_Resting_Backtest_{start_date_doji}_to_{end_date_doji}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.warning(f"No stocks triggered the Doji Resting setup between {start_date_doji} and {end_date_doji}.")
