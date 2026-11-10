@@ -42,31 +42,17 @@ def get_nifty500_symbols():
     ]
 
 def check_ema20_rounded_bottom(ema_series, lookback=20):
-    """
-    Strict mathematical filter for a smooth, U-shaped EMA bottom.
-    Rejects sharp, V-shaped reversals.
-    """
     if len(ema_series) < lookback: return False
     recent_ema = ema_series.iloc[-lookback:].values
-    
     roc = np.diff(recent_ema)
     min_idx = np.argmin(recent_ema)
     
-    # Require the trough to be somewhat centered to see both sides of the curve
     if min_idx < 4 or min_idx > lookback - 4: return False
     
-    # 1. Left side must be distinctly falling
     falling_before = np.mean(roc[:min_idx]) < -0.05
-    
-    # 2. Right side must be distinctly rising
     rising_after = np.mean(roc[min_idx:]) > 0.05
     
-    # 3. SMOOTHNESS CHECK: Reject abrupt V-shapes
-    # The transition around the trough must be gradual.
-    # We check the acceleration (second derivative) around the bottom.
     trough_window_roc = roc[max(0, min_idx-2):min(len(roc), min_idx+2)]
-    
-    # If the standard deviation of the rate of change is too high, it's a V-shape, not a U-shape.
     is_smooth = np.std(trough_window_roc) < np.abs(np.mean(roc[:min_idx])) * 1.5
     
     return falling_before and rising_after and is_smooth
@@ -670,34 +656,7 @@ def find_doji_resting_setups(ticker):
         if not sweep_occurred: return None
         
         sweep_idx = df.index.get_loc(absolute_sweep_day)
-        
-        if sweep_idx < 40: return None
-        ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
-        ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
-        ema_sweep = df['EMA20'].iloc[sweep_idx]
-        if not (ema_40_pre > ema_20_pre > ema_sweep): return None
-        
-        pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
-        if len(pre_sweep_df) < 5: return None
-        
-        swing_highs = []
-        for i in range(1, len(pre_sweep_df)-1):
-            if pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i-1] and pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i+1]:
-                swing_highs.append({'price': pre_sweep_df['High'].iloc[i], 'time': pre_sweep_df.index[i]})
-        
-        nearest_untested_high = None
-        for sh in reversed(swing_highs):
-            interim = pre_sweep_df.loc[sh['time']:].iloc[1:]
-            if interim.empty or interim['High'].max() < sh['price']:
-                nearest_untested_high = sh['price']
-                break
-                
-        if not nearest_untested_high: return None
-        
         post_sweep_df = df.iloc[sweep_idx:idx+1]
-        
-        closes_above_mss = post_sweep_df[post_sweep_df['Close'] > nearest_untested_high]
-        if closes_above_mss.empty: return None
         
         closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
         if closes_above_ema.empty: return None
@@ -713,20 +672,19 @@ def find_doji_resting_setups(ticker):
             is_doji = (rng > 0) and (body <= rng * 0.35)
             if is_doji: doji_count += 1
         
-        if doji_count < 2: return None
+        if doji_count < 1: return None
         
         row = df.iloc[idx]
         ema_val = df['EMA20'].iloc[idx]
         if row['Close'] <= ema_val: return None 
         
         distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
-        if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
+        if distance_to_ema < -1.0 or distance_to_ema > 2.5: return None
         
         return {
             "Stock Symbol": ticker.replace('.NS', ''),
             "HTF Swept": swept_name,
             "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
-            "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
             "EMA20 Rest Level (₹)": round(ema_val, 2),
             "Live CMP (₹)": round(cmp, 2)
         }
@@ -790,34 +748,7 @@ def backtest_doji_resting_date_range(ticker, start_date, end_date):
             if not sweep_occurred: continue
             
             sweep_idx = df.index.get_loc(absolute_sweep_day)
-            
-            if sweep_idx < 40: continue
-            ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
-            ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
-            ema_sweep = df['EMA20'].iloc[sweep_idx]
-            if not (ema_40_pre > ema_20_pre > ema_sweep): continue
-            
-            pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
-            if len(pre_sweep_df) < 5: continue
-            
-            swing_highs = []
-            for i in range(1, len(pre_sweep_df)-1):
-                if pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i-1] and pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i+1]:
-                    swing_highs.append({'price': pre_sweep_df['High'].iloc[i], 'time': pre_sweep_df.index[i]})
-            
-            nearest_untested_high = None
-            for sh in reversed(swing_highs):
-                interim = pre_sweep_df.loc[sh['time']:].iloc[1:]
-                if interim.empty or interim['High'].max() < sh['price']:
-                    nearest_untested_high = sh['price']
-                    break
-                    
-            if not nearest_untested_high: continue
-            
             post_sweep_df = df.iloc[sweep_idx:idx+1]
-            
-            closes_above_mss = post_sweep_df[post_sweep_df['Close'] > nearest_untested_high]
-            if closes_above_mss.empty: continue
             
             closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
             if closes_above_ema.empty: continue
@@ -833,21 +764,20 @@ def backtest_doji_resting_date_range(ticker, start_date, end_date):
                 is_doji = (rng > 0) and (body <= rng * 0.35)
                 if is_doji: doji_count += 1
             
-            if doji_count < 2: continue
+            if doji_count < 1: continue
             
             row = df.iloc[idx]
             ema_val = df['EMA20'].iloc[idx]
             if row['Close'] <= ema_val: continue 
             
             distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
-            if distance_to_ema < -0.5 or distance_to_ema > 1.5: continue
+            if distance_to_ema < -1.0 or distance_to_ema > 2.5: continue
             
             valid_setups.append({
                 "Stock Symbol": ticker.replace('.NS', ''),
                 "Trigger Date": current_day.strftime('%Y-%m-%d'),
                 "HTF Swept": swept_name,
                 "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
-                "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
                 "EMA20 Rest Level (₹)": round(ema_val, 2),
                 "Closing Price (₹)": round(row['Close'], 2)
             })
@@ -1095,7 +1025,7 @@ with tab7:
 
 with tab8:
     st.markdown("### Doji Resting Setup & Backtester")
-    st.markdown("Identifies an **untested HTF liquidity sweep** formed at a **Macro Bottom**, daily **MSS**, cross above a **rounded EMA 20**, and a **flag pullback** printing at least one **Doji** resting directly on the EMA.")
+    st.markdown("Identifies an **untested HTF liquidity sweep**, a cross above a **rounded EMA 20**, and a **flag pullback** printing at least one **Doji** resting directly on the EMA.")
     
     if st.button("Run Live Screener (Doji Rest)"):
         with st.spinner("Scanning Nifty 500 for live Doji structural flags..."):
