@@ -1,5 +1,5 @@
-yfinance
+streamlit
 pandas
 numpy
 requests
-streamlit
+git+https://github.com/rongardF/tvdatafeed.git
