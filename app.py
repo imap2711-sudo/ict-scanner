@@ -13,8 +13,10 @@ warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="ICT Liquidity Screener", layout="wide")
 
-# Initialize TradingView Feed (Anonymous Session)
-tv = TvDatafeed()
+# Initialize TradingView Feed with credentials for full data access
+username = 'imap2711'
+password = 'Sunny@7890'
+tv = TvDatafeed(username, password)
 
 @st.cache_data(ttl=3600)
 def get_nifty500_symbols():
