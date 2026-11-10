@@ -41,17 +41,35 @@ def get_nifty500_symbols():
         'WIPRO.NS', 'COALINDIA.NS', 'NESTLEIND.NS', 'GRASIM.NS', 'TECHM.NS', 'HINDALCO.NS'
     ]
 
-def check_ema20_rounded_bottom(ema_series, lookback=15):
+def check_ema20_rounded_bottom(ema_series, lookback=20):
+    """
+    Strict mathematical filter for a smooth, U-shaped EMA bottom.
+    Rejects sharp, V-shaped reversals.
+    """
     if len(ema_series) < lookback: return False
     recent_ema = ema_series.iloc[-lookback:].values
+    
     roc = np.diff(recent_ema)
     min_idx = np.argmin(recent_ema)
     
-    if min_idx < 3 or min_idx > lookback - 3: return False
-    falling_before = np.mean(roc[:min_idx]) < 0
-    rising_after = np.mean(roc[min_idx:]) > 0
+    # Require the trough to be somewhat centered to see both sides of the curve
+    if min_idx < 4 or min_idx > lookback - 4: return False
     
-    return falling_before and rising_after
+    # 1. Left side must be distinctly falling
+    falling_before = np.mean(roc[:min_idx]) < -0.05
+    
+    # 2. Right side must be distinctly rising
+    rising_after = np.mean(roc[min_idx:]) > 0.05
+    
+    # 3. SMOOTHNESS CHECK: Reject abrupt V-shapes
+    # The transition around the trough must be gradual.
+    # We check the acceleration (second derivative) around the bottom.
+    trough_window_roc = roc[max(0, min_idx-2):min(len(roc), min_idx+2)]
+    
+    # If the standard deviation of the rate of change is too high, it's a V-shape, not a U-shape.
+    is_smooth = np.std(trough_window_roc) < np.abs(np.mean(roc[:min_idx])) * 1.5
+    
+    return falling_before and rising_after and is_smooth
 
 # ==========================================
 # TAB 1: DAILY HTF SETUP
@@ -303,7 +321,7 @@ def backtest_ema20_setups(ticker, target_year, target_month):
             sweep_candidates = curr_month_so_far[curr_month_so_far['Low'] < pml]
             if sweep_candidates.empty: continue
             
-            if not check_ema20_rounded_bottom(df['EMA20'].iloc[idx-15:idx+1]): continue
+            if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-15):idx+1]): continue
             
             post_sweep_data = df.loc[sweep_candidates['Low'].idxmin():current_day]
             if post_sweep_data[post_sweep_data['Close'] > post_sweep_data['EMA20']].empty: continue
@@ -697,7 +715,6 @@ def find_doji_resting_setups(ticker):
         
         if doji_count < 2: return None
         
-        # EXACT DAY CONSTRAINT: The Low must be touching/resting on EMA today, Close must be above
         row = df.iloc[idx]
         ema_val = df['EMA20'].iloc[idx]
         if row['Close'] <= ema_val: return None 
@@ -818,7 +835,6 @@ def backtest_doji_resting_date_range(ticker, start_date, end_date):
             
             if doji_count < 2: continue
             
-            # EXACT DAY CONSTRAINT: The Low must be touching/resting on EMA today, Close must be above
             row = df.iloc[idx]
             ema_val = df['EMA20'].iloc[idx]
             if row['Close'] <= ema_val: continue 
