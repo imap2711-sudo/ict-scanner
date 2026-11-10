@@ -1,5 +1,4 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
@@ -8,11 +7,14 @@ import warnings
 import logging
 import concurrent.futures
 from datetime import datetime, timedelta
+from tvDatafeed import TvDatafeed, Interval
 
 warnings.filterwarnings('ignore')
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Liquidity Screener", layout="wide")
+
+# Initialize TradingView Feed (Anonymous Session)
+tv = TvDatafeed()
 
 @st.cache_data(ttl=3600)
 def get_nifty500_symbols():
@@ -48,7 +50,6 @@ def check_ema20_rounded_bottom(ema_series, lookback=20):
     min_idx = np.argmin(recent_ema)
     
     if min_idx < 4 or min_idx > lookback - 4: return False
-    
     falling_before = np.mean(roc[:min_idx]) < -0.05
     rising_after = np.mean(roc[min_idx:]) > 0.05
     
@@ -62,11 +63,14 @@ def check_ema20_rounded_bottom(ema_series, lookback=20):
 # ==========================================
 def find_ict_htf_setups(ticker):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="2y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 100: return None
-        try: cmp = float(t.fast_info.last_price)
-        except Exception: cmp = float(df['Close'].iloc[-1])
+        clean_ticker = ticker.replace('.NS', '')
+        df = tv.get_hist(symbol=clean_ticker, exchange='NSE', interval=Interval.in_daily, n_bars=750)
+        if df is None or df.empty or len(df) < 100: return None
+        
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        
+        cmp = float(df['Close'].iloc[-1])
         if pd.isna(cmp) or cmp <= 60: return None
 
         current_month_period = df.index[-1].to_period('M')
@@ -148,7 +152,7 @@ def find_ict_htf_setups(ticker):
         if cmp <= dealing_range_50_level: return None
             
         return {
-            "Stock Symbol": ticker.replace('.NS', ''),
+            "Stock Symbol": clean_ticker,
             "Swept Liquidity": swept_level_details[2],
             "Level Price (₹)": round(swept_level_details[0], 2),
             "Sweep Low (₹)": round(sweep_low_price, 2),
@@ -167,9 +171,13 @@ def find_ict_htf_setups(ticker):
 # ==========================================
 def find_ict_15m_intraday_setups(ticker):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="5d", interval="15m", auto_adjust=False)
-        if df.empty or len(df) < 20: return None
+        clean_ticker = ticker.replace('.NS', '')
+        df = tv.get_hist(symbol=clean_ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=125)
+        if df is None or df.empty or len(df) < 20: return None
+        
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        
         cmp = float(df['Close'].iloc[-1])
         if pd.isna(cmp) or cmp <= 60: return None
         
@@ -226,7 +234,7 @@ def find_ict_15m_intraday_setups(ticker):
         if cmp <= eq_50_level: return None
         
         return {
-            "Stock Symbol": ticker.replace('.NS', ''),
+            "Stock Symbol": clean_ticker,
             "PDL Swept (₹)": round(pdl, 2),
             "15m Sweep Low (₹)": round(sweep_low_price, 2),
             "15m Pre-Sweep High (₹)": round(valid_pre_sweep_high, 2),
@@ -243,11 +251,14 @@ def find_ict_15m_intraday_setups(ticker):
 # ==========================================
 def find_ema20_resting_setups(ticker):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="1y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 50: return None
-        try: cmp = float(t.fast_info.last_price)
-        except Exception: cmp = float(df['Close'].iloc[-1])
+        clean_ticker = ticker.replace('.NS', '')
+        df = tv.get_hist(symbol=clean_ticker, exchange='NSE', interval=Interval.in_daily, n_bars=750)
+        if df is None or df.empty or len(df) < 50: return None
+        
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        
+        cmp = float(df['Close'].iloc[-1])
         if pd.isna(cmp) or cmp <= 60: return None
 
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -275,7 +286,7 @@ def find_ema20_resting_setups(ticker):
         if cmp > buffer_zone_ceiling: return None 
         
         return {
-            "Stock Symbol": ticker.replace('.NS', ''),
+            "Stock Symbol": clean_ticker,
             "PML Swept (₹)": round(pml, 2),
             "Current EMA20 (₹)": round(current_ema20, 2),
             "Live CMP (₹)": round(cmp, 2),
@@ -286,12 +297,17 @@ def find_ema20_resting_setups(ticker):
 
 def backtest_ema20_setups(ticker, target_year, target_month):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="2y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 50: return []
+        clean_ticker = ticker.replace('.NS', '')
+        df = tv.get_hist(symbol=clean_ticker, exchange='NSE', interval=Interval.in_daily, n_bars=750)
+        if df is None or df.empty or len(df) < 50: return []
+        
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
         target_dates = df[(df.index.year == target_year) & (df.index.month == target_month)].index
         valid_setups = []
+        
         for current_day in target_dates:
             idx = df.index.get_loc(current_day)
             if idx < 30: continue
@@ -316,7 +332,7 @@ def backtest_ema20_setups(ticker, target_year, target_month):
             if cmp_on_day < current_ema20 or cmp_on_day > current_ema20 * 1.015: continue 
             
             valid_setups.append({
-                "Stock Symbol": ticker.replace('.NS', ''),
+                "Stock Symbol": clean_ticker,
                 "Trigger Date": current_day.strftime('%Y-%m-%d'),
                 "PML Swept (₹)": round(pml, 2),
                 "EMA20 Level (₹)": round(current_ema20, 2),
@@ -331,12 +347,14 @@ def backtest_ema20_setups(ticker, target_year, target_month):
 # ==========================================
 def backtest_strict_ema20_date_range(ticker, start_date, end_date):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="2y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 50: return []
+        clean_ticker = ticker.replace('.NS', '')
+        df = tv.get_hist(symbol=clean_ticker, exchange='NSE', interval=Interval.in_daily, n_bars=750)
+        if df is None or df.empty or len(df) < 50: return []
+        
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
         
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        
         target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
         valid_setups = []
         
@@ -385,7 +403,7 @@ def backtest_strict_ema20_date_range(ticker, start_date, end_date):
             distance_to_ema = ((cmp_on_day - target_ema) / target_ema) * 100
             
             valid_setups.append({
-                "Stock Symbol": ticker.replace('.NS', ''),
+                "Stock Symbol": clean_ticker,
                 "Trigger Date": current_day.strftime('%Y-%m-%d'),
                 "PML Swept (₹)": round(pml, 2),
                 "First Touch Date": first_touch_date.strftime('%Y-%m-%d'),
@@ -404,12 +422,14 @@ def backtest_strict_ema20_date_range(ticker, start_date, end_date):
 # ==========================================
 def find_expanding_divergence_setup(ticker):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="2y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 130: return None
+        clean_ticker = ticker.replace('.NS', '')
+        df = tv.get_hist(symbol=clean_ticker, exchange='NSE', interval=Interval.in_daily, n_bars=750)
+        if df is None or df.empty or len(df) < 130: return None
         
-        try: cmp = float(t.fast_info.last_price)
-        except Exception: cmp = float(df['Close'].iloc[-1])
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        
+        cmp = float(df['Close'].iloc[-1])
         if pd.isna(cmp) or cmp <= 60: return None
         
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -488,7 +508,7 @@ def find_expanding_divergence_setup(ticker):
         if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, breakout_idx-15):breakout_idx+1]): return None
             
         return {
-            "Stock Symbol": ticker.replace('.NS', ''),
+            "Stock Symbol": clean_ticker,
             "HTF Swept": swept_level_name,
             "Sweep Level (₹)": round(swept_price, 2),
             "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
@@ -500,9 +520,12 @@ def find_expanding_divergence_setup(ticker):
 
 def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="3y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 200: return []
+        clean_ticker = ticker.replace('.NS', '')
+        df = tv.get_hist(symbol=clean_ticker, exchange='NSE', interval=Interval.in_daily, n_bars=750)
+        if df is None or df.empty or len(df) < 200: return []
+        
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
         
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
         target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
@@ -584,7 +607,7 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
             if touch_count > 5: continue
             
             valid_setups.append({
-                "Stock Symbol": ticker.replace('.NS', ''),
+                "Stock Symbol": clean_ticker,
                 "Trigger Date": current_day.strftime('%Y-%m-%d'),
                 "HTF Swept": swept_level_name,
                 "Sweep Level (₹)": round(swept_price, 2),
@@ -601,12 +624,14 @@ def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
 # ==========================================
 def find_doji_resting_setups(ticker):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="3y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 200: return None
+        clean_ticker = ticker.replace('.NS', '')
+        df = tv.get_hist(symbol=clean_ticker, exchange='NSE', interval=Interval.in_daily, n_bars=750)
+        if df is None or df.empty or len(df) < 200: return None
         
-        try: cmp = float(t.fast_info.last_price)
-        except Exception: cmp = float(df['Close'].iloc[-1])
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        
+        cmp = float(df['Close'].iloc[-1])
         if pd.isna(cmp) or cmp <= 60: return None
         
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -656,7 +681,34 @@ def find_doji_resting_setups(ticker):
         if not sweep_occurred: return None
         
         sweep_idx = df.index.get_loc(absolute_sweep_day)
+        
+        if sweep_idx < 40: return None
+        ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
+        ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
+        ema_sweep = df['EMA20'].iloc[sweep_idx]
+        if not (ema_40_pre > ema_20_pre > ema_sweep): return None
+        
+        pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
+        if len(pre_sweep_df) < 5: return None
+        
+        swing_highs = []
+        for i in range(1, len(pre_sweep_df)-1):
+            if pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i-1] and pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i+1]:
+                swing_highs.append({'price': pre_sweep_df['High'].iloc[i], 'time': pre_sweep_df.index[i]})
+        
+        nearest_untested_high = None
+        for sh in reversed(swing_highs):
+            interim = pre_sweep_df.loc[sh['time']:].iloc[1:]
+            if interim.empty or interim['High'].max() < sh['price']:
+                nearest_untested_high = sh['price']
+                break
+                
+        if not nearest_untested_high: return None
+        
         post_sweep_df = df.iloc[sweep_idx:idx+1]
+        
+        closes_above_mss = post_sweep_df[post_sweep_df['Close'] > nearest_untested_high]
+        if closes_above_mss.empty: return None
         
         closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
         if closes_above_ema.empty: return None
@@ -672,19 +724,20 @@ def find_doji_resting_setups(ticker):
             is_doji = (rng > 0) and (body <= rng * 0.35)
             if is_doji: doji_count += 1
         
-        if doji_count < 1: return None
+        if doji_count < 2: return None
         
         row = df.iloc[idx]
         ema_val = df['EMA20'].iloc[idx]
         if row['Close'] <= ema_val: return None 
         
         distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
-        if distance_to_ema < -1.0 or distance_to_ema > 2.5: return None
+        if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
         
         return {
-            "Stock Symbol": ticker.replace('.NS', ''),
+            "Stock Symbol": clean_ticker,
             "HTF Swept": swept_name,
             "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
+            "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
             "EMA20 Rest Level (₹)": round(ema_val, 2),
             "Live CMP (₹)": round(cmp, 2)
         }
@@ -693,9 +746,12 @@ def find_doji_resting_setups(ticker):
 
 def backtest_doji_resting_date_range(ticker, start_date, end_date):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="3y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 200: return []
+        clean_ticker = ticker.replace('.NS', '')
+        df = tv.get_hist(symbol=clean_ticker, exchange='NSE', interval=Interval.in_daily, n_bars=750)
+        if df is None or df.empty or len(df) < 200: return []
+        
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
         
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
         target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
@@ -748,7 +804,34 @@ def backtest_doji_resting_date_range(ticker, start_date, end_date):
             if not sweep_occurred: continue
             
             sweep_idx = df.index.get_loc(absolute_sweep_day)
+            
+            if sweep_idx < 40: continue
+            ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
+            ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
+            ema_sweep = df['EMA20'].iloc[sweep_idx]
+            if not (ema_40_pre > ema_20_pre > ema_sweep): continue
+            
+            pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
+            if len(pre_sweep_df) < 5: continue
+            
+            swing_highs = []
+            for i in range(1, len(pre_sweep_df)-1):
+                if pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i-1] and pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i+1]:
+                    swing_highs.append({'price': pre_sweep_df['High'].iloc[i], 'time': pre_sweep_df.index[i]})
+            
+            nearest_untested_high = None
+            for sh in reversed(swing_highs):
+                interim = pre_sweep_df.loc[sh['time']:].iloc[1:]
+                if interim.empty or interim['High'].max() < sh['price']:
+                    nearest_untested_high = sh['price']
+                    break
+                    
+            if not nearest_untested_high: continue
+            
             post_sweep_df = df.iloc[sweep_idx:idx+1]
+            
+            closes_above_mss = post_sweep_df[post_sweep_df['Close'] > nearest_untested_high]
+            if closes_above_mss.empty: continue
             
             closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
             if closes_above_ema.empty: continue
@@ -764,20 +847,21 @@ def backtest_doji_resting_date_range(ticker, start_date, end_date):
                 is_doji = (rng > 0) and (body <= rng * 0.35)
                 if is_doji: doji_count += 1
             
-            if doji_count < 1: continue
+            if doji_count < 2: continue
             
             row = df.iloc[idx]
             ema_val = df['EMA20'].iloc[idx]
             if row['Close'] <= ema_val: continue 
             
             distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
-            if distance_to_ema < -1.0 or distance_to_ema > 2.5: continue
+            if distance_to_ema < -0.5 or distance_to_ema > 1.5: continue
             
             valid_setups.append({
-                "Stock Symbol": ticker.replace('.NS', ''),
+                "Stock Symbol": clean_ticker,
                 "Trigger Date": current_day.strftime('%Y-%m-%d'),
                 "HTF Swept": swept_name,
                 "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
+                "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
                 "EMA20 Rest Level (₹)": round(ema_val, 2),
                 "Closing Price (₹)": round(row['Close'], 2)
             })
@@ -1025,7 +1109,7 @@ with tab7:
 
 with tab8:
     st.markdown("### Doji Resting Setup & Backtester")
-    st.markdown("Identifies an **untested HTF liquidity sweep**, a cross above a **rounded EMA 20**, and a **flag pullback** printing at least one **Doji** resting directly on the EMA.")
+    st.markdown("Identifies an **untested HTF liquidity sweep** formed at a **Macro Bottom**, daily **MSS**, cross above a **rounded EMA 20**, and a **flag pullback** printing at least one **Doji** resting directly on the EMA.")
     
     if st.button("Run Live Screener (Doji Rest)"):
         with st.spinner("Scanning Nifty 500 for live Doji structural flags..."):
