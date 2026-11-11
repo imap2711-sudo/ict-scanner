@@ -122,7 +122,6 @@ def fetch_dhan_data(security_id, client_id, access_token):
                     
                 df.set_index('start_Time', inplace=True)
             
-            # ENFORCE DATETIME INDEX FOR PERIOD CALCULATIONS
             df.index = pd.to_datetime(df.index)
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
@@ -407,7 +406,10 @@ def backtest_setups(ticker, security_id, start_date, end_date, setup_type, clien
     if df.empty or len(df) < 200: return []
     
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
+    
+    # FIXED: Normalize DataFrame index and target dates safely
+    df_dates = pd.Series(df.index.normalize().date)
+    target_dates = df.index[df_dates.isin(pd.date_range(start=start_date, end=end_date).date)]
     valid_setups = []
     
     for current_day in target_dates:
