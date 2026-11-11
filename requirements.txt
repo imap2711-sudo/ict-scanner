@@ -1,5 +1,6 @@
 streamlit
-dhanhq
+yfinance
 pandas
 numpy
 requests
+urllib3
