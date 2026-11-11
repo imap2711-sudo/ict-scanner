@@ -73,7 +73,7 @@ def get_all_nse_symbols():
     return res if res else FALLBACK_TICKERS
 
 # ==========================================
-# FAST LIGHTNING DHAN FETCHING (OPTIMIZED)
+# DIRECT HTTP DHAN FETCHING 
 # ==========================================
 def fetch_dhan_data(security_id, client_id, access_token):
     try:
@@ -84,7 +84,7 @@ def fetch_dhan_data(security_id, client_id, access_token):
             "Accept": "application/json"
         }
         
-        from_date_str = (datetime.today() - timedelta(days=365)).strftime('%Y-%m-%d') # Optimized to 1 year for speed
+        from_date_str = (datetime.today() - timedelta(days=365)).strftime('%Y-%m-%d')
         to_date_str = datetime.today().strftime('%Y-%m-%d')
         
         payload = {
@@ -182,13 +182,18 @@ def check_ema20_rounded_top(ema_series, lookback=20):
 def evaluate_bullish_day(ticker, df, idx, current_day):
     if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-20):idx+1]): return None
     
-    curr_month = current_day.to_period('M')
-    pml = (df[df.index.to_period('M') == curr_month - 1]['Low'].min(), 'PML') if not df[df.index.to_period('M') == curr_month - 1].empty else None
-    curr_quarter = current_day.to_period('Q')
-    pql = (df[df.index.to_period('Q') == curr_quarter - 1]['Low'].min(), 'PQL') if not df[df.index.to_period('Q') == curr_quarter - 1].empty else None
+    curr_ts = pd.Timestamp(current_day)
+    curr_month = curr_ts.to_period('M')
     
-    curr_half = 1 if current_day.month <= 6 else 2
-    prev_half_year = current_day.year - 1 if curr_half == 1 else current_day.year
+    prev_month_data = df[df.index.to_period('M') == curr_month - 1]
+    pml = (prev_month_data['Low'].min(), 'PML') if not prev_month_data.empty else None
+    
+    curr_quarter = curr_ts.to_period('Q')
+    prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
+    pql = (prev_quarter_data['Low'].min(), 'PQL') if not prev_quarter_data.empty else None
+    
+    curr_half = 1 if curr_ts.month <= 6 else 2
+    prev_half_year = curr_ts.year - 1 if curr_half == 1 else curr_ts.year
     prev_half = 2 if curr_half == 1 else 1
     prev_half_data = df[(df.index.year == prev_half_year) & 
                         (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
@@ -266,7 +271,7 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     
     return {
         "Stock Symbol": ticker.replace('.NS', ''),
-        "Trigger Date": current_day.strftime('%Y-%m-%d'),
+        "Trigger Date": curr_ts.strftime('%Y-%m-%d'),
         "HTF Swept": swept_name,
         "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
         "EMA20 Rest (₹)": round(ema_val, 2),
@@ -279,18 +284,23 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
 def evaluate_bearish_day(ticker, df, idx, current_day):
     if not check_ema20_rounded_top(df['EMA20'].iloc[max(0, idx-20):idx+1]): return None
     
-    curr_month = current_day.to_period('M')
-    pmh = (df[df.index.to_period('M') == curr_month - 1]['High'].max(), 'PMH') if not df[df.index.to_period('M') == curr_month - 1].empty else None
-    curr_quarter = current_day.to_period('Q')
-    pqh = (df[df.index.to_period('Q') == curr_quarter - 1]['High'].max(), 'PQH') if not df[df.index.to_period('Q') == curr_quarter - 1].empty else None
+    curr_ts = pd.Timestamp(current_day)
+    curr_month = curr_ts.to_period('M')
     
-    curr_half = 1 if current_day.month <= 6 else 2
-    prev_half_year = current_day.year - 1 if curr_half == 1 else current_day.year
+    prev_month_data = df[df.index.to_period('M') == curr_month - 1]
+    pmh = (prev_month_data['High'].max(), 'PMH') if not prev_month_data.empty else None
+    
+    curr_quarter = curr_ts.to_period('Q')
+    prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
+    pqh = (prev_quarter_data['High'].max(), 'PQH') if not prev_quarter_data.empty else None
+    
+    curr_half = 1 if curr_ts.month <= 6 else 2
+    prev_half_year = curr_ts.year - 1 if curr_half == 1 else curr_ts.year
     prev_half = 2 if curr_half == 1 else 1
     prev_half_data = df[(df.index.year == prev_half_year) & 
                         (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
                          ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
-    phh = (df[df.index.to_period('M') == curr_month - 1]['High'].max(), 'PHH') if not prev_half_data.empty else None
+    phh = (prev_half_data['High'].max(), 'PHH') if not prev_half_data.empty else None
     
     htf_levels = [l for l in [pmh, pqh, phh] if l is not None]
     
@@ -363,7 +373,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     
     return {
         "Stock Symbol": ticker.replace('.NS', ''),
-        "Trigger Date": current_day.strftime('%Y-%m-%d'),
+        "Trigger Date": curr_ts.strftime('%Y-%m-%d'),
         "HTF Swept": swept_name,
         "Pre-Sweep Low (₹)": round(nearest_untested_low, 2),
         "EMA20 Rest (₹)": round(ema_val, 2),
@@ -418,7 +428,6 @@ def backtest_setups(ticker, security_id, start_date, end_date, setup_type, clien
 st.title("ICT Doji Resting Screener (Lightning Fast)")
 st.markdown("Macro Trend -> Untested HTF Sweep -> Daily MSS -> Flag -> Pinpoint Curvature Doji Rest")
 
-# Sidebar Configuration
 st.sidebar.header("Dhan API Configuration")
 CLIENT_ID = st.sidebar.text_input("Dhan Client ID", type="password")
 ACCESS_TOKEN = st.sidebar.text_input("Dhan Access Token", type="password")
@@ -458,7 +467,6 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
         my_bar = st.progress(0)
         results = []
         
-        # Split tickers into chunks of 50 to maximize concurrency safely without hitting rate limits
         chunk_size = 50
         ticker_chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
         
@@ -483,8 +491,7 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
                     total_processed += 1
                     my_bar.progress(min(total_processed / len(tickers), 1.0))
                     
-            # Tiny micro-pause between chunks to keep Dhan's rate-limiter happy
-            time.sleep(0.1)
+            time.sleep(0.05)
                 
         my_bar.empty()
 
