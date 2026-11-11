@@ -1,5 +1,5 @@
 streamlit
-yfinance
+dhanhq
 pandas
 numpy
 requests
