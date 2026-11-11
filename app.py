@@ -3,8 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import io
 import warnings
 import logging
@@ -15,34 +13,6 @@ warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
-
-# ==========================================
-# ROBUST YFINANCE SESSION
-# ==========================================
-# This prevents Yahoo Finance from silently skipping stocks due to rate limiting
-session = requests.Session()
-retry = Retry(total=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-adapter = HTTPAdapter(max_retries=retry)
-session.mount('http://', adapter)
-session.mount('https://', adapter)
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yf_data(ticker):
-    """Fetches data with robust retries and heavily caches it in RAM."""
-    try:
-        t = yf.Ticker(ticker, session=session)
-        df = t.history(period="3y", interval="1d", auto_adjust=False)
-        
-        if df.empty or len(df) < 200:
-            return pd.DataFrame()
-            
-        # Clean index timezone to prevent pandas comparison errors
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-            
-        return df
-    except Exception:
-        return pd.DataFrame()
 
 # ==========================================
 # UNIVERSE FETCHING
@@ -78,6 +48,27 @@ def get_all_nse_symbols():
         elif 'Symbol' in df.columns: return [str(s).strip() + '.NS' for s in df['Symbol']]
         return []
     except: return []
+
+# ==========================================
+# BULK DATA FETCHING (SPEED OPTIMIZATION)
+# ==========================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_bulk_yfinance_data(tickers):
+    """Fetches all tickers in a single optimized burst to bypass individual rate limits."""
+    try:
+        # We need 1y to accurately calculate Previous Half-Year highs/lows
+        data = yf.download(
+            tickers, 
+            period="1y", 
+            interval="1d", 
+            auto_adjust=False, 
+            threads=True, 
+            progress=False, 
+            show_errors=False
+        )
+        return data
+    except Exception:
+        return pd.DataFrame()
 
 # ==========================================
 # CURVATURE MATH
@@ -337,48 +328,10 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
         "Closing Price (₹)": round(row['Close'], 2)
     }
 
-# ==========================================
-# WRAPPER FUNCTIONS
-# ==========================================
-def scan_live_setups(ticker, setup_type):
-    df = fetch_yf_data(ticker)
-    if df.empty: return None
-    
-    cmp = df['Close'].iloc[-1]
-    if pd.isna(cmp) or cmp < 100: return None
-    
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    idx = len(df) - 1
-    
-    if setup_type == "Bullish": return evaluate_bullish_day(ticker, df, idx, df.index[idx])
-    else: return evaluate_bearish_day(ticker, df, idx, df.index[idx])
-
-def backtest_setups(ticker, start_date, end_date, setup_type):
-    df = fetch_yf_data(ticker)
-    if df.empty: return []
-    
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
-    valid_setups = []
-    
-    for current_day in target_dates:
-        idx = df.index.get_loc(current_day)
-        if idx < 130: continue
-        
-        cmp = df['Close'].iloc[idx]
-        if pd.isna(cmp) or cmp < 100: continue
-        
-        if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df, idx, current_day)
-        else: res = evaluate_bearish_day(ticker, df, idx, current_day)
-            
-        if res: valid_setups.append(res)
-        
-    return valid_setups
-
 # ==============================
 # STREAMLIT UI
 # ==============================
-st.title("ICT Doji Resting Screener (YFinance)")
+st.title("ICT Doji Resting Screener (YFinance Bulk)")
 st.markdown("Macro Trend -> Untested HTF Sweep -> Daily MSS -> Flag -> Pinpoint Curvature Doji Rest")
 
 st.sidebar.header("Scanner Configuration")
@@ -387,7 +340,7 @@ universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "N
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
 def execute_scan(setup_type, mode, start_date=None, end_date=None):
-    with st.spinner(f"Fetching {universe_option} via Yahoo Finance and scanning... (This is safely throttled to avoid IP bans)"):
+    with st.spinner(f"Bulk downloading 1-year data for {universe_option}... (Speed Optimized)"):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
@@ -396,22 +349,61 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
             st.error("Failed to fetch universe list. Please check internet connection.")
             return
             
+        # Bulk Fetch: This is incredibly fast compared to individual yf.Ticker calls
+        bulk_data = fetch_bulk_yfinance_data(tickers)
+        if bulk_data.empty:
+            st.error("Yahoo Finance bulk download failed. Please try again in a few minutes.")
+            return
+
         my_bar = st.progress(0)
         results = []
         
-        # Throttled to 8 workers to aggressively protect against Yahoo IP Rate limits
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            if mode == "live":
-                futures = {executor.submit(scan_live_setups, t, setup_type): t for t in tickers}
-            else:
-                futures = {executor.submit(backtest_setups, t, start_date, end_date, setup_type): t for t in tickers}
+        # We can process the pre-downloaded data locally now, which is instant
+        for i, ticker in enumerate(tickers):
+            try:
+                if len(tickers) == 1:
+                    df_ticker = pd.DataFrame({
+                        'Open': bulk_data['Open'], 'High': bulk_data['High'],
+                        'Low': bulk_data['Low'], 'Close': bulk_data['Close']
+                    }).dropna()
+                else:
+                    # Extract the specific ticker's OHLC from the bulk multi-index dataframe
+                    df_ticker = pd.DataFrame({
+                        'Open': bulk_data['Open'][ticker],
+                        'High': bulk_data['High'][ticker],
+                        'Low': bulk_data['Low'][ticker],
+                        'Close': bulk_data['Close'][ticker]
+                    }).dropna()
                 
-            for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                res = future.result()
-                if res: 
-                    if mode == "live": results.append(res)
-                    else: results.extend(res)
-                my_bar.progress((i + 1) / len(futures))
+                if df_ticker.empty or len(df_ticker) < 130: continue
+                
+                # Check CMP filter
+                cmp = df_ticker['Close'].iloc[-1]
+                if pd.isna(cmp) or cmp < 100: continue
+                
+                if df_ticker.index.tz is not None:
+                    df_ticker.index = df_ticker.index.tz_localize(None)
+                    
+                df_ticker['EMA20'] = df_ticker['Close'].ewm(span=20, adjust=False).mean()
+                
+                if mode == "live":
+                    idx = len(df_ticker) - 1
+                    if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df_ticker, idx, df_ticker.index[idx])
+                    else: res = evaluate_bearish_day(ticker, df_ticker, idx, df_ticker.index[idx])
+                    if res: results.append(res)
+                
+                elif mode == "backtest":
+                    target_dates = df_ticker[(df_ticker.index.date >= start_date) & (df_ticker.index.date <= end_date)].index
+                    for current_day in target_dates:
+                        idx = df_ticker.index.get_loc(current_day)
+                        if idx < 130: continue
+                        if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df_ticker, idx, current_day)
+                        else: res = evaluate_bearish_day(ticker, df_ticker, idx, current_day)
+                        if res: results.append(res)
+            except Exception:
+                pass
+                
+            my_bar.progress((i + 1) / len(tickers))
                 
         my_bar.empty()
 
