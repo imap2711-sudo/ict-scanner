@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import requests
 import io
+import time
+import random
 import warnings
 import logging
 import concurrent.futures
@@ -30,7 +32,7 @@ FALLBACK_TICKERS = [
 @st.cache_data(ttl=86400)
 def get_nifty200_symbols():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
@@ -42,7 +44,7 @@ def get_nifty200_symbols():
 @st.cache_data(ttl=86400)
 def get_nifty500_symbols():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
@@ -54,7 +56,7 @@ def get_nifty500_symbols():
 @st.cache_data(ttl=86400)
 def get_all_nse_symbols():
     url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code == 200:
@@ -65,52 +67,32 @@ def get_all_nse_symbols():
     return FALLBACK_TICKERS
 
 # ==========================================
-# ROBUST BULK DATA FETCHING
+# ROBUST ITERATIVE DATA FETCHING
 # ==========================================
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_bulk_yfinance_data(tickers):
-    """Downloads data in chunks of 50 using native yfinance session management."""
-    chunk_size = 50
-    combined_dict = {}
-    
-    for i in range(0, len(tickers), chunk_size):
-        chunk = tickers[i:i + chunk_size]
-        try:
-            # Let yfinance natively handle cookies and headers to avoid 403 Forbidden errors
-            data = yf.download(
-                chunk, 
-                period="1y", 
-                interval="1d", 
-                auto_adjust=False, 
-                threads=True, 
-                progress=False
-            )
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_historical_data(ticker):
+    """
+    Fetches data one stock at a time to bypass Yahoo's bulk block.
+    Caches the result for 24 hours so backtests and tab switches are instant.
+    """
+    try:
+        # Micro-delay mimics human behavior to avoid Yahoo rate limits
+        time.sleep(random.uniform(0.05, 0.2))
+        
+        df = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=False)
+        
+        if df.empty or len(df) < 130: 
+            return None
             
-            if data.empty: continue
+        # Clean column names to ensure Open, High, Low, Close are formatted correctly
+        df.rename(columns=lambda x: x.capitalize(), inplace=True)
+        
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
             
-            # If chunk is 1 ticker, columns are flat
-            if len(chunk) == 1 or not isinstance(data.columns, pd.MultiIndex):
-                df_t = data.dropna()
-                if not df_t.empty:
-                    combined_dict[chunk[0]] = df_t
-            else:
-                # If chunk > 1, columns are MultiIndex (Price Type, Ticker)
-                for t in chunk:
-                    if 'Close' in data.columns and t in data['Close'].columns:
-                        df_t = pd.DataFrame({
-                            'Open': data['Open'][t],
-                            'High': data['High'][t],
-                            'Low': data['Low'][t],
-                            'Close': data['Close'][t]
-                        }).dropna()
-                        
-                        if not df_t.empty:
-                            combined_dict[t] = df_t
-                            
-        except Exception:
-            continue
-            
-    return combined_dict
+        return df
+    except Exception:
+        return None
 
 # ==========================================
 # CURVATURE MATH
@@ -155,7 +137,7 @@ def check_ema20_rounded_top(ema_series, lookback=20):
 # ENGINE: BULLISH LOGIC
 # ==========================================
 def evaluate_bullish_day(ticker, df, idx, current_day):
-    if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-20):idx+1]): return None
+    if not check_ema20_rounded_bottom(df['Ema20'].iloc[max(0, idx-20):idx+1]): return None
     
     curr_month = current_day.to_period('M')
     prev_month_data = df[df.index.to_period('M') == curr_month - 1]
@@ -199,9 +181,9 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     sweep_idx = df.index.get_loc(absolute_sweep_day)
     
     if sweep_idx < 40: return None
-    ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
-    ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
-    ema_sweep = df['EMA20'].iloc[sweep_idx]
+    ema_40_pre = df['Ema20'].iloc[sweep_idx - 40]
+    ema_20_pre = df['Ema20'].iloc[sweep_idx - 20]
+    ema_sweep = df['Ema20'].iloc[sweep_idx]
     if not (ema_40_pre > ema_20_pre > ema_sweep): return None
     
     pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
@@ -224,20 +206,20 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     post_sweep_df = df.iloc[sweep_idx:idx+1]
     if post_sweep_df[post_sweep_df['Close'] > nearest_untested_high].empty: return None
     
-    closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
+    closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['Ema20']]
     if closes_above_ema.empty: return None
     first_breakout_idx = df.index.get_loc(closes_above_ema.index[0])
     
     window_start = max(0, first_breakout_idx - 30)
     pre_touch_window = df.iloc[window_start:first_breakout_idx]
-    if len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']]) > 5: return None
+    if len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['Ema20']]) > 5: return None
     
     recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
     doji_count = 0
     for i in range(len(recent_window)):
         r = recent_window.iloc[i]
         c_idx = df.index.get_loc(recent_window.index[i])
-        ema_val = df['EMA20'].iloc[c_idx]
+        ema_val = df['Ema20'].iloc[c_idx]
         body = abs(r['Open'] - r['Close'])
         rng = r['High'] - r['Low']
         if (rng > 0) and (body <= rng * 0.35) and (r['Close'] > ema_val): doji_count += 1
@@ -245,7 +227,7 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     if doji_count < 1: return None
     
     row = df.iloc[idx]
-    ema_val = df['EMA20'].iloc[idx]
+    ema_val = df['Ema20'].iloc[idx]
     if row['Close'] <= ema_val: return None 
     
     distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
@@ -265,7 +247,7 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
 # ENGINE: BEARISH LOGIC
 # ==========================================
 def evaluate_bearish_day(ticker, df, idx, current_day):
-    if not check_ema20_rounded_top(df['EMA20'].iloc[max(0, idx-20):idx+1]): return None
+    if not check_ema20_rounded_top(df['Ema20'].iloc[max(0, idx-20):idx+1]): return None
     
     curr_month = current_day.to_period('M')
     prev_month_data = df[df.index.to_period('M') == curr_month - 1]
@@ -308,9 +290,9 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     sweep_idx = df.index.get_loc(absolute_sweep_day)
     
     if sweep_idx < 40: return None
-    ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
-    ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
-    ema_sweep = df['EMA20'].iloc[sweep_idx]
+    ema_40_pre = df['Ema20'].iloc[sweep_idx - 40]
+    ema_20_pre = df['Ema20'].iloc[sweep_idx - 20]
+    ema_sweep = df['Ema20'].iloc[sweep_idx]
     if not (ema_40_pre < ema_20_pre < ema_sweep): return None
     
     pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
@@ -333,20 +315,20 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     post_sweep_df = df.iloc[sweep_idx:idx+1]
     if post_sweep_df[post_sweep_df['Close'] < nearest_untested_low].empty: return None
     
-    closes_below_ema = post_sweep_df[post_sweep_df['Close'] < post_sweep_df['EMA20']]
+    closes_below_ema = post_sweep_df[post_sweep_df['Close'] < post_sweep_df['Ema20']]
     if closes_below_ema.empty: return None
     first_breakout_idx = df.index.get_loc(closes_below_ema.index[0])
     
     window_start = max(0, first_breakout_idx - 30)
     pre_touch_window = df.iloc[window_start:first_breakout_idx]
-    if len(pre_touch_window[pre_touch_window['Low'] <= pre_touch_window['EMA20']]) > 5: return None
+    if len(pre_touch_window[pre_touch_window['Low'] <= pre_touch_window['Ema20']]) > 5: return None
     
     recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
     doji_count = 0
     for i in range(len(recent_window)):
         r = recent_window.iloc[i]
         c_idx = df.index.get_loc(recent_window.index[i])
-        ema_val = df['EMA20'].iloc[c_idx]
+        ema_val = df['Ema20'].iloc[c_idx]
         body = abs(r['Open'] - r['Close'])
         rng = r['High'] - r['Low']
         if (rng > 0) and (body <= rng * 0.35) and (r['Close'] < ema_val): doji_count += 1
@@ -354,7 +336,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     if doji_count < 1: return None
     
     row = df.iloc[idx]
-    ema_val = df['EMA20'].iloc[idx]
+    ema_val = df['Ema20'].iloc[idx]
     if row['Close'] >= ema_val: return None 
     
     distance_to_ema = ((ema_val - row['High']) / ema_val) * 100
@@ -373,7 +355,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
 # ==============================
 # STREAMLIT UI
 # ==============================
-st.title("ICT Doji Resting Screener (YFinance Bulk)")
+st.title("ICT Doji Resting Screener (Cached Fetch)")
 st.markdown("Macro Trend -> Untested HTF Sweep -> Daily MSS -> Flag -> Pinpoint Curvature Doji Rest")
 
 st.sidebar.header("Scanner Configuration")
@@ -382,7 +364,7 @@ universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "N
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
 def execute_scan(setup_type, mode, start_date=None, end_date=None):
-    with st.spinner(f"Bulk downloading 1-year data for {universe_option}... (Speed Optimized)"):
+    with st.spinner(f"Fetching data for {universe_option}... (The first run takes ~2 minutes, but saves to memory. Backtests will be instant afterward)"):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
@@ -390,49 +372,44 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
         if not tickers:
             st.error("Failed to fetch universe list. Proceeding with fallback stocks.")
             tickers = FALLBACK_TICKERS
-            
-        bulk_data_dict = fetch_bulk_yfinance_data(tickers)
-        if not bulk_data_dict:
-            st.error("Yahoo Finance bulk download failed completely. Please try again in a few minutes.")
-            return
 
         my_bar = st.progress(0)
         results = []
         
-        for i, ticker in enumerate(tickers):
-            try:
-                df_ticker = bulk_data_dict.get(ticker)
-                
-                if df_ticker is None or df_ticker.empty or len(df_ticker) < 130: 
-                    continue
-                
-                cmp = df_ticker['Close'].iloc[-1]
-                if pd.isna(cmp) or cmp < 100: 
-                    continue
-                
-                if df_ticker.index.tz is not None:
-                    df_ticker.index = df_ticker.index.tz_localize(None)
+        def process_ticker(ticker):
+            df_ticker = fetch_historical_data(ticker)
+            if df_ticker is None: return []
+            
+            cmp = df_ticker['Close'].iloc[-1]
+            if pd.isna(cmp) or cmp < 100: return []
+            
+            df_ticker['Ema20'] = df_ticker['Close'].ewm(span=20, adjust=False).mean()
+            local_results = []
+            
+            if mode == "live":
+                idx = len(df_ticker) - 1
+                if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df_ticker, idx, df_ticker.index[idx])
+                else: res = evaluate_bearish_day(ticker, df_ticker, idx, df_ticker.index[idx])
+                if res: local_results.append(res)
+            
+            elif mode == "backtest":
+                target_dates = df_ticker[(df_ticker.index.date >= start_date) & (df_ticker.index.date <= end_date)].index
+                for current_day in target_dates:
+                    idx = df_ticker.index.get_loc(current_day)
+                    if idx < 130: continue
+                    if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df_ticker, idx, current_day)
+                    else: res = evaluate_bearish_day(ticker, df_ticker, idx, current_day)
+                    if res: local_results.append(res)
                     
-                df_ticker['EMA20'] = df_ticker['Close'].ewm(span=20, adjust=False).mean()
-                
-                if mode == "live":
-                    idx = len(df_ticker) - 1
-                    if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df_ticker, idx, df_ticker.index[idx])
-                    else: res = evaluate_bearish_day(ticker, df_ticker, idx, df_ticker.index[idx])
-                    if res: results.append(res)
-                
-                elif mode == "backtest":
-                    target_dates = df_ticker[(df_ticker.index.date >= start_date) & (df_ticker.index.date <= end_date)].index
-                    for current_day in target_dates:
-                        idx = df_ticker.index.get_loc(current_day)
-                        if idx < 130: continue
-                        if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df_ticker, idx, current_day)
-                        else: res = evaluate_bearish_day(ticker, df_ticker, idx, current_day)
-                        if res: results.append(res)
-            except Exception:
-                pass
-                
-            my_bar.progress((i + 1) / len(tickers))
+            return local_results
+
+        # Uses 10 background threads to download swiftly without angering Yahoo's bot-detection
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(process_ticker, t): t for t in tickers}
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                res_list = future.result()
+                if res_list: results.extend(res_list)
+                my_bar.progress((i + 1) / len(tickers))
                 
         my_bar.empty()
 
