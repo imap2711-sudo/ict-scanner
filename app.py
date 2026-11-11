@@ -3,6 +3,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import io
 import warnings
 import logging
@@ -14,61 +16,102 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
+# Fallback list in case NSE India servers block the fetch request
+FALLBACK_TICKERS = [
+    'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'BHARTIARTL.NS', 'SBIN.NS', 
+    'INFY.NS', 'LICI.NS', 'ITC.NS', 'HINDUNILVR.NS', 'LT.NS', 'BAJFINANCE.NS', 
+    'HCLTECH.NS', 'MARUTI.NS', 'SUNPHARMA.NS', 'TATAMOTORS.NS', 'TATASTEEL.NS', 
+    'ONGC.NS', 'KOTAKBANK.NS', 'NTPC.NS', 'AXISBANK.NS', 'POWERGRID.NS', 'TITAN.NS', 
+    'M&M.NS', 'BAJAJFINSV.NS', 'ASIANPAINT.NS', 'ADANIENT.NS', 'ADANIPORTS.NS', 
+    'WIPRO.NS', 'COALINDIA.NS', 'NESTLEIND.NS', 'GRASIM.NS', 'TECHM.NS', 'HINDALCO.NS'
+]
+
 # ==========================================
 # UNIVERSE FETCHING
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_nifty200_symbols():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        df = pd.read_csv(io.StringIO(res.text))
-        return [str(s).strip() + '.NS' for s in df['Symbol']]
-    except: return []
+        if res.status_code == 200:
+            df = pd.read_csv(io.StringIO(res.text))
+            return [str(s).strip() + '.NS' for s in df['Symbol']]
+    except: pass
+    return FALLBACK_TICKERS
 
 @st.cache_data(ttl=86400)
 def get_nifty500_symbols():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        df = pd.read_csv(io.StringIO(res.text))
-        return [str(s).strip() + '.NS' for s in df['Symbol']]
-    except: return []
+        if res.status_code == 200:
+            df = pd.read_csv(io.StringIO(res.text))
+            return [str(s).strip() + '.NS' for s in df['Symbol']]
+    except: pass
+    return FALLBACK_TICKERS
 
 @st.cache_data(ttl=86400)
 def get_all_nse_symbols():
     url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         res = requests.get(url, headers=headers, timeout=15)
-        df = pd.read_csv(io.StringIO(res.text))
-        if 'SYMBOL' in df.columns: return [str(s).strip() + '.NS' for s in df['SYMBOL']]
-        elif 'Symbol' in df.columns: return [str(s).strip() + '.NS' for s in df['Symbol']]
-        return []
-    except: return []
+        if res.status_code == 200:
+            df = pd.read_csv(io.StringIO(res.text))
+            if 'SYMBOL' in df.columns: return [str(s).strip() + '.NS' for s in df['SYMBOL']]
+            elif 'Symbol' in df.columns: return [str(s).strip() + '.NS' for s in df['Symbol']]
+    except: pass
+    return FALLBACK_TICKERS
 
 # ==========================================
-# BULK DATA FETCHING (SPEED OPTIMIZATION)
+# ROBUST BULK DATA FETCHING (CHUNKED)
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_bulk_yfinance_data(tickers):
-    """Fetches all tickers in a single optimized burst to bypass individual rate limits."""
-    try:
-        # We need 1y to accurately calculate Previous Half-Year highs/lows
-        data = yf.download(
-            tickers, 
-            period="1y", 
-            interval="1d", 
-            auto_adjust=False, 
-            threads=True, 
-            progress=False, 
-            show_errors=False
-        )
-        return data
-    except Exception:
-        return pd.DataFrame()
+    """Downloads data in chunks of 100 to prevent Yahoo IP blocks and stores in a dictionary."""
+    session = requests.Session()
+    retry = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    
+    chunk_size = 100
+    combined_dict = {}
+    
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i + chunk_size]
+        try:
+            # group_by="ticker" forces robust formatting regardless of chunk size
+            data = yf.download(
+                chunk, 
+                period="1y", 
+                interval="1d", 
+                auto_adjust=False, 
+                threads=True, 
+                progress=False, 
+                show_errors=False,
+                group_by="ticker",
+                session=session
+            )
+            
+            if data.empty: continue
+            
+            # Map into a safe dictionary (avoids pandas MultiIndex bugs on older/newer yfinance versions)
+            if len(chunk) == 1:
+                # Format fixing for single ticker fallback
+                if 'Close' in data.columns or 'close' in data.columns:
+                    combined_dict[chunk[0]] = data
+            else:
+                for t in chunk:
+                    if t in data.columns.get_level_values(0):
+                        combined_dict[t] = data[t]
+        except Exception:
+            continue
+            
+    return combined_dict
 
 # ==========================================
 # CURVATURE MATH
@@ -340,46 +383,41 @@ universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "N
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
 def execute_scan(setup_type, mode, start_date=None, end_date=None):
-    with st.spinner(f"Bulk downloading 1-year data for {universe_option}... (Speed Optimized)"):
+    with st.spinner(f"Safely chunking and downloading 1-year data for {universe_option}..."):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
         
         if not tickers:
-            st.error("Failed to fetch universe list. Please check internet connection.")
-            return
+            st.error("Failed to fetch universe list. Proceeding with fallback stocks.")
+            tickers = FALLBACK_TICKERS
             
-        # Bulk Fetch: This is incredibly fast compared to individual yf.Ticker calls
-        bulk_data = fetch_bulk_yfinance_data(tickers)
-        if bulk_data.empty:
-            st.error("Yahoo Finance bulk download failed. Please try again in a few minutes.")
+        # Secure Bulk Fetch into Dictionary
+        bulk_data_dict = fetch_bulk_yfinance_data(tickers)
+        if not bulk_data_dict:
+            st.error("Yahoo Finance bulk download failed completely. Please try again in a few minutes.")
             return
 
         my_bar = st.progress(0)
         results = []
         
-        # We can process the pre-downloaded data locally now, which is instant
         for i, ticker in enumerate(tickers):
             try:
-                if len(tickers) == 1:
-                    df_ticker = pd.DataFrame({
-                        'Open': bulk_data['Open'], 'High': bulk_data['High'],
-                        'Low': bulk_data['Low'], 'Close': bulk_data['Close']
-                    }).dropna()
-                else:
-                    # Extract the specific ticker's OHLC from the bulk multi-index dataframe
-                    df_ticker = pd.DataFrame({
-                        'Open': bulk_data['Open'][ticker],
-                        'High': bulk_data['High'][ticker],
-                        'Low': bulk_data['Low'][ticker],
-                        'Close': bulk_data['Close'][ticker]
-                    }).dropna()
+                df_ticker = bulk_data_dict.get(ticker)
                 
-                if df_ticker.empty or len(df_ticker) < 130: continue
+                # Verify dataframe validity
+                if df_ticker is None or df_ticker.empty or len(df_ticker) < 130: 
+                    continue
                 
-                # Check CMP filter
+                # Standardize columns to safely catch Open/open/Adj Close variants
+                df_ticker.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+                
+                if 'Close' not in df_ticker.columns: 
+                    continue
+                
                 cmp = df_ticker['Close'].iloc[-1]
-                if pd.isna(cmp) or cmp < 100: continue
+                if pd.isna(cmp) or cmp < 100: 
+                    continue
                 
                 if df_ticker.index.tz is not None:
                     df_ticker.index = df_ticker.index.tz_localize(None)
