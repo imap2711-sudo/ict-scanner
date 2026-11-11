@@ -60,21 +60,23 @@ def get_all_nse_symbols():
     return res if res else FALLBACK_TICKERS
 
 # ==========================================
-# DHANHQ DATA FETCHING
+# DHANHQ DATA FETCHING (FIXED FOR V2 API)
 # ==========================================
 def fetch_dhan_data(security_id, client_id, access_token):
     try:
         dhan = dhanhq(client_id, access_token)
-        from_date = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
-        to_date = datetime.today().strftime('%Y-%m-%d')
+        
+        # Dhan V2 strictly requires YYYY-MM-DD string format
+        from_date_str = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
+        to_date_str = datetime.today().strftime('%Y-%m-%d')
         
         historical_data = dhan.historical_daily_data(
-            symbol=security_id,
+            symbol=str(security_id), # Ensure numeric ID is cast to string
             exchange_segment='NSE_EQ',
             instrument_type='EQUITY',
-            expiry_code='0',  # CRITICAL for Equities in Dhan
-            from_date=from_date,
-            to_date=to_date
+            expiry_code=0, 
+            from_date=from_date_str,
+            to_date=to_date_str
         )
         
         if historical_data.get('status') == 'success':
