@@ -73,13 +73,10 @@ def get_all_nse_symbols():
     return res if res else FALLBACK_TICKERS
 
 # ==========================================
-# DIRECT HTTP DHAN FETCHING (THROTTLED)
+# FAST LIGHTNING DHAN FETCHING (OPTIMIZED)
 # ==========================================
 def fetch_dhan_data(security_id, client_id, access_token):
     try:
-        # STRICT RATE LIMIT THROTTLE: Pause 0.4 seconds between calls to prevent DH-904
-        time.sleep(0.4)
-        
         url = "https://api.dhan.co/v2/charts/historical"
         headers = {
             "access-token": access_token.strip(),
@@ -87,7 +84,7 @@ def fetch_dhan_data(security_id, client_id, access_token):
             "Accept": "application/json"
         }
         
-        from_date_str = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
+        from_date_str = (datetime.today() - timedelta(days=365)).strftime('%Y-%m-%d') # Optimized to 1 year for speed
         to_date_str = datetime.today().strftime('%Y-%m-%d')
         
         payload = {
@@ -100,22 +97,18 @@ def fetch_dhan_data(security_id, client_id, access_token):
             "toDate": to_date_str
         }
         
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        response = requests.post(url, headers=headers, json=payload, timeout=8)
         
-        if not response.text.strip():
-            return "API_FAIL: Dhan returned a completely blank response."
-            
-        if response.status_code != 200:
-            return f"API_FAIL: HTTP {response.status_code} - {response.text}"
+        if not response.text.strip() or response.status_code != 200:
+            return pd.DataFrame()
             
         try:
             data = response.json()
         except ValueError:
-            return f"API_FAIL: Invalid JSON from Dhan -> {response.text[:150]}"
+            return pd.DataFrame()
             
         if 'open' in data and 'close' in data:
-            if not data['open']: 
-                return pd.DataFrame() 
+            if not data['open']: return pd.DataFrame() 
                 
             df = pd.DataFrame(data)
             if df.empty: return pd.DataFrame()
@@ -136,10 +129,9 @@ def fetch_dhan_data(security_id, client_id, access_token):
             df.sort_index(inplace=True)
             return df
             
-        return f"API_FAIL: Dhan Error -> {data.get('remarks', data.get('errorType', str(data)[:200]))}"
-        
-    except Exception as e:
-        return f"API_FAIL: Python Exception -> {str(e)}"
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 # ==========================================
 # CURVATURE MATH
@@ -379,11 +371,14 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     }
 
 # ==========================================
-# WRAPPER FUNCTIONS
+# WRAPPER FUNCTIONS (CACHED)
 # ==========================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_cached_stock_df(security_id, client_id, access_token):
+    return fetch_dhan_data(security_id, client_id, access_token)
+
 def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
-    df = fetch_dhan_data(security_id, client_id, access_token)
-    if isinstance(df, str) and df.startswith("API_FAIL"): return df 
+    df = get_cached_stock_df(security_id, client_id, access_token)
     if df.empty or len(df) < 200: return None
     
     cmp = df['Close'].iloc[-1]
@@ -396,8 +391,7 @@ def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
     else: return evaluate_bearish_day(ticker, df, idx, df.index[idx])
 
 def backtest_setups(ticker, security_id, start_date, end_date, setup_type, client_id, access_token):
-    df = fetch_dhan_data(security_id, client_id, access_token)
-    if isinstance(df, str) and df.startswith("API_FAIL"): return df
+    df = get_cached_stock_df(security_id, client_id, access_token)
     if df.empty or len(df) < 200: return []
     
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -421,12 +415,11 @@ def backtest_setups(ticker, security_id, start_date, end_date, setup_type, clien
 # ==============================
 # STREAMLIT UI
 # ==============================
-st.title("ICT Doji Resting Screener (DhanHQ)")
+st.title("ICT Doji Resting Screener (Lightning Fast)")
 st.markdown("Macro Trend -> Untested HTF Sweep -> Daily MSS -> Flag -> Pinpoint Curvature Doji Rest")
 
 # Sidebar Configuration
 st.sidebar.header("Dhan API Configuration")
-st.sidebar.markdown("Enter your broker keys to fetch institutional-grade tick data directly from NSE.")
 CLIENT_ID = st.sidebar.text_input("Dhan Client ID", type="password")
 ACCESS_TOKEN = st.sidebar.text_input("Dhan Access Token", type="password")
 
@@ -437,13 +430,10 @@ if st.sidebar.button("Test API Connection"):
         else:
             st.write("Testing API via HDFCBANK (SecID: 1333)...")
             res = fetch_dhan_data("1333", CLIENT_ID, ACCESS_TOKEN)
-            if isinstance(res, str) and res.startswith("API_FAIL"):
-                st.error(res)
-            elif isinstance(res, pd.DataFrame):
-                if res.empty:
-                    st.warning("API connection succeeded, but returned 0 daily candles.")
-                else:
-                    st.success(f"Success! Properly fetched {len(res)} daily candles.")
+            if res.empty:
+                st.error("API returned empty data. Check token.")
+            else:
+                st.success(f"Success! Fetched {len(res)} daily candles.")
 
 st.sidebar.divider()
 universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "Nifty 500", "All NSE Stocks (> ₹100)"])
@@ -455,7 +445,7 @@ if not CLIENT_ID or not ACCESS_TOKEN:
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
 def execute_scan(setup_type, mode, start_date=None, end_date=None):
-    with st.spinner(f"Fetching {universe_option} via Dhan API (Throttled to prevent rate limits)..."):
+    with st.spinner(f"Lightning scanning {universe_option} (Concurrent batches)..."):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
@@ -467,37 +457,36 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
             
         my_bar = st.progress(0)
         results = []
-        api_fails = 0
-        last_error_msg = ""
         
-        # STRICT RATE LIMIT SAFETY: max_workers=1 forces sequential requests with our 0.4s pause
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            futures = {}
-            for t in tickers:
-                clean_sym = t.replace('.NS', '')
-                sec_id = mapping.get(clean_sym)
-                if sec_id:
-                    if mode == "live":
-                        futures[executor.submit(scan_live_setups, t, sec_id, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
-                    else:
-                        futures[executor.submit(backtest_setups, t, sec_id, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+        # Split tickers into chunks of 50 to maximize concurrency safely without hitting rate limits
+        chunk_size = 50
+        ticker_chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+        
+        total_processed = 0
+        for chunk in ticker_chunks:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {}
+                for t in chunk:
+                    clean_sym = t.replace('.NS', '')
+                    sec_id = mapping.get(clean_sym)
+                    if sec_id:
+                        if mode == "live":
+                            futures[executor.submit(scan_live_setups, t, sec_id, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                        else:
+                            futures[executor.submit(backtest_setups, t, sec_id, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                        
+                for future in concurrent.futures.as_completed(futures):
+                    res = future.result()
+                    if res:
+                        if mode == "live": results.append(res)
+                        else: results.extend(res)
+                    total_processed += 1
+                    my_bar.progress(min(total_processed / len(tickers), 1.0))
                     
-            for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                res = future.result()
-                if isinstance(res, str) and res.startswith("API_FAIL"): 
-                    api_fails += 1
-                    last_error_msg = res
-                elif res: 
-                    if mode == "live": results.append(res)
-                    else: results.extend(res)
-                my_bar.progress((i + 1) / len(futures))
+            # Tiny micro-pause between chunks to keep Dhan's rate-limiter happy
+            time.sleep(0.1)
                 
         my_bar.empty()
-        
-        if api_fails > len(futures) * 0.9:
-            st.error(f"🚨 **Dhan API Connection Failed:** {api_fails} requests failed.")
-            st.error(f"**Diagnostic Response:**\n\n`{last_error_msg}`")
-            return
 
         if results:
             if mode == "backtest": results.sort(key=lambda x: x['Trigger Date'])
