@@ -1,33 +1,52 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import io
 import warnings
 import logging
 import concurrent.futures
 from datetime import datetime, timedelta
-from dhanhq import dhanhq
 
 warnings.filterwarnings('ignore')
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
 # ==========================================
-# UNIVERSE & MAPPING
+# ROBUST YFINANCE SESSION
 # ==========================================
-@st.cache_data(ttl=86400)
-def get_dhan_symbol_mapping():
-    """Downloads Dhan's master scrip list to map text symbols (RELIANCE) to Security IDs (1333)"""
-    try:
-        url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-        df = pd.read_csv(url, low_memory=False)
-        df_nse = df[df['SEM_EXM_EXCH_ID'] == 'NSE']
-        mapping = dict(zip(df_nse['SEM_TRADING_SYMBOL'], df_nse['SEM_SMST_SECURITY_ID'].astype(str)))
-        return mapping
-    except Exception:
-        return {}
+# This prevents Yahoo Finance from silently skipping stocks due to rate limiting
+session = requests.Session()
+retry = Retry(total=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+adapter = HTTPAdapter(max_retries=retry)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yf_data(ticker):
+    """Fetches data with robust retries and heavily caches it in RAM."""
+    try:
+        t = yf.Ticker(ticker, session=session)
+        df = t.history(period="3y", interval="1d", auto_adjust=False)
+        
+        if df.empty or len(df) < 200:
+            return pd.DataFrame()
+            
+        # Clean index timezone to prevent pandas comparison errors
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+            
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# ==========================================
+# UNIVERSE FETCHING
+# ==========================================
 @st.cache_data(ttl=86400)
 def get_nifty200_symbols():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
@@ -59,48 +78,6 @@ def get_all_nse_symbols():
         elif 'Symbol' in df.columns: return [str(s).strip() + '.NS' for s in df['Symbol']]
         return []
     except: return []
-
-# ==========================================
-# DHANHQ DATA FETCHING
-# ==========================================
-def fetch_dhan_data(security_id, client_id, access_token):
-    """Fetches exact EOD historical data using the numeric Security ID."""
-    try:
-        dhan = dhanhq(client_id, access_token)
-        
-        from_date = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
-        to_date = datetime.today().strftime('%Y-%m-%d')
-        
-        historical_data = dhan.historical_daily_data(
-            symbol=security_id,
-            exchange_segment='NSE_EQ',
-            instrument_type='EQUITY',
-            expiry_code='0',  # CRITICAL FIX: Dhan crashes without this explicitly set to '0' for equities
-            from_date=from_date,
-            to_date=to_date
-        )
-        
-        if historical_data.get('status') == 'success':
-            df = pd.DataFrame(historical_data['data'])
-            if df.empty: return pd.DataFrame()
-            
-            # Robust Epoch/Date parsing
-            if pd.api.types.is_numeric_dtype(df['start_Time']):
-                if df['start_Time'].iloc[0] > 1e11: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='ms')
-                else: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='s')
-            else:
-                df['start_Time'] = pd.to_datetime(df['start_Time'])
-                
-            if df['start_Time'].dt.tz is not None:
-                df['start_Time'] = df['start_Time'].dt.tz_localize(None)
-                
-            df.set_index('start_Time', inplace=True)
-            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-            df.sort_index(inplace=True)
-            return df
-        return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
 
 # ==========================================
 # CURVATURE MATH
@@ -174,7 +151,8 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     for price, date, name in htf_levels:
         if date < eval_window.index[0]:
             interim = df.loc[date + pd.Timedelta(days=1) : eval_window.index[0] - pd.Timedelta(days=1)]
-            if not interim.empty and interim['Low'].min() <= price: continue 
+            if not interim.empty and interim['Low'].min() <= price:
+                continue 
         
         sweep_cands = eval_window[eval_window['Low'] < price]
         if not sweep_cands.empty:
@@ -362,13 +340,9 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
 # ==========================================
 # WRAPPER FUNCTIONS
 # ==========================================
-def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
-    df = fetch_dhan_data(security_id, client_id, access_token)
-    
-    # DIAGNOSTIC CHECK: Return special flag if API call utterly fails
-    if df.empty: return "API_FAIL" 
-    
-    if len(df) < 200: return None
+def scan_live_setups(ticker, setup_type):
+    df = fetch_yf_data(ticker)
+    if df.empty: return None
     
     cmp = df['Close'].iloc[-1]
     if pd.isna(cmp) or cmp < 100: return None
@@ -379,11 +353,9 @@ def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
     if setup_type == "Bullish": return evaluate_bullish_day(ticker, df, idx, df.index[idx])
     else: return evaluate_bearish_day(ticker, df, idx, df.index[idx])
 
-def backtest_setups(ticker, security_id, start_date, end_date, setup_type, client_id, access_token):
-    df = fetch_dhan_data(security_id, client_id, access_token)
-    
-    if df.empty: return "API_FAIL"
-    if len(df) < 200: return []
+def backtest_setups(ticker, start_date, end_date, setup_type):
+    df = fetch_yf_data(ticker)
+    if df.empty: return []
     
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
@@ -406,67 +378,42 @@ def backtest_setups(ticker, security_id, start_date, end_date, setup_type, clien
 # ==============================
 # STREAMLIT UI
 # ==============================
-st.title("ICT Doji Resting Screener")
+st.title("ICT Doji Resting Screener (YFinance)")
 st.markdown("Macro Trend -> Untested HTF Sweep -> Daily MSS -> Flag -> Pinpoint Curvature Doji Rest")
 
-# Sidebar Configuration
-st.sidebar.header("Dhan API Configuration")
-st.sidebar.markdown("Enter your broker keys to fetch institutional-grade tick data directly from NSE.")
-CLIENT_ID = st.sidebar.text_input("Dhan Client ID", type="password")
-ACCESS_TOKEN = st.sidebar.text_input("Dhan Access Token", type="password")
-
-st.sidebar.divider()
+st.sidebar.header("Scanner Configuration")
 universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "Nifty 500", "All NSE Stocks (> ₹100)"])
-
-# Halt if no API keys
-if not CLIENT_ID or not ACCESS_TOKEN:
-    st.info("👈 Please enter your Dhan API Client ID and Access Token in the sidebar to run scans.")
-    st.stop()
 
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
 def execute_scan(setup_type, mode, start_date=None, end_date=None):
-    with st.spinner(f"Fetching {universe_option} via Dhan API and scanning..."):
+    with st.spinner(f"Fetching {universe_option} via Yahoo Finance and scanning... (This is safely throttled to avoid IP bans)"):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
         
-        mapping = get_dhan_symbol_mapping()
-        
-        if not tickers or not mapping:
-            st.error("Failed to fetch universe list or Dhan symbol map. Please check internet connection.")
+        if not tickers:
+            st.error("Failed to fetch universe list. Please check internet connection.")
             return
             
         my_bar = st.progress(0)
         results = []
-        api_fails = 0
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {}
-            for t in tickers:
-                clean_sym = t.replace('.NS', '')
-                sec_id = mapping.get(clean_sym)
-                if sec_id:
-                    if mode == "live":
-                        futures[executor.submit(scan_live_setups, t, sec_id, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
-                    else:
-                        futures[executor.submit(backtest_setups, t, sec_id, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
-                    
+        # Throttled to 8 workers to aggressively protect against Yahoo IP Rate limits
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            if mode == "live":
+                futures = {executor.submit(scan_live_setups, t, setup_type): t for t in tickers}
+            else:
+                futures = {executor.submit(backtest_setups, t, start_date, end_date, setup_type): t for t in tickers}
+                
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res = future.result()
-                if res == "API_FAIL": 
-                    api_fails += 1
-                elif res: 
+                if res: 
                     if mode == "live": results.append(res)
                     else: results.extend(res)
                 my_bar.progress((i + 1) / len(futures))
                 
         my_bar.empty()
-        
-        # Diagnostics Catch
-        if api_fails > len(futures) * 0.9:
-            st.error(f"🚨 **Dhan API Connection Failed:** {api_fails} requests returned empty data. Please check if your Client ID and Access Token are correct, and verify your Dhan account data privileges.")
-            return
 
         if results:
             if mode == "backtest": results.sort(key=lambda x: x['Trigger Date'])
