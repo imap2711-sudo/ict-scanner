@@ -21,14 +21,11 @@ def get_dhan_symbol_mapping():
     """Downloads Dhan's master scrip list to map text symbols (RELIANCE) to Security IDs (1333)"""
     try:
         url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-        # Download master CSV (low_memory=False prevents mixed-type warnings)
         df = pd.read_csv(url, low_memory=False)
-        # Filter strictly for NSE Equity segment
         df_nse = df[df['SEM_EXM_EXCH_ID'] == 'NSE']
-        # Create a dictionary mapping: 'RELIANCE' -> '1333'
         mapping = dict(zip(df_nse['SEM_TRADING_SYMBOL'], df_nse['SEM_SMST_SECURITY_ID'].astype(str)))
         return mapping
-    except Exception as e:
+    except Exception:
         return {}
 
 @st.cache_data(ttl=86400)
@@ -58,10 +55,8 @@ def get_all_nse_symbols():
     try:
         res = requests.get(url, headers=headers, timeout=15)
         df = pd.read_csv(io.StringIO(res.text))
-        if 'SYMBOL' in df.columns:
-            return [str(s).strip() + '.NS' for s in df['SYMBOL']]
-        elif 'Symbol' in df.columns:
-            return [str(s).strip() + '.NS' for s in df['Symbol']]
+        if 'SYMBOL' in df.columns: return [str(s).strip() + '.NS' for s in df['SYMBOL']]
+        elif 'Symbol' in df.columns: return [str(s).strip() + '.NS' for s in df['Symbol']]
         return []
     except: return []
 
@@ -73,14 +68,14 @@ def fetch_dhan_data(security_id, client_id, access_token):
     try:
         dhan = dhanhq(client_id, access_token)
         
-        # Fetch up to 3 years of daily history for deep backtesting
         from_date = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
         to_date = datetime.today().strftime('%Y-%m-%d')
         
         historical_data = dhan.historical_daily_data(
-            symbol=security_id, # Must be numeric ID for Dhan!
+            symbol=security_id,
             exchange_segment='NSE_EQ',
             instrument_type='EQUITY',
+            expiry_code='0',  # CRITICAL FIX: Dhan crashes without this explicitly set to '0' for equities
             from_date=from_date,
             to_date=to_date
         )
@@ -91,21 +86,17 @@ def fetch_dhan_data(security_id, client_id, access_token):
             
             # Robust Epoch/Date parsing
             if pd.api.types.is_numeric_dtype(df['start_Time']):
-                if df['start_Time'].iloc[0] > 1e11: # Milliseconds fallback
-                    df['start_Time'] = pd.to_datetime(df['start_Time'], unit='ms')
-                else: # Seconds format (standard for Dhan)
-                    df['start_Time'] = pd.to_datetime(df['start_Time'], unit='s')
+                if df['start_Time'].iloc[0] > 1e11: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='ms')
+                else: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='s')
             else:
                 df['start_Time'] = pd.to_datetime(df['start_Time'])
                 
-            # Strip timezones for clean indexing
             if df['start_Time'].dt.tz is not None:
                 df['start_Time'] = df['start_Time'].dt.tz_localize(None)
                 
             df.set_index('start_Time', inplace=True)
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
             df.sort_index(inplace=True)
-            
             return df
         return pd.DataFrame()
     except Exception:
@@ -130,7 +121,6 @@ def check_ema20_rounded_bottom(ema_series, lookback=20):
     overall_roc = np.mean(np.abs(roc1))
     if trough_roc > overall_roc * 0.7: return False
     if np.mean(roc2) <= 0: return False
-    
     return True
 
 def check_ema20_rounded_top(ema_series, lookback=20):
@@ -149,7 +139,6 @@ def check_ema20_rounded_top(ema_series, lookback=20):
     overall_roc = np.mean(np.abs(roc1))
     if peak_roc > overall_roc * 0.7: return False
     if np.mean(roc2) >= 0: return False 
-    
     return True
 
 # ==========================================
@@ -185,8 +174,7 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     for price, date, name in htf_levels:
         if date < eval_window.index[0]:
             interim = df.loc[date + pd.Timedelta(days=1) : eval_window.index[0] - pd.Timedelta(days=1)]
-            if not interim.empty and interim['Low'].min() <= price:
-                continue 
+            if not interim.empty and interim['Low'].min() <= price: continue 
         
         sweep_cands = eval_window[eval_window['Low'] < price]
         if not sweep_cands.empty:
@@ -197,7 +185,6 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
                 absolute_sweep_day = sweep_cands['Low'].idxmin()
                 
     if not sweep_occurred: return None
-    
     sweep_idx = df.index.get_loc(absolute_sweep_day)
     
     if sweep_idx < 40: return None
@@ -242,8 +229,7 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
         ema_val = df['EMA20'].iloc[c_idx]
         body = abs(r['Open'] - r['Close'])
         rng = r['High'] - r['Low']
-        if (rng > 0) and (body <= rng * 0.35) and (r['Close'] > ema_val):
-            doji_count += 1
+        if (rng > 0) and (body <= rng * 0.35) and (r['Close'] > ema_val): doji_count += 1
             
     if doji_count < 1: return None
     
@@ -297,8 +283,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     for price, date, name in htf_levels:
         if date < eval_window.index[0]:
             interim = df.loc[date + pd.Timedelta(days=1) : eval_window.index[0] - pd.Timedelta(days=1)]
-            if not interim.empty and interim['High'].max() >= price:
-                continue 
+            if not interim.empty and interim['High'].max() >= price: continue 
         
         sweep_cands = eval_window[eval_window['High'] > price]
         if not sweep_cands.empty:
@@ -309,7 +294,6 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
                 absolute_sweep_day = sweep_cands['High'].idxmax()
                 
     if not sweep_occurred: return None
-    
     sweep_idx = df.index.get_loc(absolute_sweep_day)
     
     if sweep_idx < 40: return None
@@ -354,8 +338,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
         ema_val = df['EMA20'].iloc[c_idx]
         body = abs(r['Open'] - r['Close'])
         rng = r['High'] - r['Low']
-        if (rng > 0) and (body <= rng * 0.35) and (r['Close'] < ema_val):
-            doji_count += 1
+        if (rng > 0) and (body <= rng * 0.35) and (r['Close'] < ema_val): doji_count += 1
             
     if doji_count < 1: return None
     
@@ -381,7 +364,11 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
 # ==========================================
 def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
     df = fetch_dhan_data(security_id, client_id, access_token)
-    if df.empty or len(df) < 200: return None
+    
+    # DIAGNOSTIC CHECK: Return special flag if API call utterly fails
+    if df.empty: return "API_FAIL" 
+    
+    if len(df) < 200: return None
     
     cmp = df['Close'].iloc[-1]
     if pd.isna(cmp) or cmp < 100: return None
@@ -394,7 +381,9 @@ def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
 
 def backtest_setups(ticker, security_id, start_date, end_date, setup_type, client_id, access_token):
     df = fetch_dhan_data(security_id, client_id, access_token)
-    if df.empty or len(df) < 200: return []
+    
+    if df.empty: return "API_FAIL"
+    if len(df) < 200: return []
     
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
@@ -436,8 +425,8 @@ if not CLIENT_ID or not ACCESS_TOKEN:
 
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
-def run_screener(setup_type):
-    with st.spinner(f"Fetching {universe_option} via Dhan API and scanning for {setup_type} setups..."):
+def execute_scan(setup_type, mode, start_date=None, end_date=None):
+    with st.spinner(f"Fetching {universe_option} via Dhan API and scanning..."):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
@@ -445,102 +434,70 @@ def run_screener(setup_type):
         mapping = get_dhan_symbol_mapping()
         
         if not tickers or not mapping:
-            st.error("Failed to fetch universe list or Dhan symbol map. Please try again.")
+            st.error("Failed to fetch universe list or Dhan symbol map. Please check internet connection.")
             return
             
         my_bar = st.progress(0)
         results = []
+        api_fails = 0
         
-        # Throttled to 5 workers to prevent API Rate Limiting from DhanHQ
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = {}
             for t in tickers:
                 clean_sym = t.replace('.NS', '')
                 sec_id = mapping.get(clean_sym)
                 if sec_id:
-                    futures[executor.submit(scan_live_setups, t, sec_id, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                    if mode == "live":
+                        futures[executor.submit(scan_live_setups, t, sec_id, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                    else:
+                        futures[executor.submit(backtest_setups, t, sec_id, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
                     
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res = future.result()
-                if res: results.append(res)
+                if res == "API_FAIL": 
+                    api_fails += 1
+                elif res: 
+                    if mode == "live": results.append(res)
+                    else: results.extend(res)
                 my_bar.progress((i + 1) / len(futures))
                 
         my_bar.empty()
-        if results:
-            df_res = pd.DataFrame(results)
-            st.success(f"Found {len(df_res)} Live {setup_type} Setups!")
-            st.dataframe(df_res, use_container_width=True)
-        else:
-            st.warning(f"No {setup_type} setups found today.")
+        
+        # Diagnostics Catch
+        if api_fails > len(futures) * 0.9:
+            st.error(f"🚨 **Dhan API Connection Failed:** {api_fails} requests returned empty data. Please check if your Client ID and Access Token are correct, and verify your Dhan account data privileges.")
+            return
 
-def run_backtest(setup_type, start_date, end_date):
-    if start_date > end_date:
-        st.error("Start Date must be before End Date.")
-        return
-        
-    with st.spinner(f"Simulating daily data across {universe_option} for {setup_type} setups..."):
-        if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
-        elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
-        else: tickers = get_all_nse_symbols()
-        
-        mapping = get_dhan_symbol_mapping()
-        
-        my_bar = st.progress(0)
-        results = []
-        
-        # Throttled to 5 workers to prevent API Rate Limiting from DhanHQ
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {}
-            for t in tickers:
-                clean_sym = t.replace('.NS', '')
-                sec_id = mapping.get(clean_sym)
-                if sec_id:
-                    futures[executor.submit(backtest_setups, t, sec_id, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
-                    
-            for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                res_list = future.result()
-                if res_list: results.extend(res_list)
-                my_bar.progress((i + 1) / len(futures))
-                
-        my_bar.empty()
         if results:
-            results.sort(key=lambda x: x['Trigger Date'])
-            df_bt = pd.DataFrame(results)
-            st.success(f"Found {len(df_bt)} {setup_type} triggers in the selected range!")
-            st.dataframe(df_bt, use_container_width=True)
+            if mode == "backtest": results.sort(key=lambda x: x['Trigger Date'])
+            df_res = pd.DataFrame(results)
+            st.success(f"Found {len(df_res)} {setup_type} Setups!")
+            st.dataframe(df_res, use_container_width=True)
             
-            csv = df_bt.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label=f"Download {setup_type} Backtest Data",
-                data=csv,
-                file_name=f"{setup_type}_Backtest_{start_date}_to_{end_date}.csv",
-                mime="text/csv",
-            )
+            if mode == "backtest":
+                csv = df_res.to_csv(index=False).encode('utf-8')
+                st.download_button(label=f"Download Backtest Data", data=csv, file_name=f"{setup_type}_Backtest.csv", mime="text/csv")
         else:
-            st.warning(f"No {setup_type} setups found in the specified range.")
+            st.warning(f"No {setup_type} setups found in the specified criteria.")
 
 with bullish_tab:
     st.markdown("Identifies a sustained **Macro Downtrend**, an **untested HTF low sweep**, daily **MSS**, a breakout above a **rounded EMA 20 bottom**, and a flag pulling back to print at least one **Doji resting precisely ON the EMA**.")
-    if st.button("Run Live Bullish Screener"):
-        run_screener("Bullish")
+    if st.button("Run Live Bullish Screener"): execute_scan("Bullish", "live")
         
     st.divider()
     st.markdown("#### Backtest Custom Date Range (Bullish)")
     col1, col2 = st.columns(2)
     with col1: start_b = st.date_input("From Date (Bullish)", datetime.today() - timedelta(days=30))
     with col2: end_b = st.date_input("To Date (Bullish)", datetime.today())
-    if st.button("Run Bullish Backtester"):
-        run_backtest("Bullish", start_b, end_b)
+    if st.button("Run Bullish Backtester"): execute_scan("Bullish", "backtest", start_b, end_b)
 
 with bearish_tab:
     st.markdown("Identifies a sustained **Macro Uptrend**, an **untested HTF high sweep**, daily **MSS (Downside)**, a drop below a **rounded EMA 20 top**, and a rally flag printing at least one **Doji resting tightly BENEATH the EMA**.")
-    if st.button("Run Live Bearish Screener"):
-        run_screener("Bearish")
+    if st.button("Run Live Bearish Screener"): execute_scan("Bearish", "live")
         
     st.divider()
     st.markdown("#### Backtest Custom Date Range (Bearish)")
     col3, col4 = st.columns(2)
     with col3: start_br = st.date_input("From Date (Bearish)", datetime.today() - timedelta(days=30))
     with col4: end_br = st.date_input("To Date (Bearish)", datetime.today())
-    if st.button("Run Bearish Backtester"):
-        run_backtest("Bearish", start_br, end_br)
+    if st.button("Run Bearish Backtester"): execute_scan("Bearish", "backtest", start_br, end_br)
