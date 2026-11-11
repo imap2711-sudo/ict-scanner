@@ -14,8 +14,23 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
 # ==========================================
-# UNIVERSE FETCHING
+# UNIVERSE & MAPPING
 # ==========================================
+@st.cache_data(ttl=86400)
+def get_dhan_symbol_mapping():
+    """Downloads Dhan's master scrip list to map text symbols (RELIANCE) to Security IDs (1333)"""
+    try:
+        url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+        # Download master CSV (low_memory=False prevents mixed-type warnings)
+        df = pd.read_csv(url, low_memory=False)
+        # Filter strictly for NSE Equity segment
+        df_nse = df[df['SEM_EXM_EXCH_ID'] == 'NSE']
+        # Create a dictionary mapping: 'RELIANCE' -> '1333'
+        mapping = dict(zip(df_nse['SEM_TRADING_SYMBOL'], df_nse['SEM_SMST_SECURITY_ID'].astype(str)))
+        return mapping
+    except Exception as e:
+        return {}
+
 @st.cache_data(ttl=86400)
 def get_nifty200_symbols():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
@@ -53,17 +68,17 @@ def get_all_nse_symbols():
 # ==========================================
 # DHANHQ DATA FETCHING
 # ==========================================
-def fetch_dhan_data(symbol, client_id, access_token):
+def fetch_dhan_data(security_id, client_id, access_token):
+    """Fetches exact EOD historical data using the numeric Security ID."""
     try:
         dhan = dhanhq(client_id, access_token)
-        clean_symbol = symbol.replace('.NS', '')
         
-        # Fetch last 3 years of daily data
+        # Fetch up to 3 years of daily history for deep backtesting
         from_date = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
         to_date = datetime.today().strftime('%Y-%m-%d')
         
         historical_data = dhan.historical_daily_data(
-            symbol=clean_symbol,
+            symbol=security_id, # Must be numeric ID for Dhan!
             exchange_segment='NSE_EQ',
             instrument_type='EQUITY',
             from_date=from_date,
@@ -74,8 +89,19 @@ def fetch_dhan_data(symbol, client_id, access_token):
             df = pd.DataFrame(historical_data['data'])
             if df.empty: return pd.DataFrame()
             
-            # Format to match the previous yfinance structure
-            df['start_Time'] = pd.to_datetime(df['start_Time']).dt.tz_localize(None)
+            # Robust Epoch/Date parsing
+            if pd.api.types.is_numeric_dtype(df['start_Time']):
+                if df['start_Time'].iloc[0] > 1e11: # Milliseconds fallback
+                    df['start_Time'] = pd.to_datetime(df['start_Time'], unit='ms')
+                else: # Seconds format (standard for Dhan)
+                    df['start_Time'] = pd.to_datetime(df['start_Time'], unit='s')
+            else:
+                df['start_Time'] = pd.to_datetime(df['start_Time'])
+                
+            # Strip timezones for clean indexing
+            if df['start_Time'].dt.tz is not None:
+                df['start_Time'] = df['start_Time'].dt.tz_localize(None)
+                
             df.set_index('start_Time', inplace=True)
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
             df.sort_index(inplace=True)
@@ -353,8 +379,8 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
 # ==========================================
 # WRAPPER FUNCTIONS
 # ==========================================
-def scan_live_setups(ticker, setup_type, client_id, access_token):
-    df = fetch_dhan_data(ticker, client_id, access_token)
+def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
+    df = fetch_dhan_data(security_id, client_id, access_token)
     if df.empty or len(df) < 200: return None
     
     cmp = df['Close'].iloc[-1]
@@ -363,13 +389,11 @@ def scan_live_setups(ticker, setup_type, client_id, access_token):
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     idx = len(df) - 1
     
-    if setup_type == "Bullish":
-        return evaluate_bullish_day(ticker, df, idx, df.index[idx])
-    else:
-        return evaluate_bearish_day(ticker, df, idx, df.index[idx])
+    if setup_type == "Bullish": return evaluate_bullish_day(ticker, df, idx, df.index[idx])
+    else: return evaluate_bearish_day(ticker, df, idx, df.index[idx])
 
-def backtest_setups(ticker, start_date, end_date, setup_type, client_id, access_token):
-    df = fetch_dhan_data(ticker, client_id, access_token)
+def backtest_setups(ticker, security_id, start_date, end_date, setup_type, client_id, access_token):
+    df = fetch_dhan_data(security_id, client_id, access_token)
     if df.empty or len(df) < 200: return []
     
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -383,10 +407,8 @@ def backtest_setups(ticker, start_date, end_date, setup_type, client_id, access_
         cmp = df['Close'].iloc[idx]
         if pd.isna(cmp) or cmp < 100: continue
         
-        if setup_type == "Bullish":
-            res = evaluate_bullish_day(ticker, df, idx, current_day)
-        else:
-            res = evaluate_bearish_day(ticker, df, idx, current_day)
+        if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df, idx, current_day)
+        else: res = evaluate_bearish_day(ticker, df, idx, current_day)
             
         if res: valid_setups.append(res)
         
@@ -420,18 +442,28 @@ def run_screener(setup_type):
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
         
-        if not tickers:
-            st.error("Failed to fetch universe list. Please try again.")
+        mapping = get_dhan_symbol_mapping()
+        
+        if not tickers or not mapping:
+            st.error("Failed to fetch universe list or Dhan symbol map. Please try again.")
             return
             
         my_bar = st.progress(0)
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(scan_live_setups, t, setup_type, CLIENT_ID, ACCESS_TOKEN): t for t in tickers}
+        
+        # Throttled to 5 workers to prevent API Rate Limiting from DhanHQ
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {}
+            for t in tickers:
+                clean_sym = t.replace('.NS', '')
+                sec_id = mapping.get(clean_sym)
+                if sec_id:
+                    futures[executor.submit(scan_live_setups, t, sec_id, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                    
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res = future.result()
                 if res: results.append(res)
-                my_bar.progress((i + 1) / len(tickers))
+                my_bar.progress((i + 1) / len(futures))
                 
         my_bar.empty()
         if results:
@@ -451,14 +483,24 @@ def run_backtest(setup_type, start_date, end_date):
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
         
+        mapping = get_dhan_symbol_mapping()
+        
         my_bar = st.progress(0)
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(backtest_setups, t, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN): t for t in tickers}
+        
+        # Throttled to 5 workers to prevent API Rate Limiting from DhanHQ
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {}
+            for t in tickers:
+                clean_sym = t.replace('.NS', '')
+                sec_id = mapping.get(clean_sym)
+                if sec_id:
+                    futures[executor.submit(backtest_setups, t, sec_id, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                    
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res_list = future.result()
                 if res_list: results.extend(res_list)
-                my_bar.progress((i + 1) / len(tickers))
+                my_bar.progress((i + 1) / len(futures))
                 
         my_bar.empty()
         if results:
