@@ -7,9 +7,9 @@ import warnings
 import logging
 import concurrent.futures
 from datetime import datetime, timedelta
-from dhanhq import dhanhq
 
 warnings.filterwarnings('ignore')
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
@@ -25,7 +25,6 @@ FALLBACK_TICKERS = [
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_dhan_symbol_mapping():
-    """Maps clean NSE text symbols to Dhan's required numeric Security IDs."""
     try:
         url = "https://images.dhan.co/api-data/api-scrip-master.csv"
         df = pd.read_csv(url, low_memory=False)
@@ -74,46 +73,58 @@ def get_all_nse_symbols():
     return res if res else FALLBACK_TICKERS
 
 # ==========================================
-# DHANHQ DATA FETCHING (FIXED SDK SIGNATURE)
+# DIRECT HTTP DHAN FETCHING (BYPASSING BUGGY SDK)
 # ==========================================
 def fetch_dhan_data(security_id, client_id, access_token):
     try:
-        dhan = dhanhq(client_id, access_token)
+        url = "https://api.dhan.co/charts/historical"
+        
+        headers = {
+            "access-token": access_token,
+            "client-id": client_id,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
         from_date_str = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
         to_date_str = datetime.today().strftime('%Y-%m-%d')
         
-        # CRITICAL FIX: The Python SDK explicitly requires the parameter named `security_id`
-        historical_data = dhan.historical_daily_data(
-            security_id=str(security_id), 
-            exchange_segment='NSE_EQ',
-            instrument_type='EQUITY',
-            from_date=from_date_str,
-            to_date=to_date_str,
-            expiry_code=0
-        )
+        payload = {
+            "symbol": str(security_id),
+            "exchangeSegment": "NSE_EQ",
+            "instrument": "EQUITY",
+            "expiryCode": 0,
+            "fromDate": from_date_str,
+            "toDate": to_date_str
+        }
         
-        if historical_data.get('status') == 'success':
-            df = pd.DataFrame(historical_data['data'])
-            if df.empty: return pd.DataFrame()
-            
-            if pd.api.types.is_numeric_dtype(df['start_Time']):
-                if df['start_Time'].iloc[0] > 1e11: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='ms')
-                else: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='s')
-            else:
-                df['start_Time'] = pd.to_datetime(df['start_Time'])
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status') == 'success' and 'data' in data:
+                df = pd.DataFrame(data['data'])
+                if df.empty: return pd.DataFrame()
                 
-            if df['start_Time'].dt.tz is not None:
-                df['start_Time'] = df['start_Time'].dt.tz_localize(None)
+                if pd.api.types.is_numeric_dtype(df['start_Time']):
+                    if df['start_Time'].iloc[0] > 1e11: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='ms')
+                    else: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='s')
+                else:
+                    df['start_Time'] = pd.to_datetime(df['start_Time'])
+                    
+                if df['start_Time'].dt.tz is not None:
+                    df['start_Time'] = df['start_Time'].dt.tz_localize(None)
+                    
+                df.set_index('start_Time', inplace=True)
+                df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+                df.sort_index(inplace=True)
+                return df
                 
-            df.set_index('start_Time', inplace=True)
-            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-            df.sort_index(inplace=True)
-            return df
-            
-        print(f"API Rejected {security_id}: {historical_data}")
+        # If API fails, log the exact HTTP response for diagnostics
+        print(f"API Error {security_id}: HTTP {response.status_code} - {response.text}")
         return "API_FAIL"
     except Exception as e:
-        print(f"Python Error {security_id}: {e}")
+        print(f"Exception {security_id}: {str(e)}")
         return "API_FAIL"
 
 # ==========================================
@@ -273,7 +284,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     prev_half_data = df[(df.index.year == prev_half_year) & 
                         (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
                          ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
-    phh = (prev_half_data['High'].max(), 'PHH') if not prev_half_data.empty else None
+    phh = (df[df.index.to_period('M') == curr_month - 1]['High'].max(), 'PHH') if not prev_half_data.empty else None
     
     htf_levels = [l for l in [pmh, pqh, phh] if l is not None]
     
