@@ -16,7 +16,7 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
-# Fallback list in case NSE India servers block the fetch request
+# Emergency fallback list if NSE servers block the dynamic download
 FALLBACK_TICKERS = [
     'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'BHARTIARTL.NS', 'SBIN.NS', 
     'INFY.NS', 'LICI.NS', 'ITC.NS', 'HINDUNILVR.NS', 'LT.NS', 'BAJFINANCE.NS', 
@@ -29,64 +29,51 @@ FALLBACK_TICKERS = [
 # ==========================================
 # UNIVERSE FETCHING
 # ==========================================
-@st.cache_data(ttl=86400)
-def get_nifty200_symbols():
-    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
+def fetch_nse_csv(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/csv,application/csv",
+        "Referer": "https://www.nseindia.com/"
+    }
     try:
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
             df = pd.read_csv(io.StringIO(res.text))
-            return [str(s).strip() + '.NS' for s in df['Symbol']]
+            col = 'Symbol' if 'Symbol' in df.columns else 'SYMBOL'
+            return [str(s).strip() + '.NS' for s in df[col]]
     except: pass
-    return FALLBACK_TICKERS
+    return []
+
+@st.cache_data(ttl=86400)
+def get_nifty200_symbols():
+    res = fetch_nse_csv("https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv")
+    return res if res else FALLBACK_TICKERS
 
 @st.cache_data(ttl=86400)
 def get_nifty500_symbols():
-    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            df = pd.read_csv(io.StringIO(res.text))
-            return [str(s).strip() + '.NS' for s in df['Symbol']]
-    except: pass
-    return FALLBACK_TICKERS
+    res = fetch_nse_csv("https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv")
+    return res if res else FALLBACK_TICKERS
 
 @st.cache_data(ttl=86400)
 def get_all_nse_symbols():
-    url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code == 200:
-            df = pd.read_csv(io.StringIO(res.text))
-            if 'SYMBOL' in df.columns: return [str(s).strip() + '.NS' for s in df['SYMBOL']]
-            elif 'Symbol' in df.columns: return [str(s).strip() + '.NS' for s in df['Symbol']]
-    except: pass
-    return FALLBACK_TICKERS
+    res = fetch_nse_csv("https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv")
+    return res if res else FALLBACK_TICKERS
 
 # ==========================================
-# ROBUST ITERATIVE DATA FETCHING
+# YFINANCE DATA FETCHING
 # ==========================================
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_historical_data(ticker):
-    """
-    Fetches data one stock at a time to bypass Yahoo's bulk block.
-    Caches the result for 24 hours so backtests and tab switches are instant.
-    """
     try:
-        # Micro-delay mimics human behavior to avoid Yahoo rate limits
-        time.sleep(random.uniform(0.05, 0.2))
-        
+        # Micro-delay bypasses Yahoo anti-bot limits
+        time.sleep(random.uniform(0.05, 0.15))
         df = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=False)
         
         if df.empty or len(df) < 130: 
             return None
             
-        # Clean column names to ensure Open, High, Low, Close are formatted correctly
+        # Clean columns robustly
         df.rename(columns=lambda x: x.capitalize(), inplace=True)
-        
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
             
@@ -95,48 +82,62 @@ def fetch_historical_data(ticker):
         return None
 
 # ==========================================
-# CURVATURE MATH
+# ROBUST CURVATURE MATH
 # ==========================================
 def check_ema20_rounded_bottom(ema_series, lookback=20):
     if len(ema_series) < lookback: return False
     recent_ema = ema_series.iloc[-lookback:].values
-    roc1 = np.diff(recent_ema)
-    roc2 = np.diff(roc1)
+    
     min_idx = np.argmin(recent_ema)
-    
+    # Trough must be near the middle (Titan shape)
     if min_idx < 4 or min_idx > lookback - 4: return False
-    falling_before = np.mean(roc1[:min_idx-1]) < 0
-    rising_after = np.mean(roc1[min_idx+1:]) > 0
-    if not (falling_before and rising_after): return False
     
-    trough_roc = np.mean(np.abs(roc1[max(0, min_idx-2):min_idx+2]))
-    overall_roc = np.mean(np.abs(roc1))
-    if trough_roc > overall_roc * 0.7: return False
-    if np.mean(roc2) <= 0: return False
+    ema_start = recent_ema[0]
+    ema_end = recent_ema[-1]
+    ema_trough = recent_ema[min_idx]
+    
+    if ema_start <= ema_trough or ema_end <= ema_trough: return False
+    
+    # Smoothness Check: The trough should be a flat curved bowl, not a sharp V-spike
+    trough_vals = recent_ema[max(0, min_idx-2):min(lookback, min_idx+3)]
+    trough_range = np.max(trough_vals) - np.min(trough_vals)
+    total_depth = max(ema_start, ema_end) - ema_trough
+    
+    if total_depth == 0: return False
+    # If the 5-day variance at the bottom is more than half the total depth, it's a jagged V-shape (GPIL)
+    if trough_range > total_depth * 0.5: return False 
+    
     return True
 
 def check_ema20_rounded_top(ema_series, lookback=20):
     if len(ema_series) < lookback: return False
     recent_ema = ema_series.iloc[-lookback:].values
-    roc1 = np.diff(recent_ema)
-    roc2 = np.diff(roc1)
+    
     max_idx = np.argmax(recent_ema)
-    
     if max_idx < 4 or max_idx > lookback - 4: return False
-    rising_before = np.mean(roc1[:max_idx-1]) > 0
-    falling_after = np.mean(roc1[max_idx+1:]) < 0
-    if not (rising_before and falling_after): return False
     
-    peak_roc = np.mean(np.abs(roc1[max(0, max_idx-2):max_idx+2]))
-    overall_roc = np.mean(np.abs(roc1))
-    if peak_roc > overall_roc * 0.7: return False
-    if np.mean(roc2) >= 0: return False 
+    ema_start = recent_ema[0]
+    ema_end = recent_ema[-1]
+    ema_peak = recent_ema[max_idx]
+    
+    if ema_start >= ema_peak or ema_end >= ema_peak: return False
+    
+    peak_vals = recent_ema[max(0, max_idx-2):min(lookback, max_idx+3)]
+    peak_range = np.max(peak_vals) - np.min(peak_vals)
+    total_height = ema_peak - min(ema_start, ema_end)
+    
+    if total_height == 0: return False
+    if peak_range > total_height * 0.5: return False 
+    
     return True
 
 # ==========================================
 # ENGINE: BULLISH LOGIC
 # ==========================================
 def evaluate_bullish_day(ticker, df, idx, current_day):
+    if 'Ema20' not in df.columns:
+        df['Ema20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        
     if not check_ema20_rounded_bottom(df['Ema20'].iloc[max(0, idx-20):idx+1]): return None
     
     curr_month = current_day.to_period('M')
@@ -166,8 +167,7 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     for price, date, name in htf_levels:
         if date < eval_window.index[0]:
             interim = df.loc[date + pd.Timedelta(days=1) : eval_window.index[0] - pd.Timedelta(days=1)]
-            if not interim.empty and interim['Low'].min() <= price:
-                continue 
+            if not interim.empty and interim['Low'].min() <= price: continue 
         
         sweep_cands = eval_window[eval_window['Low'] < price]
         if not sweep_cands.empty:
@@ -180,11 +180,11 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     if not sweep_occurred: return None
     sweep_idx = df.index.get_loc(absolute_sweep_day)
     
-    if sweep_idx < 40: return None
-    ema_40_pre = df['Ema20'].iloc[sweep_idx - 40]
+    # 20-Day Downtrend before sweep
+    if sweep_idx < 20: return None
     ema_20_pre = df['Ema20'].iloc[sweep_idx - 20]
     ema_sweep = df['Ema20'].iloc[sweep_idx]
-    if not (ema_40_pre > ema_20_pre > ema_sweep): return None
+    if ema_sweep >= ema_20_pre: return None
     
     pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
     if len(pre_sweep_df) < 5: return None
@@ -230,8 +230,9 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     ema_val = df['Ema20'].iloc[idx]
     if row['Close'] <= ema_val: return None 
     
+    # Tolerant Rest check (-1.0% pierce up to 2.0% hover)
     distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
-    if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
+    if distance_to_ema < -1.0 or distance_to_ema > 2.0: return None
     
     return {
         "Stock Symbol": ticker.replace('.NS', ''),
@@ -247,6 +248,9 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
 # ENGINE: BEARISH LOGIC
 # ==========================================
 def evaluate_bearish_day(ticker, df, idx, current_day):
+    if 'Ema20' not in df.columns:
+        df['Ema20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        
     if not check_ema20_rounded_top(df['Ema20'].iloc[max(0, idx-20):idx+1]): return None
     
     curr_month = current_day.to_period('M')
@@ -289,11 +293,11 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     if not sweep_occurred: return None
     sweep_idx = df.index.get_loc(absolute_sweep_day)
     
-    if sweep_idx < 40: return None
-    ema_40_pre = df['Ema20'].iloc[sweep_idx - 40]
+    # 20-Day Uptrend before sweep
+    if sweep_idx < 20: return None
     ema_20_pre = df['Ema20'].iloc[sweep_idx - 20]
     ema_sweep = df['Ema20'].iloc[sweep_idx]
-    if not (ema_40_pre < ema_20_pre < ema_sweep): return None
+    if ema_sweep <= ema_20_pre: return None
     
     pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
     if len(pre_sweep_df) < 5: return None
@@ -340,7 +344,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     if row['Close'] >= ema_val: return None 
     
     distance_to_ema = ((ema_val - row['High']) / ema_val) * 100
-    if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
+    if distance_to_ema < -1.0 or distance_to_ema > 2.0: return None
     
     return {
         "Stock Symbol": ticker.replace('.NS', ''),
@@ -355,7 +359,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
 # ==============================
 # STREAMLIT UI
 # ==============================
-st.title("ICT Doji Resting Screener (Cached Fetch)")
+st.title("ICT Doji Resting Screener")
 st.markdown("Macro Trend -> Untested HTF Sweep -> Daily MSS -> Flag -> Pinpoint Curvature Doji Rest")
 
 st.sidebar.header("Scanner Configuration")
@@ -364,15 +368,17 @@ universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "N
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
 def execute_scan(setup_type, mode, start_date=None, end_date=None):
-    with st.spinner(f"Fetching data for {universe_option}... (The first run takes ~2 minutes, but saves to memory. Backtests will be instant afterward)"):
-        if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
-        elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
-        else: tickers = get_all_nse_symbols()
+    if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
+    elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
+    else: tickers = get_all_nse_symbols()
+    
+    # Active Diagnostics Output
+    if tickers == FALLBACK_TICKERS:
+        st.warning("⚠️ NSE Servers blocked the dynamic list fetch. Scanning 34 emergency fallback stocks instead. You likely will find 0 setups in a small universe.")
+    else:
+        st.info(f"✅ Universe fetch successful. Scanning {len(tickers)} stocks...")
         
-        if not tickers:
-            st.error("Failed to fetch universe list. Proceeding with fallback stocks.")
-            tickers = FALLBACK_TICKERS
-
+    with st.spinner(f"Fetching historical data for {len(tickers)} stocks... (Caches to memory)"):
         my_bar = st.progress(0)
         results = []
         
@@ -383,15 +389,12 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
             cmp = df_ticker['Close'].iloc[-1]
             if pd.isna(cmp) or cmp < 100: return []
             
-            df_ticker['Ema20'] = df_ticker['Close'].ewm(span=20, adjust=False).mean()
             local_results = []
-            
             if mode == "live":
                 idx = len(df_ticker) - 1
                 if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df_ticker, idx, df_ticker.index[idx])
                 else: res = evaluate_bearish_day(ticker, df_ticker, idx, df_ticker.index[idx])
                 if res: local_results.append(res)
-            
             elif mode == "backtest":
                 target_dates = df_ticker[(df_ticker.index.date >= start_date) & (df_ticker.index.date <= end_date)].index
                 for current_day in target_dates:
@@ -403,8 +406,7 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
                     
             return local_results
 
-        # Uses 10 background threads to download swiftly without angering Yahoo's bot-detection
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(process_ticker, t): t for t in tickers}
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res_list = future.result()
