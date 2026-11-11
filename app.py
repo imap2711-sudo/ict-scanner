@@ -21,18 +21,8 @@ FALLBACK_TICKERS = [
 ]
 
 # ==========================================
-# UNIVERSE & MAPPING
+# UNIVERSE FETCHING
 # ==========================================
-@st.cache_data(ttl=86400)
-def get_dhan_symbol_mapping():
-    try:
-        url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-        df = pd.read_csv(url, low_memory=False)
-        df_nse = df[df['SEM_EXM_EXCH_ID'] == 'NSE']
-        return dict(zip(df_nse['SEM_TRADING_SYMBOL'], df_nse['SEM_SMST_SECURITY_ID'].astype(str)))
-    except Exception:
-        return {}
-
 def fetch_nse_csv(url):
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -60,18 +50,19 @@ def get_all_nse_symbols():
     return res if res else FALLBACK_TICKERS
 
 # ==========================================
-# DHANHQ DATA FETCHING (FIXED FOR V2 API)
+# DHANHQ DATA FETCHING
 # ==========================================
-def fetch_dhan_data(security_id, client_id, access_token):
+def fetch_dhan_data(clean_symbol, client_id, access_token):
     try:
         dhan = dhanhq(client_id, access_token)
         
-        # Dhan V2 strictly requires YYYY-MM-DD string format
         from_date_str = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
         to_date_str = datetime.today().strftime('%Y-%m-%d')
         
+        # CRITICAL FIX: The historical_daily_data API strictly expects the text symbol ('RELIANCE'), 
+        # not the numeric security ID used in intraday APIs.
         historical_data = dhan.historical_daily_data(
-            symbol=str(security_id), # Ensure numeric ID is cast to string
+            symbol=clean_symbol, 
             exchange_segment='NSE_EQ',
             instrument_type='EQUITY',
             expiry_code=0, 
@@ -340,8 +331,8 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
 # ==========================================
 # WRAPPER FUNCTIONS
 # ==========================================
-def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
-    df = fetch_dhan_data(security_id, client_id, access_token)
+def scan_live_setups(ticker, clean_symbol, setup_type, client_id, access_token):
+    df = fetch_dhan_data(clean_symbol, client_id, access_token)
     if df.empty: return "API_FAIL" 
     if len(df) < 200: return None
     
@@ -354,8 +345,8 @@ def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
     if setup_type == "Bullish": return evaluate_bullish_day(ticker, df, idx, df.index[idx])
     else: return evaluate_bearish_day(ticker, df, idx, df.index[idx])
 
-def backtest_setups(ticker, security_id, start_date, end_date, setup_type, client_id, access_token):
-    df = fetch_dhan_data(security_id, client_id, access_token)
+def backtest_setups(ticker, clean_symbol, start_date, end_date, setup_type, client_id, access_token):
+    df = fetch_dhan_data(clean_symbol, client_id, access_token)
     if df.empty: return "API_FAIL"
     if len(df) < 200: return []
     
@@ -403,11 +394,6 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
-        
-        mapping = get_dhan_symbol_mapping()
-        if not mapping:
-            st.error("Failed to fetch Dhan Symbol Mapping. Check connection.")
-            return
             
         my_bar = st.progress(0)
         results = []
@@ -417,13 +403,11 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = {}
             for t in tickers:
-                clean_sym = t.replace('.NS', '')
-                sec_id = mapping.get(clean_sym)
-                if sec_id:
-                    if mode == "live":
-                        futures[executor.submit(scan_live_setups, t, sec_id, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
-                    else:
-                        futures[executor.submit(backtest_setups, t, sec_id, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                clean_sym = t.replace('.NS', '')  # Just passes 'RELIANCE', exactly as Dhan historical endpoint requires
+                if mode == "live":
+                    futures[executor.submit(scan_live_setups, t, clean_sym, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                else:
+                    futures[executor.submit(backtest_setups, t, clean_sym, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
                     
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res = future.result()
