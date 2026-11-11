@@ -3,13 +3,13 @@ import pandas as pd
 import numpy as np
 import requests
 import io
+import time
 import warnings
 import logging
 import concurrent.futures
 from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
@@ -73,12 +73,14 @@ def get_all_nse_symbols():
     return res if res else FALLBACK_TICKERS
 
 # ==========================================
-# DIRECT HTTP DHAN FETCHING 
+# DIRECT HTTP DHAN FETCHING (THROTTLED)
 # ==========================================
 def fetch_dhan_data(security_id, client_id, access_token):
     try:
-        url = "https://api.dhan.co/v2/charts/historical"
+        # STRICT RATE LIMIT THROTTLE: Pause 0.4 seconds between calls to prevent DH-904
+        time.sleep(0.4)
         
+        url = "https://api.dhan.co/v2/charts/historical"
         headers = {
             "access-token": access_token.strip(),
             "Content-Type": "application/json",
@@ -100,12 +102,25 @@ def fetch_dhan_data(security_id, client_id, access_token):
         
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         
-        if response.status_code == 200:
+        if not response.text.strip():
+            return "API_FAIL: Dhan returned a completely blank response."
+            
+        if response.status_code != 200:
+            return f"API_FAIL: HTTP {response.status_code} - {response.text}"
+            
+        try:
             data = response.json()
-            if data.get('status') == 'success' and 'data' in data:
-                df = pd.DataFrame(data['data'])
-                if df.empty: return pd.DataFrame()
+        except ValueError:
+            return f"API_FAIL: Invalid JSON from Dhan -> {response.text[:150]}"
+            
+        if 'open' in data and 'close' in data:
+            if not data['open']: 
+                return pd.DataFrame() 
                 
+            df = pd.DataFrame(data)
+            if df.empty: return pd.DataFrame()
+            
+            if 'start_Time' in df.columns:
                 if pd.api.types.is_numeric_dtype(df['start_Time']):
                     if df['start_Time'].iloc[0] > 1e11: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='ms')
                     else: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='s')
@@ -116,15 +131,15 @@ def fetch_dhan_data(security_id, client_id, access_token):
                     df['start_Time'] = df['start_Time'].dt.tz_localize(None)
                     
                 df.set_index('start_Time', inplace=True)
-                df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-                df.sort_index(inplace=True)
-                return df
-            else:
-                return f"API_FAIL: {data.get('remarks', data)}"
                 
-        return f"API_FAIL: HTTP {response.status_code} - {response.text}"
+            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+            df.sort_index(inplace=True)
+            return df
+            
+        return f"API_FAIL: Dhan Error -> {data.get('remarks', data.get('errorType', str(data)[:200]))}"
+        
     except Exception as e:
-        return f"API_FAIL: Exception - {str(e)}"
+        return f"API_FAIL: Python Exception -> {str(e)}"
 
 # ==========================================
 # CURVATURE MATH
@@ -440,7 +455,7 @@ if not CLIENT_ID or not ACCESS_TOKEN:
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
 def execute_scan(setup_type, mode, start_date=None, end_date=None):
-    with st.spinner(f"Fetching {universe_option} via Dhan API and scanning..."):
+    with st.spinner(f"Fetching {universe_option} via Dhan API (Throttled to prevent rate limits)..."):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
@@ -455,8 +470,8 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
         api_fails = 0
         last_error_msg = ""
         
-        # Throttled to 5 workers to prevent API Rate Limiting from DhanHQ
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # STRICT RATE LIMIT SAFETY: max_workers=1 forces sequential requests with our 0.4s pause
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             futures = {}
             for t in tickers:
                 clean_sym = t.replace('.NS', '')
@@ -479,7 +494,6 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
                 
         my_bar.empty()
         
-        # Explicitly output the raw Dhan API error to the screen if the batch fails
         if api_fails > len(futures) * 0.9:
             st.error(f"🚨 **Dhan API Connection Failed:** {api_fails} requests failed.")
             st.error(f"**Diagnostic Response:**\n\n`{last_error_msg}`")
