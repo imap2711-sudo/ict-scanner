@@ -4,6 +4,7 @@ import numpy as np
 import requests
 import io
 import warnings
+import logging
 import concurrent.futures
 from datetime import datetime, timedelta
 from dhanhq import dhanhq
@@ -11,39 +12,6 @@ from dhanhq import dhanhq
 warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
-
-# ==========================================
-# DHAN API CONFIGURATION
-# ==========================================
-# Replace with your actual Dhan API credentials
-DHAN_CLIENT_ID = "1108837035"
-DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJ1c2VyUmVnaW9uIjoiUjEiLCJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzk0NTEwNjg2LCJpYXQiOjE3OTQ0MjQyODYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA4ODM3MDM1In0.teTlBBbF-P8ibQ4GcQOdvm9dHEJLZPrPikcf8lIpWbOIiHrtkXGeXvIHZNfNeKBHNpC0zYhxV9DLyuIWxPcLSg"
-
-try:
-    dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-except Exception as e:
-    st.error("Failed to initialize Dhan API. Check your credentials.")
-
-def fetch_dhan_data(symbol, start_date='2023-01-01'):
-    """Fetches clean daily historical data directly from DhanHQ API."""
-    clean_symbol = symbol.replace('.NS', '')
-    try:
-        historical_data = dhan.historical_daily_data(
-            symbol=clean_symbol,
-            exchange_segment='NSE_EQ',
-            instrument_type='EQUITY',
-            from_date=start_date,
-            to_date=datetime.today().strftime('%Y-%m-%d')
-        )
-        if historical_data['status'] == 'success':
-            df = pd.DataFrame(historical_data['data'])
-            df['start_Time'] = pd.to_datetime(df['start_Time'])
-            df.set_index('start_Time', inplace=True)
-            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-            return df
-    except Exception:
-        pass
-    return pd.DataFrame()
 
 # ==========================================
 # UNIVERSE FETCHING
@@ -55,7 +23,7 @@ def get_nifty200_symbols():
     try:
         res = requests.get(url, headers=headers, timeout=10)
         df = pd.read_csv(io.StringIO(res.text))
-        return [str(s).strip() for s in df['Symbol']]
+        return [str(s).strip() + '.NS' for s in df['Symbol']]
     except: return []
 
 @st.cache_data(ttl=86400)
@@ -65,7 +33,7 @@ def get_nifty500_symbols():
     try:
         res = requests.get(url, headers=headers, timeout=10)
         df = pd.read_csv(io.StringIO(res.text))
-        return [str(s).strip() for s in df['Symbol']]
+        return [str(s).strip() + '.NS' for s in df['Symbol']]
     except: return []
 
 @st.cache_data(ttl=86400)
@@ -76,11 +44,46 @@ def get_all_nse_symbols():
         res = requests.get(url, headers=headers, timeout=15)
         df = pd.read_csv(io.StringIO(res.text))
         if 'SYMBOL' in df.columns:
-            return [str(s).strip() for s in df['SYMBOL']]
+            return [str(s).strip() + '.NS' for s in df['SYMBOL']]
         elif 'Symbol' in df.columns:
-            return [str(s).strip() for s in df['Symbol']]
+            return [str(s).strip() + '.NS' for s in df['Symbol']]
         return []
     except: return []
+
+# ==========================================
+# DHANHQ DATA FETCHING
+# ==========================================
+def fetch_dhan_data(symbol, client_id, access_token):
+    try:
+        dhan = dhanhq(client_id, access_token)
+        clean_symbol = symbol.replace('.NS', '')
+        
+        # Fetch last 3 years of daily data
+        from_date = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
+        to_date = datetime.today().strftime('%Y-%m-%d')
+        
+        historical_data = dhan.historical_daily_data(
+            symbol=clean_symbol,
+            exchange_segment='NSE_EQ',
+            instrument_type='EQUITY',
+            from_date=from_date,
+            to_date=to_date
+        )
+        
+        if historical_data.get('status') == 'success':
+            df = pd.DataFrame(historical_data['data'])
+            if df.empty: return pd.DataFrame()
+            
+            # Format to match the previous yfinance structure
+            df['start_Time'] = pd.to_datetime(df['start_Time']).dt.tz_localize(None)
+            df.set_index('start_Time', inplace=True)
+            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+            df.sort_index(inplace=True)
+            
+            return df
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 # ==========================================
 # CURVATURE MATH
@@ -226,7 +229,7 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
     
     return {
-        "Stock Symbol": ticker,
+        "Stock Symbol": ticker.replace('.NS', ''),
         "Trigger Date": current_day.strftime('%Y-%m-%d'),
         "HTF Swept": swept_name,
         "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
@@ -338,7 +341,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
     
     return {
-        "Stock Symbol": ticker,
+        "Stock Symbol": ticker.replace('.NS', ''),
         "Trigger Date": current_day.strftime('%Y-%m-%d'),
         "HTF Swept": swept_name,
         "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
@@ -348,10 +351,10 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     }
 
 # ==========================================
-# WRAPPER FUNCTIONS (DHAN)
+# WRAPPER FUNCTIONS
 # ==========================================
-def process_live_ticker(ticker, setup_type):
-    df = fetch_dhan_data(ticker)
+def scan_live_setups(ticker, setup_type, client_id, access_token):
+    df = fetch_dhan_data(ticker, client_id, access_token)
     if df.empty or len(df) < 200: return None
     
     cmp = df['Close'].iloc[-1]
@@ -365,8 +368,8 @@ def process_live_ticker(ticker, setup_type):
     else:
         return evaluate_bearish_day(ticker, df, idx, df.index[idx])
 
-def process_backtest_ticker(ticker, start_date, end_date, setup_type):
-    df = fetch_dhan_data(ticker)
+def backtest_setups(ticker, start_date, end_date, setup_type, client_id, access_token):
+    df = fetch_dhan_data(ticker, client_id, access_token)
     if df.empty or len(df) < 200: return []
     
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -392,27 +395,39 @@ def process_backtest_ticker(ticker, start_date, end_date, setup_type):
 # ==============================
 # STREAMLIT UI
 # ==============================
-st.title("ICT Doji Resting Screener (Dhan API Powered)")
+st.title("ICT Doji Resting Screener")
 st.markdown("Macro Trend -> Untested HTF Sweep -> Daily MSS -> Flag -> Pinpoint Curvature Doji Rest")
 
+# Sidebar Configuration
+st.sidebar.header("Dhan API Configuration")
+st.sidebar.markdown("Enter your broker keys to fetch institutional-grade tick data directly from NSE.")
+CLIENT_ID = st.sidebar.text_input("Dhan Client ID", type="password")
+ACCESS_TOKEN = st.sidebar.text_input("Dhan Access Token", type="password")
+
+st.sidebar.divider()
 universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "Nifty 500", "All NSE Stocks (> ₹100)"])
+
+# Halt if no API keys
+if not CLIENT_ID or not ACCESS_TOKEN:
+    st.info("👈 Please enter your Dhan API Client ID and Access Token in the sidebar to run scans.")
+    st.stop()
 
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
 def run_screener(setup_type):
-    with st.spinner(f"Fetching {universe_option} universe via DhanHQ and scanning..."):
+    with st.spinner(f"Fetching {universe_option} via Dhan API and scanning for {setup_type} setups..."):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
         
         if not tickers:
-            st.error("Failed to fetch universe. Please try again.")
+            st.error("Failed to fetch universe list. Please try again.")
             return
             
         my_bar = st.progress(0)
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(process_live_ticker, t, setup_type): t for t in tickers}
+            futures = {executor.submit(scan_live_setups, t, setup_type, CLIENT_ID, ACCESS_TOKEN): t for t in tickers}
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res = future.result()
                 if res: results.append(res)
@@ -431,7 +446,7 @@ def run_backtest(setup_type, start_date, end_date):
         st.error("Start Date must be before End Date.")
         return
         
-    with st.spinner(f"Simulating daily data across {universe_option} via DhanHQ..."):
+    with st.spinner(f"Simulating daily data across {universe_option} for {setup_type} setups..."):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
@@ -439,7 +454,7 @@ def run_backtest(setup_type, start_date, end_date):
         my_bar = st.progress(0)
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(process_backtest_ticker, t, start_date, end_date, setup_type): t for t in tickers}
+            futures = {executor.submit(backtest_setups, t, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN): t for t in tickers}
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res_list = future.result()
                 if res_list: results.extend(res_list)
