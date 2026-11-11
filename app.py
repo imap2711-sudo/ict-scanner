@@ -120,11 +120,13 @@ def fetch_dhan_data(security_id, client_id, access_token):
                 else:
                     df['start_Time'] = pd.to_datetime(df['start_Time'])
                     
-                if df['start_Time'].dt.tz is not None:
-                    df['start_Time'] = df['start_Time'].dt.tz_localize(None)
-                    
                 df.set_index('start_Time', inplace=True)
-                
+            
+            # ENFORCE DATETIME INDEX FOR PERIOD CALCULATIONS
+            df.index = pd.to_datetime(df.index)
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+                    
             df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
             df.sort_index(inplace=True)
             return df
