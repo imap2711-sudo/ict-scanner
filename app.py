@@ -3,8 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import io
 import warnings
 import logging
@@ -67,47 +65,48 @@ def get_all_nse_symbols():
     return FALLBACK_TICKERS
 
 # ==========================================
-# ROBUST BULK DATA FETCHING (CHUNKED)
+# ROBUST BULK DATA FETCHING
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_bulk_yfinance_data(tickers):
-    """Downloads data in chunks of 100 to prevent Yahoo IP blocks and stores in a dictionary."""
-    session = requests.Session()
-    retry = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    
-    chunk_size = 100
+    """Downloads data in chunks of 50 using native yfinance session management."""
+    chunk_size = 50
     combined_dict = {}
     
     for i in range(0, len(tickers), chunk_size):
         chunk = tickers[i:i + chunk_size]
         try:
-            # group_by="ticker" forces robust formatting regardless of chunk size
+            # Let yfinance natively handle cookies and headers to avoid 403 Forbidden errors
             data = yf.download(
                 chunk, 
                 period="1y", 
                 interval="1d", 
                 auto_adjust=False, 
                 threads=True, 
-                progress=False, 
-                show_errors=False,
-                group_by="ticker",
-                session=session
+                progress=False
             )
             
             if data.empty: continue
             
-            # Map into a safe dictionary (avoids pandas MultiIndex bugs on older/newer yfinance versions)
-            if len(chunk) == 1:
-                # Format fixing for single ticker fallback
-                if 'Close' in data.columns or 'close' in data.columns:
-                    combined_dict[chunk[0]] = data
+            # If chunk is 1 ticker, columns are flat
+            if len(chunk) == 1 or not isinstance(data.columns, pd.MultiIndex):
+                df_t = data.dropna()
+                if not df_t.empty:
+                    combined_dict[chunk[0]] = df_t
             else:
+                # If chunk > 1, columns are MultiIndex (Price Type, Ticker)
                 for t in chunk:
-                    if t in data.columns.get_level_values(0):
-                        combined_dict[t] = data[t]
+                    if 'Close' in data.columns and t in data['Close'].columns:
+                        df_t = pd.DataFrame({
+                            'Open': data['Open'][t],
+                            'High': data['High'][t],
+                            'Low': data['Low'][t],
+                            'Close': data['Close'][t]
+                        }).dropna()
+                        
+                        if not df_t.empty:
+                            combined_dict[t] = df_t
+                            
         except Exception:
             continue
             
@@ -383,7 +382,7 @@ universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "N
 bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
 def execute_scan(setup_type, mode, start_date=None, end_date=None):
-    with st.spinner(f"Safely chunking and downloading 1-year data for {universe_option}..."):
+    with st.spinner(f"Bulk downloading 1-year data for {universe_option}... (Speed Optimized)"):
         if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
         elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
         else: tickers = get_all_nse_symbols()
@@ -392,7 +391,6 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
             st.error("Failed to fetch universe list. Proceeding with fallback stocks.")
             tickers = FALLBACK_TICKERS
             
-        # Secure Bulk Fetch into Dictionary
         bulk_data_dict = fetch_bulk_yfinance_data(tickers)
         if not bulk_data_dict:
             st.error("Yahoo Finance bulk download failed completely. Please try again in a few minutes.")
@@ -405,14 +403,7 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
             try:
                 df_ticker = bulk_data_dict.get(ticker)
                 
-                # Verify dataframe validity
                 if df_ticker is None or df_ticker.empty or len(df_ticker) < 130: 
-                    continue
-                
-                # Standardize columns to safely catch Open/open/Adj Close variants
-                df_ticker.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-                
-                if 'Close' not in df_ticker.columns: 
                     continue
                 
                 cmp = df_ticker['Close'].iloc[-1]
