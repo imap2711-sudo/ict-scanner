@@ -9,7 +9,6 @@ import concurrent.futures
 from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
@@ -73,7 +72,7 @@ def get_all_nse_symbols():
     return res if res else FALLBACK_TICKERS
 
 # ==========================================
-# DIRECT HTTP DHAN FETCHING (BYPASSING BUGGY SDK)
+# DIRECT HTTP DHAN FETCHING 
 # ==========================================
 def fetch_dhan_data(security_id, client_id, access_token):
     try:
@@ -89,8 +88,9 @@ def fetch_dhan_data(security_id, client_id, access_token):
         from_date_str = (datetime.today() - timedelta(days=1095)).strftime('%Y-%m-%d')
         to_date_str = datetime.today().strftime('%Y-%m-%d')
         
+        # CRITICAL FIX: The payload key MUST be strictly 'securityId' (camelCase).
         payload = {
-            "symbol": str(security_id),
+            "securityId": str(security_id),
             "exchangeSegment": "NSE_EQ",
             "instrument": "EQUITY",
             "expiryCode": 0,
@@ -119,13 +119,12 @@ def fetch_dhan_data(security_id, client_id, access_token):
                 df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
                 df.sort_index(inplace=True)
                 return df
+            else:
+                return f"API_FAIL: {data.get('remarks', data)}"
                 
-        # If API fails, log the exact HTTP response for diagnostics
-        print(f"API Error {security_id}: HTTP {response.status_code} - {response.text}")
-        return "API_FAIL"
+        return f"API_FAIL: HTTP {response.status_code} - {response.text}"
     except Exception as e:
-        print(f"Exception {security_id}: {str(e)}")
-        return "API_FAIL"
+        return f"API_FAIL: Exception - {str(e)}"
 
 # ==========================================
 # CURVATURE MATH
@@ -284,7 +283,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     prev_half_data = df[(df.index.year == prev_half_year) & 
                         (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
                          ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
-    phh = (df[df.index.to_period('M') == curr_month - 1]['High'].max(), 'PHH') if not prev_half_data.empty else None
+    phh = (prev_half_data['High'].max(), 'PHH') if not prev_half_data.empty else None
     
     htf_levels = [l for l in [pmh, pqh, phh] if l is not None]
     
@@ -369,7 +368,7 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
 # ==========================================
 def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
     df = fetch_dhan_data(security_id, client_id, access_token)
-    if isinstance(df, str) and df.startswith("API_FAIL"): return "API_FAIL" 
+    if isinstance(df, str) and df.startswith("API_FAIL"): return df 
     if df.empty or len(df) < 200: return None
     
     cmp = df['Close'].iloc[-1]
@@ -383,7 +382,7 @@ def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
 
 def backtest_setups(ticker, security_id, start_date, end_date, setup_type, client_id, access_token):
     df = fetch_dhan_data(security_id, client_id, access_token)
-    if isinstance(df, str) and df.startswith("API_FAIL"): return "API_FAIL"
+    if isinstance(df, str) and df.startswith("API_FAIL"): return df
     if df.empty or len(df) < 200: return []
     
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -439,6 +438,7 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
         my_bar = st.progress(0)
         results = []
         api_fails = 0
+        last_error_msg = ""
         
         # Throttled to 5 workers to prevent API Rate Limiting from DhanHQ
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -454,8 +454,9 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
                     
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res = future.result()
-                if res == "API_FAIL": 
+                if isinstance(res, str) and res.startswith("API_FAIL"): 
                     api_fails += 1
+                    last_error_msg = res
                 elif res: 
                     if mode == "live": results.append(res)
                     else: results.extend(res)
@@ -463,9 +464,11 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
                 
         my_bar.empty()
         
-        # Diagnostics Catch
+        # Explicitly output the raw Dhan API error to the screen if the batch fails
         if api_fails > len(futures) * 0.9:
-            st.error(f"🚨 **Dhan API Connection Failed:** {api_fails} requests returned empty data. Check your Client ID, Token, and ensure you have an active Data API plan.")
+            st.error(f"🚨 **Dhan API Connection Failed:** {api_fails} requests returned empty data.")
+            st.error(f"**Diagnostic API Response from Dhan:**\n\n`{last_error_msg}`")
+            st.info("Check your Data API plan validity and ensure you are using the correct Access Token.")
             return
 
         if results:
