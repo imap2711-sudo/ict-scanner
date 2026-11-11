@@ -4,8 +4,6 @@ import pandas as pd
 import numpy as np
 import requests
 import io
-import time
-import random
 import warnings
 import logging
 import concurrent.futures
@@ -16,7 +14,7 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
-# Emergency fallback list if NSE servers block the dynamic download
+# Emergency fallback list
 FALLBACK_TICKERS = [
     'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'BHARTIARTL.NS', 'SBIN.NS', 
     'INFY.NS', 'LICI.NS', 'ITC.NS', 'HINDUNILVR.NS', 'LT.NS', 'BAJFINANCE.NS', 
@@ -30,11 +28,7 @@ FALLBACK_TICKERS = [
 # UNIVERSE FETCHING
 # ==========================================
 def fetch_nse_csv(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/csv,application/csv",
-        "Referer": "https://www.nseindia.com/"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
@@ -60,36 +54,30 @@ def get_all_nse_symbols():
     return res if res else FALLBACK_TICKERS
 
 # ==========================================
-# YFINANCE DATA FETCHING
+# ROBUST INDIVIDUAL FETCHING
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_historical_data(ticker):
+    """Fetches clean OHLC data for a single stock."""
     try:
-        # Micro-delay bypasses Yahoo anti-bot limits
-        time.sleep(random.uniform(0.05, 0.15))
         df = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=False)
-        
         if df.empty or len(df) < 130: 
             return None
             
-        # Clean columns robustly
         df.rename(columns=lambda x: x.capitalize(), inplace=True)
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
-            
         return df
     except Exception:
         return None
 
 # ==========================================
-# ROBUST CURVATURE MATH
+# CURVATURE MATH
 # ==========================================
 def check_ema20_rounded_bottom(ema_series, lookback=20):
     if len(ema_series) < lookback: return False
     recent_ema = ema_series.iloc[-lookback:].values
     
     min_idx = np.argmin(recent_ema)
-    # Trough must be near the middle (Titan shape)
     if min_idx < 4 or min_idx > lookback - 4: return False
     
     ema_start = recent_ema[0]
@@ -98,13 +86,11 @@ def check_ema20_rounded_bottom(ema_series, lookback=20):
     
     if ema_start <= ema_trough or ema_end <= ema_trough: return False
     
-    # Smoothness Check: The trough should be a flat curved bowl, not a sharp V-spike
     trough_vals = recent_ema[max(0, min_idx-2):min(lookback, min_idx+3)]
     trough_range = np.max(trough_vals) - np.min(trough_vals)
     total_depth = max(ema_start, ema_end) - ema_trough
     
     if total_depth == 0: return False
-    # If the 5-day variance at the bottom is more than half the total depth, it's a jagged V-shape (GPIL)
     if trough_range > total_depth * 0.5: return False 
     
     return True
@@ -180,7 +166,6 @@ def evaluate_bullish_day(ticker, df, idx, current_day):
     if not sweep_occurred: return None
     sweep_idx = df.index.get_loc(absolute_sweep_day)
     
-    # 20-Day Downtrend before sweep
     if sweep_idx < 20: return None
     ema_20_pre = df['Ema20'].iloc[sweep_idx - 20]
     ema_sweep = df['Ema20'].iloc[sweep_idx]
@@ -293,7 +278,6 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
     if not sweep_occurred: return None
     sweep_idx = df.index.get_loc(absolute_sweep_day)
     
-    # 20-Day Uptrend before sweep
     if sweep_idx < 20: return None
     ema_20_pre = df['Ema20'].iloc[sweep_idx - 20]
     ema_sweep = df['Ema20'].iloc[sweep_idx]
@@ -372,13 +356,12 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
     elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
     else: tickers = get_all_nse_symbols()
     
-    # Active Diagnostics Output
     if tickers == FALLBACK_TICKERS:
         st.warning("⚠️ NSE Servers blocked the dynamic list fetch. Scanning 34 emergency fallback stocks instead. You likely will find 0 setups in a small universe.")
     else:
         st.info(f"✅ Universe fetch successful. Scanning {len(tickers)} stocks...")
         
-    with st.spinner(f"Fetching historical data for {len(tickers)} stocks... (Caches to memory)"):
+    with st.spinner("Fetching historical data and running setup logic..."):
         my_bar = st.progress(0)
         results = []
         
@@ -406,7 +389,8 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
                     
             return local_results
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        # High concurrent workers because we fetch single tickers
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
             futures = {executor.submit(process_ticker, t): t for t in tickers}
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 res_list = future.result()
