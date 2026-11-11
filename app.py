@@ -12,6 +12,8 @@ warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
+HISTORY_DAYS = 365
+
 FALLBACK_TICKERS = [
     'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'BHARTIARTL.NS', 'SBIN.NS',
     'INFY.NS', 'LICI.NS', 'ITC.NS', 'HINDUNILVR.NS', 'LT.NS', 'BAJFINANCE.NS',
@@ -84,7 +86,7 @@ def fetch_dhan_data(security_id, client_id, access_token):
             "Accept": "application/json"
         }
 
-        from_date_str = (datetime.today() - timedelta(days=365)).strftime('%Y-%m-%d')
+        from_date_str = (datetime.today() - timedelta(days=HISTORY_DAYS)).strftime('%Y-%m-%d')
         to_date_str = datetime.today().strftime('%Y-%m-%d')
 
         payload = {
@@ -115,7 +117,6 @@ def fetch_dhan_data(security_id, client_id, access_token):
             if df.empty:
                 return pd.DataFrame()
 
-            # --- Build a proper DatetimeIndex (Dhan returns 'timestamp'; older format used 'start_Time') ---
             ts_col = next((c for c in ['timestamp', 'start_Time', 'Timestamp'] if c in df.columns), None)
             if ts_col is None:
                 return pd.DataFrame()
@@ -148,250 +149,236 @@ def fetch_dhan_data(security_id, client_id, access_token):
         return pd.DataFrame()
 
 # ==========================================
+# FRAME PREPARATION
+# ------------------------------------------
+# Bearish setups are evaluated by MIRRORING the price frame (negating prices and swapping
+# High/Low). A bearish setup then looks exactly like a bullish one, so a single engine
+# handles both sides. All displayed prices are un-mirrored again.
+# ==========================================
+def _period_start(kind, key):
+    if kind == 'M':
+        return pd.Timestamp(int(key // 12), int(key % 12) + 1, 1)
+    if kind == 'Q':
+        return pd.Timestamp(int(key // 4), int(key % 4) * 3 + 1, 1)
+    return pd.Timestamp(int(key // 2), int(key % 2) * 6 + 1, 1)
+
+def prepare_frame(df, side):
+    d = df[['Open', 'High', 'Low', 'Close']].astype(float)
+    if side == "Bearish":
+        d = pd.DataFrame({'Open': -d['Open'], 'High': -d['Low'],
+                          'Low': -d['High'], 'Close': -d['Close']}, index=d.index)
+    d = d.copy()
+    d['EMA20'] = d['Close'].ewm(span=20, adjust=False).mean()
+
+    ix = d.index
+    keys = {
+        'PML': ('M', ix.year * 12 + ix.month - 1),
+        'PQL': ('Q', ix.year * 4 + (ix.month - 1) // 3),
+        'PHL': ('H', ix.year * 2 + (ix.month - 1) // 6),
+    }
+    # Previous-month / quarter / half-year low for every bar (the "as of that bar" level).
+    # A first period that is only partially covered by the downloaded history is dropped,
+    # otherwise its low would be wrong and would create fake sweeps.
+    for col, (kind, arr) in keys.items():
+        k = pd.Series(np.asarray(arr), index=ix)
+        grp = d['Low'].groupby(k).min()
+        first_key = int(k.iloc[0])
+        if ix[0] > _period_start(kind, first_key) + pd.Timedelta(days=7):
+            grp = grp.drop(first_key, errors='ignore')
+        d[col] = (k - 1).map(grp)
+    return d
+
+# ==========================================
 # CURVATURE MATH
 # ==========================================
-def check_ema20_rounded_bottom(ema_series, lookback=20):
-    if len(ema_series) < lookback: return False
-    recent_ema = ema_series.iloc[-lookback:].values
-    min_idx = np.argmin(recent_ema)
+def ema_curve_ok(ema_series, mode, lookback=20):
+    """Is the EMA20 forming a bottom? (bearish frames are mirrored, so this covers both sides)"""
+    if mode == "Off":
+        return True, "filter is off"
+    if len(ema_series) < lookback:
+        return False, "not enough bars"
+    r = ema_series.iloc[-lookback:].values
+    mi = int(np.argmin(r))
+    start, end, trough = r[0], r[-1], r[mi]
+    ago = lookback - 1 - mi
+    where = f"EMA20 low was {ago} bars ago"
 
-    if min_idx < 4 or min_idx > lookback - 4: return False
+    if mi < 4:
+        return False, f"EMA20 low is too far back ({where})"
+    if start <= trough:
+        return False, "EMA20 did not fall into a low within the window"
 
-    ema_start = recent_ema[0]
-    ema_end = recent_ema[-1]
-    ema_trough = recent_ema[min_idx]
-    if ema_start <= ema_trough or ema_end <= ema_trough: return False
+    if mode.startswith("Relaxed"):
+        if end <= trough:
+            return False, f"EMA20 is still at its low, no upturn yet ({where})"
+        return True, f"EMA20 has turned up ({where})"
 
-    trough_vals = recent_ema[max(0, min_idx-2):min(lookback, min_idx+3)]
-    trough_range = np.max(trough_vals) - np.min(trough_vals)
-    total_depth = max(ema_start, ema_end) - ema_trough
-
-    if total_depth == 0: return False
-    if trough_range > total_depth * 0.5: return False
-    return True
-
-def check_ema20_rounded_top(ema_series, lookback=20):
-    if len(ema_series) < lookback: return False
-    recent_ema = ema_series.iloc[-lookback:].values
-    max_idx = np.argmax(recent_ema)
-
-    if max_idx < 4 or max_idx > lookback - 4: return False
-
-    ema_start = recent_ema[0]
-    ema_end = recent_ema[-1]
-    ema_peak = recent_ema[max_idx]
-    if ema_start >= ema_peak or ema_end >= ema_peak: return False
-
-    peak_vals = recent_ema[max(0, max_idx-2):min(lookback, max_idx+3)]
-    peak_range = np.max(peak_vals) - np.min(peak_vals)
-    total_height = ema_peak - min(ema_start, ema_end)
-
-    if total_height == 0: return False
-    if peak_range > total_height * 0.5: return False
-    return True
+    # Strict (original rules)
+    if mi > lookback - 4:
+        return False, f"EMA20 low is too recent ({where}); strict mode needs 3+ bars of upturn"
+    if end <= trough:
+        return False, "EMA20 has not risen above its low"
+    trough_vals = r[max(0, mi - 2):min(lookback, mi + 3)]
+    trough_range = trough_vals.max() - trough_vals.min()
+    total_depth = max(start, end) - trough
+    if total_depth == 0:
+        return False, "EMA20 is flat"
+    if trough_range > total_depth * 0.5:
+        return False, "EMA20 bottom is too sharp (V-shaped), not rounded"
+    return True, f"rounded EMA20 bottom ({where})"
 
 # ==========================================
-# ENGINE: BULLISH LOGIC
+# ENGINE (both sides)
 # ==========================================
-def evaluate_bullish_day(ticker, df, idx, current_day):
-    if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-20):idx+1]): return None
+LEVEL_NAMES = {
+    "Bullish": {'PML': 'PML', 'PQL': 'PQL', 'PHL': 'PHL'},
+    "Bearish": {'PML': 'PMH', 'PQL': 'PQH', 'PHL': 'PHH'},
+}
 
-    curr_ts = pd.Timestamp(current_day)
-    curr_month = curr_ts.to_period('M')
+def evaluate_day(ticker, d, idx, side, p, trace=None):
+    """
+    d     : frame from prepare_frame(df, side)
+    idx   : integer position of the trigger candle
+    trace : pass a list to receive a pass/fail row for every check (used by the Diagnose tab)
+    """
+    sg = 1 if side == "Bullish" else -1
+    names = LEVEL_NAMES[side]
+    w_trend = "downtrend" if sg == 1 else "uptrend"
+    w_above = "above" if sg == 1 else "below"
+    w_edge = "low" if sg == 1 else "high"
 
-    prev_month_data = df[df.index.to_period('M') == curr_month - 1]
-    pml = (prev_month_data['Low'].min(), 'PML') if not prev_month_data.empty else None
+    def log(name, ok, detail=""):
+        if trace is not None:
+            trace.append({"Check": name, "Result": "✅ Pass" if ok else "❌ Fail", "Detail": detail})
+        return ok
 
-    curr_quarter = curr_ts.to_period('Q')
-    prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
-    pql = (prev_quarter_data['Low'].min(), 'PQL') if not prev_quarter_data.empty else None
+    if idx < 60:
+        log("Enough history", False, f"only {idx} bars before this date")
+        return None
 
-    curr_half = 1 if curr_ts.month <= 6 else 2
-    prev_half_year = curr_ts.year - 1 if curr_half == 1 else curr_ts.year
-    prev_half = 2 if curr_half == 1 else 1
-    prev_half_data = df[(df.index.year == prev_half_year) &
-                        (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) |
-                         ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
-    phl = (prev_half_data['Low'].min(), 'PHL') if not prev_half_data.empty else None
+    row = d.iloc[idx]
+    ema_val = row['EMA20']
 
-    htf_levels = [l for l in [pml, pql, phl] if l is not None]
+    # ---- Independent checks (cheap, so run first) ----
+    ok_ema, det = ema_curve_ok(d['EMA20'].iloc[max(0, idx - 20):idx + 1], p['ema_mode'])
+    log("EMA20 curvature", ok_ema, det)
+    if not ok_ema and trace is None:
+        return None
 
-    eval_window = df.iloc[max(0, idx-40):idx+1]
-    sweep_occurred, swept_name, absolute_sweep_day, swept_price = False, "", None, np.inf
+    ok_close = bool(row['Close'] > ema_val)
+    log(f"Trigger candle closes {w_above} EMA20", ok_close,
+        f"Close {sg * row['Close']:.2f} vs EMA20 {sg * ema_val:.2f}")
+    if not ok_close and trace is None:
+        return None
 
-    for price, name in htf_levels:
-        sweep_cands = eval_window[eval_window['Low'] < price]
-        if not sweep_cands.empty:
-            if price < swept_price:
-                sweep_occurred = True
-                swept_name = name
-                swept_price = price
-                absolute_sweep_day = sweep_cands['Low'].idxmin()
+    dist = (row['Low'] - ema_val) / abs(ema_val) * 100
+    ok_dist = p['dist_min'] <= dist <= p['dist_max']
+    log(f"Trigger candle's {w_edge} is close to EMA20", ok_dist,
+        f"distance {dist:.2f}% (allowed {p['dist_min']}% to {p['dist_max']}%)")
+    if not ok_dist and trace is None:
+        return None
 
-    if not sweep_occurred: return None
-    sweep_idx = df.index.get_loc(absolute_sweep_day)
+    # ---- 1. Higher-timeframe sweep inside the lookback window ----
+    use_sweep_date = p['level_mode'].startswith("Sweep")
+    win = d.iloc[max(0, idx - p['sweep_window']):idx + 1]
+    swept = pd.Series(False, index=win.index)
+    for nm in ('PML', 'PQL', 'PHL'):
+        ref = win[nm] if use_sweep_date else d[nm].iloc[idx]
+        swept = swept | (win['Low'] < ref)
 
-    if sweep_idx < 40: return None
-    ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
-    ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
-    ema_sweep = df['EMA20'].iloc[sweep_idx]
-    if not (ema_40_pre > ema_20_pre > ema_sweep): return None
+    if not swept.any():
+        log("HTF level swept", False,
+            f"no bar in the last {p['sweep_window']} took out the previous month/quarter/half-year {w_edge}")
+        return None
 
-    pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
-    if len(pre_sweep_df) < 5: return None
+    sweep_day = win['Low'][swept].idxmin()
+    sweep_idx = d.index.get_loc(sweep_day)
+    hits = []
+    for nm in ('PML', 'PQL', 'PHL'):
+        ref = d[nm].iloc[sweep_idx] if use_sweep_date else d[nm].iloc[idx]
+        if pd.notna(ref) and d['Low'].iloc[sweep_idx] < ref:
+            hits.append((ref, nm))
+    level_price, level_nm = min(hits)
+    log("HTF level swept", True,
+        f"{names[level_nm]} at ₹{sg * level_price:.2f} swept on {sweep_day.date()} ({idx - sweep_idx} bars ago)")
 
-    swing_highs = []
-    for i in range(1, len(pre_sweep_df)-1):
-        if pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i-1] and pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i+1]:
-            swing_highs.append({'price': pre_sweep_df['High'].iloc[i], 'time': pre_sweep_df.index[i]})
+    # ---- 2. Macro trend into the sweep ----
+    if sweep_idx < 40:
+        log(f"Macro {w_trend} into sweep", False, "sweep is too early in the available data")
+        return None
+    e40 = d['EMA20'].iloc[sweep_idx - 40]
+    e20 = d['EMA20'].iloc[sweep_idx - 20]
+    e0 = d['EMA20'].iloc[sweep_idx]
+    ok_trend = bool(e40 > e20 > e0)
+    log(f"Macro {w_trend} into sweep", ok_trend,
+        f"EMA20 40/20/0 bars before sweep: {sg * e40:.1f} → {sg * e20:.1f} → {sg * e0:.1f}")
+    if not ok_trend:
+        return None
 
-    nearest_untested_high = None
-    for sh in reversed(swing_highs):
-        interim = pre_sweep_df.loc[sh['time']:].iloc[1:]
-        if interim.empty or interim['High'].max() < sh['price']:
-            nearest_untested_high = sh['price']
+    # ---- 3. Nearest untested swing before the sweep ----
+    pre = d.iloc[max(0, sweep_idx - 60):sweep_idx]
+    if len(pre) < 5:
+        log("Untested swing before sweep", False, "not enough bars before the sweep")
+        return None
+    H = pre['High'].values
+    nearest = None
+    for i in range(len(H) - 2, 0, -1):
+        if H[i] > H[i - 1] and H[i] > H[i + 1] and H[i + 1:].max() < H[i]:
+            nearest = H[i]
             break
+    if nearest is None:
+        log("Untested swing before sweep", False, "no untested swing point found")
+        return None
+    log("Untested swing before sweep", True, f"₹{sg * nearest:.2f}")
 
-    if not nearest_untested_high: return None
+    # ---- 4. Market structure shift ----
+    post = d.iloc[sweep_idx:idx + 1]
+    ok_mss = bool((post['Close'] > nearest).any())
+    log("Market structure shift", ok_mss,
+        f"a close {w_above} ₹{sg * nearest:.2f} after the sweep " + ("happened" if ok_mss else "has not happened"))
+    if not ok_mss:
+        return None
 
-    post_sweep_df = df.iloc[sweep_idx:idx+1]
-    if post_sweep_df[post_sweep_df['Close'] > nearest_untested_high].empty: return None
+    # ---- 5. First close beyond EMA20 after the sweep ----
+    above = post[post['Close'] > post['EMA20']]
+    if above.empty:
+        log(f"Breakout {w_above} EMA20", False, "no close beyond EMA20 since the sweep")
+        return None
+    first_idx = d.index.get_loc(above.index[0])
+    log(f"Breakout {w_above} EMA20", True, f"first close {w_above} EMA20 on {above.index[0].date()}")
 
-    closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
-    if closes_above_ema.empty: return None
-    first_breakout_idx = df.index.get_loc(closes_above_ema.index[0])
+    # ---- 6. Price stayed on the trend side of EMA20 before that breakout ----
+    ptw = d.iloc[max(0, first_idx - p['pretouch_window']):first_idx]
+    touches = int((ptw['High'] >= ptw['EMA20']).sum())
+    ok_pt = touches <= p['pretouch_max']
+    log("Clean trend before breakout", ok_pt,
+        f"{touches} bars touched/crossed EMA20 in the {p['pretouch_window']} bars before the breakout "
+        f"(max allowed {p['pretouch_max']})")
+    if not ok_pt:
+        return None
 
-    pre_touch_window = df.iloc[max(0, first_breakout_idx - 30):first_breakout_idx]
-    if len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']]) > 5: return None
+    # ---- 7. At least one doji resting on the right side of EMA20 ----
+    rw = d.iloc[max(first_idx, idx - p['doji_bars'] + 1):idx + 1]
+    body = (rw['Open'] - rw['Close']).abs()
+    rng = rw['High'] - rw['Low']
+    dojis = int(((rng > 0) & (body <= rng * p['doji_body']) & (rw['Close'] > rw['EMA20'])).sum())
+    ok_doji = dojis >= 1
+    log("Doji resting on EMA20", ok_doji,
+        f"{dojis} doji in the last {p['doji_bars']} bars (body <= {int(p['doji_body'] * 100)}% of range)")
+    if not ok_doji:
+        return None
 
-    recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
-    doji_count = 0
-    for i in range(len(recent_window)):
-        r = recent_window.iloc[i]
-        c_idx = df.index.get_loc(recent_window.index[i])
-        ema_val = df['EMA20'].iloc[c_idx]
-        body = abs(r['Open'] - r['Close'])
-        rng = r['High'] - r['Low']
-        if (rng > 0) and (body <= rng * 0.35) and (r['Close'] > ema_val): doji_count += 1
-
-    if doji_count < 1: return None
-
-    row = df.iloc[idx]
-    ema_val = df['EMA20'].iloc[idx]
-    if row['Close'] <= ema_val: return None
-
-    distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
-    if distance_to_ema < -1.0 or distance_to_ema > 2.0: return None
+    if not (ok_ema and ok_close and ok_dist):
+        return None
 
     return {
         "Stock Symbol": ticker.replace('.NS', ''),
-        "Trigger Date": curr_ts.strftime('%Y-%m-%d'),
-        "HTF Swept": swept_name,
-        "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
-        "EMA20 Rest (₹)": round(ema_val, 2),
-        "Close (₹)": round(row['Close'], 2)
-    }
-
-# ==========================================
-# ENGINE: BEARISH LOGIC
-# ==========================================
-def evaluate_bearish_day(ticker, df, idx, current_day):
-    if not check_ema20_rounded_top(df['EMA20'].iloc[max(0, idx-20):idx+1]): return None
-
-    curr_ts = pd.Timestamp(current_day)
-    curr_month = curr_ts.to_period('M')
-
-    prev_month_data = df[df.index.to_period('M') == curr_month - 1]
-    pmh = (prev_month_data['High'].max(), 'PMH') if not prev_month_data.empty else None
-
-    curr_quarter = curr_ts.to_period('Q')
-    prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
-    pqh = (prev_quarter_data['High'].max(), 'PQH') if not prev_quarter_data.empty else None
-
-    curr_half = 1 if curr_ts.month <= 6 else 2
-    prev_half_year = curr_ts.year - 1 if curr_half == 1 else curr_ts.year
-    prev_half = 2 if curr_half == 1 else 1
-    prev_half_data = df[(df.index.year == prev_half_year) &
-                        (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) |
-                         ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
-    phh = (prev_half_data['High'].max(), 'PHH') if not prev_half_data.empty else None
-
-    htf_levels = [l for l in [pmh, pqh, phh] if l is not None]
-
-    eval_window = df.iloc[max(0, idx-40):idx+1]
-    sweep_occurred, swept_name, absolute_sweep_day, swept_price = False, "", None, -np.inf
-
-    for price, name in htf_levels:
-        sweep_cands = eval_window[eval_window['High'] > price]
-        if not sweep_cands.empty:
-            if price > swept_price:
-                sweep_occurred = True
-                swept_name = name
-                swept_price = price
-                absolute_sweep_day = sweep_cands['High'].idxmax()
-
-    if not sweep_occurred: return None
-    sweep_idx = df.index.get_loc(absolute_sweep_day)
-
-    if sweep_idx < 40: return None
-    ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
-    ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
-    ema_sweep = df['EMA20'].iloc[sweep_idx]
-    if not (ema_40_pre < ema_20_pre < ema_sweep): return None
-
-    pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
-    if len(pre_sweep_df) < 5: return None
-
-    swing_lows = []
-    for i in range(1, len(pre_sweep_df)-1):
-        if pre_sweep_df['Low'].iloc[i] < pre_sweep_df['Low'].iloc[i-1] and pre_sweep_df['Low'].iloc[i] < pre_sweep_df['Low'].iloc[i+1]:
-            swing_lows.append({'price': pre_sweep_df['Low'].iloc[i], 'time': pre_sweep_df.index[i]})
-
-    nearest_untested_low = None
-    for sl in reversed(swing_lows):
-        interim = pre_sweep_df.loc[sl['time']:].iloc[1:]
-        if interim.empty or interim['Low'].min() > sl['price']:
-            nearest_untested_low = sl['price']
-            break
-
-    if not nearest_untested_low: return None
-
-    post_sweep_df = df.iloc[sweep_idx:idx+1]
-    if post_sweep_df[post_sweep_df['Close'] < nearest_untested_low].empty: return None
-
-    closes_below_ema = post_sweep_df[post_sweep_df['Close'] < post_sweep_df['EMA20']]
-    if closes_below_ema.empty: return None
-    first_breakout_idx = df.index.get_loc(closes_below_ema.index[0])
-
-    pre_touch_window = df.iloc[max(0, first_breakout_idx - 30):first_breakout_idx]
-    if len(pre_touch_window[pre_touch_window['Low'] <= pre_touch_window['EMA20']]) > 5: return None
-
-    recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
-    doji_count = 0
-    for i in range(len(recent_window)):
-        r = recent_window.iloc[i]
-        c_idx = df.index.get_loc(recent_window.index[i])
-        ema_val = df['EMA20'].iloc[c_idx]
-        body = abs(r['Open'] - r['Close'])
-        rng = r['High'] - r['Low']
-        if (rng > 0) and (body <= rng * 0.35) and (r['Close'] < ema_val): doji_count += 1
-
-    if doji_count < 1: return None
-
-    row = df.iloc[idx]
-    ema_val = df['EMA20'].iloc[idx]
-    if row['Close'] >= ema_val: return None
-
-    distance_to_ema = ((ema_val - row['High']) / ema_val) * 100
-    if distance_to_ema < -1.0 or distance_to_ema > 2.0: return None
-
-    return {
-        "Stock Symbol": ticker.replace('.NS', ''),
-        "Trigger Date": curr_ts.strftime('%Y-%m-%d'),
-        "HTF Swept": swept_name,
-        "Pre-Sweep Low (₹)": round(nearest_untested_low, 2),
-        "EMA20 Rest (₹)": round(ema_val, 2),
-        "Close (₹)": round(row['Close'], 2)
+        "Trigger Date": d.index[idx].strftime('%Y-%m-%d'),
+        "HTF Swept": names[level_nm],
+        "Sweep Date": sweep_day.strftime('%Y-%m-%d'),
+        ("Pre-Sweep High (₹)" if sg == 1 else "Pre-Sweep Low (₹)"): round(sg * nearest, 2),
+        "EMA20 Rest (₹)": round(sg * ema_val, 2),
+        "Close (₹)": round(sg * row['Close'], 2),
     }
 
 # ==========================================
@@ -401,46 +388,32 @@ def evaluate_bearish_day(ticker, df, idx, current_day):
 def get_cached_stock_df(security_id, client_id, access_token):
     return fetch_dhan_data(security_id, client_id, access_token)
 
-def scan_live_setups(ticker, security_id, setup_type, client_id, access_token):
+def scan_live_setups(ticker, security_id, setup_type, client_id, access_token, p):
     df = get_cached_stock_df(security_id, client_id, access_token)
     if df.empty or len(df) < 200: return None
-    df = df.copy()
 
     cmp = df['Close'].iloc[-1]
     if pd.isna(cmp) or cmp < 100: return None
 
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    idx = len(df) - 1
+    d = prepare_frame(df, setup_type)
+    return evaluate_day(ticker, d, len(d) - 1, setup_type, p)
 
-    if setup_type == "Bullish": return evaluate_bullish_day(ticker, df, idx, df.index[idx])
-    else: return evaluate_bearish_day(ticker, df, idx, df.index[idx])
-
-def backtest_setups(ticker, security_id, start_date, end_date, setup_type, client_id, access_token):
+def backtest_setups(ticker, security_id, start_date, end_date, setup_type, client_id, access_token, p):
     df = get_cached_stock_df(security_id, client_id, access_token)
     if df.empty or len(df) < 200: return []
-    df = df.copy()
 
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    d = prepare_frame(df, setup_type)
+    dates = d.index.normalize()
+    mask = (dates >= pd.Timestamp(start_date)) & (dates <= pd.Timestamp(end_date))
 
-    # Compare timestamps directly (index is a normalized DatetimeIndex)
-    idx_dates = df.index.normalize()
-    mask = (idx_dates >= pd.Timestamp(start_date)) & (idx_dates <= pd.Timestamp(end_date))
-    target_dates = df.index[mask]
-    valid_setups = []
-
-    for current_day in target_dates:
-        idx = df.index.get_loc(current_day)
+    out = []
+    for idx in np.flatnonzero(mask):
         if idx < 130: continue
-
         cmp = df['Close'].iloc[idx]
         if pd.isna(cmp) or cmp < 100: continue
-
-        if setup_type == "Bullish": res = evaluate_bullish_day(ticker, df, idx, current_day)
-        else: res = evaluate_bearish_day(ticker, df, idx, current_day)
-
-        if res: valid_setups.append(res)
-
-    return valid_setups
+        res = evaluate_day(ticker, d, int(idx), setup_type, p)
+        if res: out.append(res)
+    return out
 
 # ==============================
 # STREAMLIT UI
@@ -468,11 +441,52 @@ if st.sidebar.button("Test API Connection"):
 st.sidebar.divider()
 universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "Nifty 500", "All NSE Stocks (> ₹100)"])
 
+st.sidebar.divider()
+st.sidebar.header("Filter Settings")
+st.sidebar.caption("Defaults are tuned to also catch early-reversal setups like COLPAL. "
+                   "Original values are noted on each control.")
+
+ema_mode = st.sidebar.selectbox(
+    "EMA20 curvature filter",
+    ["Relaxed (early turn)", "Strict (original)", "Off"], index=0,
+    help="Strict needs the EMA20 low to be 4-16 bars back and a rounded bottom. "
+         "Relaxed only needs the EMA20 to have fallen and started turning up.")
+level_mode = st.sidebar.selectbox(
+    "HTF levels measured as of",
+    ["Sweep date (recommended)", "Trigger date (original)"], index=0,
+    help="Original compares the sweep against the previous month/quarter/half-year of the TRIGGER date. "
+         "If the sweep happened in an earlier month, that level can include the sweep candle itself "
+         "and the sweep is missed.")
+pretouch_max = st.sidebar.slider(
+    "Max bars touching EMA20 before breakout", 0, 30, 12,
+    help="Original = 5. Counted over the 30 bars before the first close back above EMA20.")
+
+with st.sidebar.expander("Advanced"):
+    sweep_window = st.slider("Sweep must be within last N bars", 10, 80, 40, help="Original = 40")
+    pretouch_window = st.slider("Pre-breakout window (bars)", 10, 60, 30, help="Original = 30")
+    doji_bars = st.slider("Look for doji in last N bars", 1, 10, 6, help="Original = 6")
+    doji_body = st.slider("Doji body as % of candle range", 10, 60, 35, help="Original = 35") / 100
+    dist_min = st.number_input("Min distance of trigger candle's edge from EMA20 (%)", value=-1.0, step=0.5)
+    dist_max = st.number_input("Max distance of trigger candle's edge from EMA20 (%)", value=2.0, step=0.5)
+
+P = {
+    'ema_mode': ema_mode,
+    'level_mode': level_mode,
+    'pretouch_max': pretouch_max,
+    'pretouch_window': pretouch_window,
+    'sweep_window': sweep_window,
+    'doji_bars': doji_bars,
+    'doji_body': doji_body,
+    'dist_min': dist_min,
+    'dist_max': dist_max,
+}
+
 if not CLIENT_ID or not ACCESS_TOKEN:
     st.info("👈 Please enter your Dhan API Client ID and Access Token in the sidebar to run scans.")
     st.stop()
 
-bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
+bullish_tab, bearish_tab, diag_tab = st.tabs(
+    ["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)", "🔍 Diagnose a Stock"])
 
 def execute_scan(setup_type, mode, start_date=None, end_date=None):
     with st.spinner(f"Lightning scanning {universe_option} (Concurrent batches)..."):
@@ -501,9 +515,9 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
                     sec_id = mapping.get(clean_sym)
                     if sec_id:
                         if mode == "live":
-                            futures[executor.submit(scan_live_setups, t, sec_id, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                            futures[executor.submit(scan_live_setups, t, sec_id, setup_type, CLIENT_ID, ACCESS_TOKEN, P)] = t
                         else:
-                            futures[executor.submit(backtest_setups, t, sec_id, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN)] = t
+                            futures[executor.submit(backtest_setups, t, sec_id, start_date, end_date, setup_type, CLIENT_ID, ACCESS_TOKEN, P)] = t
                     else:
                         total_processed += 1
 
@@ -540,7 +554,7 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
             st.warning(f"No {setup_type} setups found in the specified criteria.")
 
 with bullish_tab:
-    st.markdown("Identifies a sustained **Macro Downtrend**, an **untested HTF low sweep**, daily **MSS**, a breakout above a **rounded EMA 20 bottom**, and a flag pulling back to print at least one **Doji resting precisely ON the EMA**.")
+    st.markdown("Identifies a sustained **Macro Downtrend**, an **untested HTF low sweep**, daily **MSS**, a breakout above the **EMA 20**, and a flag pulling back to print at least one **Doji resting precisely ON the EMA**.")
     if st.button("Run Live Bullish Screener"): execute_scan("Bullish", "live")
 
     st.divider()
@@ -551,7 +565,7 @@ with bullish_tab:
     if st.button("Run Bullish Backtester"): execute_scan("Bullish", "backtest", start_b, end_b)
 
 with bearish_tab:
-    st.markdown("Identifies a sustained **Macro Uptrend**, an **untested HTF high sweep**, daily **MSS (Downside)**, a drop below a **rounded EMA 20 top**, and a rally flag printing at least one **Doji resting tightly BENEATH the EMA**.")
+    st.markdown("Identifies a sustained **Macro Uptrend**, an **untested HTF high sweep**, daily **MSS (Downside)**, a drop below the **EMA 20**, and a rally flag printing at least one **Doji resting tightly BENEATH the EMA**.")
     if st.button("Run Live Bearish Screener"): execute_scan("Bearish", "live")
 
     st.divider()
@@ -560,3 +574,43 @@ with bearish_tab:
     with col3: start_br = st.date_input("From Date (Bearish)", datetime.today() - timedelta(days=30))
     with col4: end_br = st.date_input("To Date (Bearish)", datetime.today())
     if st.button("Run Bearish Backtester"): execute_scan("Bearish", "backtest", start_br, end_br)
+
+with diag_tab:
+    st.markdown("Check any stock against every filter, using the current **Filter Settings** from the sidebar. "
+                "Failed checks tell you exactly why a stock did not appear.")
+    c1, c2, c3 = st.columns(3)
+    diag_sym = c1.text_input("NSE symbol (without .NS)", value="COLPAL").strip().upper().replace('.NS', '')
+    diag_side = c2.selectbox("Setup type", ["Bullish", "Bearish"], key="diag_side")
+    diag_date = c3.date_input("As of date", datetime.today(), key="diag_date")
+
+    if st.button("Run diagnosis"):
+        mapping = get_dhan_symbol_mapping()
+        sec_id = mapping.get(diag_sym)
+        if not sec_id:
+            st.error(f"'{diag_sym}' was not found in the Dhan symbol list.")
+        else:
+            raw = get_cached_stock_df(sec_id, CLIENT_ID, ACCESS_TOKEN)
+            if raw.empty:
+                st.error("No data returned for this stock. Check the token and try again.")
+            else:
+                d = prepare_frame(raw, diag_side)
+                pos = int(d.index.searchsorted(pd.Timestamp(diag_date), side='right')) - 1
+                if pos < 0:
+                    st.error("That date is before the available data.")
+                else:
+                    sg = 1 if diag_side == "Bullish" else -1
+                    r = raw.iloc[pos]
+                    st.caption(
+                        f"Candle used: {raw.index[pos].date()} | O {r['Open']:.2f}  H {r['High']:.2f}  "
+                        f"L {r['Low']:.2f}  C {r['Close']:.2f} | EMA20 {sg * d['EMA20'].iloc[pos]:.2f} "
+                        f"| {len(raw)} candles loaded ({raw.index[0].date()} to {raw.index[-1].date()}). "
+                        f"Compare with your chart to confirm the data matches.")
+                    trace = []
+                    res = evaluate_day(diag_sym, d, pos, diag_side, P, trace)
+                    st.dataframe(pd.DataFrame(trace), use_container_width=True, hide_index=True)
+                    if res:
+                        st.success("This stock WOULD be listed with the current settings.")
+                        st.dataframe(pd.DataFrame([res]), use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("This stock would NOT be listed. See the ❌ rows above. "
+                                   "Loosen the matching setting in the sidebar and run again.")
