@@ -12,740 +12,361 @@ from datetime import datetime, timedelta
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
-st.set_page_config(page_title="ICT Liquidity Screener", layout="wide")
+st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
-@st.cache_data(ttl=3600)
+# ==========================================
+# UNIVERSE FETCHING
+# ==========================================
+@st.cache_data(ttl=86400)
+def get_nifty200_symbols():
+    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        df = pd.read_csv(io.StringIO(res.text))
+        return [str(s).strip() + '.NS' for s in df['Symbol']]
+    except: return []
+
+@st.cache_data(ttl=86400)
 def get_nifty500_symbols():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5"
-    }
-    
-    for attempt in range(3):
-        try:
-            response = requests.get(url, headers=headers, timeout=20)
-            if response.status_code == 200:
-                df = pd.read_csv(io.StringIO(response.text))
-                return [str(symbol).strip() + '.NS' for symbol in df['Symbol']]
-        except Exception:
-            continue
-            
-    return [
-        'RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'BHARTIARTL.NS', 'SBIN.NS', 
-        'INFY.NS', 'LICI.NS', 'ITC.NS', 'HINDUNILVR.NS', 'LT.NS', 'BAJFINANCE.NS', 
-        'HCLTECH.NS', 'MARUTI.NS', 'SUNPHARMA.NS', 'TATAMOTORS.NS', 'TATASTEEL.NS', 
-        'ONGC.NS', 'KOTAKBANK.NS', 'NTPC.NS', 'AXISBANK.NS', 'POWERGRID.NS', 'TITAN.NS', 
-        'M&M.NS', 'BAJAJFINSV.NS', 'ASIANPAINT.NS', 'ADANIENT.NS', 'ADANIPORTS.NS', 
-        'WIPRO.NS', 'COALINDIA.NS', 'NESTLEIND.NS', 'GRASIM.NS', 'TECHM.NS', 'HINDALCO.NS'
-    ]
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        df = pd.read_csv(io.StringIO(res.text))
+        return [str(s).strip() + '.NS' for s in df['Symbol']]
+    except: return []
 
+@st.cache_data(ttl=86400)
+def get_all_nse_symbols():
+    # Equity L file contains all active NSE equities
+    url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        df = pd.read_csv(io.StringIO(res.text))
+        # Ensure we only pick active equity symbols
+        if 'SYMBOL' in df.columns:
+            return [str(s).strip() + '.NS' for s in df['SYMBOL']]
+        elif 'Symbol' in df.columns:
+            return [str(s).strip() + '.NS' for s in df['Symbol']]
+        return []
+    except: return []
+
+# ==========================================
+# CURVATURE MATH
+# ==========================================
 def check_ema20_rounded_bottom(ema_series, lookback=20):
-    """
-    Upgraded function to force a smooth, circular Titan-style bottom
-    and strictly reject abrupt GPIL-style V-shape kinks.
-    """
     if len(ema_series) < lookback: return False
     recent_ema = ema_series.iloc[-lookback:].values
-    
-    # First derivative (rate of change)
     roc1 = np.diff(recent_ema)
-    # Second derivative (rate of rate of change - acceleration)
     roc2 = np.diff(roc1)
-    
     min_idx = np.argmin(recent_ema)
     
-    # Trough must be roughly in the middle to form a proper 'U'
     if min_idx < 4 or min_idx > lookback - 4: return False
-    
-    # 1. Slope Check
     falling_before = np.mean(roc1[:min_idx-1]) < 0
     rising_after = np.mean(roc1[min_idx+1:]) > 0
     if not (falling_before and rising_after): return False
     
-    # 2. Smooth Circularity Check (Reject V-Shapes)
-    # At the bottom (trough), the rate of change should be near zero (flattening out)
     trough_roc = np.mean(np.abs(roc1[max(0, min_idx-2):min_idx+2]))
     overall_roc = np.mean(np.abs(roc1))
-    
-    # If the speed of change at the trough is equal to or faster than the overall speed, it's a V-shape spike.
     if trough_roc > overall_roc * 0.7: return False
-    
-    # 3. Convexity (Acceleration should be generally positive and smooth)
     if np.mean(roc2) <= 0: return False
     
     return True
 
-# ==========================================
-# TAB 1: DAILY HTF SETUP
-# ==========================================
-def find_ict_htf_setups(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="2y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 100: return None
-        try: cmp = float(t.fast_info.last_price)
-        except Exception: cmp = float(df['Close'].iloc[-1])
-        if pd.isna(cmp) or cmp <= 60: return None
+def check_ema20_rounded_top(ema_series, lookback=20):
+    if len(ema_series) < lookback: return False
+    recent_ema = ema_series.iloc[-lookback:].values
+    roc1 = np.diff(recent_ema)
+    roc2 = np.diff(roc1)
+    max_idx = np.argmax(recent_ema)
+    
+    if max_idx < 4 or max_idx > lookback - 4: return False
+    rising_before = np.mean(roc1[:max_idx-1]) > 0
+    falling_after = np.mean(roc1[max_idx+1:]) < 0
+    if not (rising_before and falling_after): return False
+    
+    peak_roc = np.mean(np.abs(roc1[max(0, max_idx-2):max_idx+2]))
+    overall_roc = np.mean(np.abs(roc1))
+    if peak_roc > overall_roc * 0.7: return False
+    if np.mean(roc2) >= 0: return False 
+    
+    return True
 
-        current_month_period = df.index[-1].to_period('M')
-        previous_month_period = current_month_period - 1
-        eval_window = df.iloc[-30:]
-        hist_df = df.iloc[:-30]
-        levels = []
+# ==========================================
+# ENGINE: BULLISH LOGIC
+# ==========================================
+def evaluate_bullish_day(ticker, df, idx, current_day):
+    # 1. Curvature check
+    if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-20):idx+1]): return None
+    
+    # 2. HTF Levels
+    curr_month = current_day.to_period('M')
+    prev_month_data = df[df.index.to_period('M') == curr_month - 1]
+    pml = (prev_month_data['Low'].min(), prev_month_data['Low'].idxmin(), 'PML') if not prev_month_data.empty else None
+    
+    curr_quarter = current_day.to_period('Q')
+    prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
+    pql = (prev_quarter_data['Low'].min(), prev_quarter_data['Low'].idxmin(), 'PQL') if not prev_quarter_data.empty else None
+    
+    curr_half = 1 if current_day.month <= 6 else 2
+    prev_half_year = current_day.year - 1 if curr_half == 1 else current_day.year
+    prev_half = 2 if curr_half == 1 else 1
+    prev_half_data = df[(df.index.year == prev_half_year) & 
+                        (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
+                         ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
+    phl = (prev_half_data['Low'].min(), prev_half_data['Low'].idxmin(), 'PHL') if not prev_half_data.empty else None
+    
+    htf_levels = [l for l in [pml, pql, phl] if l is not None]
+    
+    # 3. Untested Sweep Check
+    eval_window = df.iloc[idx-40:idx+1]
+    sweep_occurred = False
+    swept_name = ""
+    absolute_sweep_day = None
+    swept_price = np.inf
+    
+    for price, date, name in htf_levels:
+        if date < eval_window.index[0]:
+            interim = df.loc[date + pd.Timedelta(days=1) : eval_window.index[0] - pd.Timedelta(days=1)]
+            if not interim.empty and interim['Low'].min() <= price:
+                continue 
         
-        prev_month_data = df[df.index.to_period('M') == previous_month_period]
-        if not prev_month_data.empty:
-            levels.append((prev_month_data['Low'].min(), prev_month_data['Low'].idxmin(), 'Last Month Low (PML)'))
-            
-        weekly_df = hist_df.resample('W-FRI').agg({'Low':'min'}).dropna()
-        for i in range(1, len(weekly_df)-1):
-            if weekly_df['Low'].iloc[i] < weekly_df['Low'].iloc[i-1] and weekly_df['Low'].iloc[i] < weekly_df['Low'].iloc[i+1]:
-                week_data = hist_df.loc[weekly_df.index[i] - pd.Timedelta(days=6):weekly_df.index[i]]
-                if not week_data.empty:
-                    levels.append((weekly_df['Low'].iloc[i], week_data['Low'].idxmin(), 'Weekly Swing Low (WSL)'))
-                    
-        monthly_df = hist_df.resample('ME').agg({'Low':'min'}).dropna()
-        for i in range(1, len(monthly_df)-1):
-            if monthly_df['Low'].iloc[i] < monthly_df['Low'].iloc[i-1] and monthly_df['Low'].iloc[i] < monthly_df['Low'].iloc[i+1]:
-                month_data = hist_df.loc[monthly_df.index[i].replace(day=1):monthly_df.index[i]]
-                if not month_data.empty:
-                    levels.append((monthly_df['Low'].iloc[i], month_data['Low'].idxmin(), 'Monthly Swing Low (MSL)'))
-
-        fresh_levels = []
-        for price, date, ltype in levels:
-            if ltype != 'Last Month Low (PML)' and date < hist_df.index[-1]:
-                subsequent_data = hist_df.loc[date + pd.Timedelta(days=1):]
-                if not subsequent_data.empty and subsequent_data['Low'].min() < price: continue 
-            fresh_levels.append((price, date, ltype))
-            
-        if not fresh_levels: return None
-        
-        sweep_occurred, swept_level_details, first_sweep_day = False, None, None
-        for price, date, ltype in fresh_levels:
-            sweep_candidates = eval_window[eval_window['Low'] < price]
-            if not sweep_candidates.empty:
-                temp_first_sweep = sweep_candidates.index[0]
-                if ltype == 'Last Month Low (PML)' and temp_first_sweep.to_period('M') != current_month_period: continue
-                if temp_first_sweep <= date: continue
-                sweep_occurred, first_sweep_day, swept_level_details = True, temp_first_sweep, (price, date, ltype)
-                break 
+        sweep_cands = eval_window[eval_window['Low'] < price]
+        if not sweep_cands.empty:
+            if price < swept_price:
+                sweep_occurred = True
+                swept_name = name
+                swept_price = price
+                absolute_sweep_day = sweep_cands['Low'].idxmin()
                 
-        if not sweep_occurred: return None
+    if not sweep_occurred: return None
+    
+    sweep_idx = df.index.get_loc(absolute_sweep_day)
+    
+    # 4. Macro Bottom Trend (Falling EMA before sweep)
+    if sweep_idx < 40: return None
+    ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
+    ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
+    ema_sweep = df['EMA20'].iloc[sweep_idx]
+    if not (ema_40_pre > ema_20_pre > ema_sweep): return None
+    
+    # 5. Untested Pre-Sweep Swing High (MSS)
+    pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
+    if len(pre_sweep_df) < 5: return None
+    
+    swing_highs = []
+    for i in range(1, len(pre_sweep_df)-1):
+        if pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i-1] and pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i+1]:
+            swing_highs.append({'price': pre_sweep_df['High'].iloc[i], 'time': pre_sweep_df.index[i]})
+    
+    nearest_untested_high = None
+    for sh in reversed(swing_highs):
+        interim = pre_sweep_df.loc[sh['time']:].iloc[1:]
+        if interim.empty or interim['High'].max() < sh['price']:
+            nearest_untested_high = sh['price']
+            break
+            
+    if not nearest_untested_high: return None
+    
+    # 6. Breakout checks
+    post_sweep_df = df.iloc[sweep_idx:idx+1]
+    if post_sweep_df[post_sweep_df['Close'] > nearest_untested_high].empty: return None
+    
+    closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
+    if closes_above_ema.empty: return None
+    first_breakout_idx = df.index.get_loc(closes_above_ema.index[0])
+    
+    # 7. Pre-touch Flag rules (max 5 hits from above in 30 days before first touch)
+    window_start = max(0, first_breakout_idx - 30)
+    pre_touch_window = df.iloc[window_start:first_breakout_idx]
+    if len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']]) > 5: return None
+    
+    # 8. Doji Count during resting phase
+    recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
+    doji_count = 0
+    for i in range(len(recent_window)):
+        r = recent_window.iloc[i]
+        c_idx = df.index.get_loc(recent_window.index[i])
+        ema_val = df['EMA20'].iloc[c_idx]
+        body = abs(r['Open'] - r['Close'])
+        rng = r['High'] - r['Low']
+        if (rng > 0) and (body <= rng * 0.35) and (r['Close'] > ema_val):
+            doji_count += 1
+            
+    if doji_count < 1: return None
+    
+    # 9. Exact Day Condition
+    row = df.iloc[idx]
+    ema_val = df['EMA20'].iloc[idx]
+    if row['Close'] <= ema_val: return None 
+    
+    distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
+    if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
+    
+    return {
+        "Stock Symbol": ticker.replace('.NS', ''),
+        "Trigger Date": current_day.strftime('%Y-%m-%d'),
+        "HTF Swept": swept_name,
+        "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
+        "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
+        "EMA20 Rest Level (₹)": round(ema_val, 2),
+        "Closing Price (₹)": round(row['Close'], 2)
+    }
+
+# ==========================================
+# ENGINE: BEARISH LOGIC
+# ==========================================
+def evaluate_bearish_day(ticker, df, idx, current_day):
+    # 1. Curvature check
+    if not check_ema20_rounded_top(df['EMA20'].iloc[max(0, idx-20):idx+1]): return None
+    
+    # 2. HTF Levels
+    curr_month = current_day.to_period('M')
+    prev_month_data = df[df.index.to_period('M') == curr_month - 1]
+    pmh = (prev_month_data['High'].max(), prev_month_data['High'].idxmax(), 'PMH') if not prev_month_data.empty else None
+    
+    curr_quarter = current_day.to_period('Q')
+    prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
+    pqh = (prev_quarter_data['High'].max(), prev_quarter_data['High'].idxmax(), 'PQH') if not prev_quarter_data.empty else None
+    
+    curr_half = 1 if current_day.month <= 6 else 2
+    prev_half_year = current_day.year - 1 if curr_half == 1 else current_day.year
+    prev_half = 2 if curr_half == 1 else 1
+    prev_half_data = df[(df.index.year == prev_half_year) & 
+                        (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
+                         ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
+    phh = (prev_half_data['High'].max(), prev_half_data['High'].idxmax(), 'PHH') if not prev_half_data.empty else None
+    
+    htf_levels = [l for l in [pmh, pqh, phh] if l is not None]
+    
+    # 3. Untested Sweep Check (Upside Sweep)
+    eval_window = df.iloc[idx-40:idx+1]
+    sweep_occurred = False
+    swept_name = ""
+    absolute_sweep_day = None
+    swept_price = -np.inf
+    
+    for price, date, name in htf_levels:
+        if date < eval_window.index[0]:
+            interim = df.loc[date + pd.Timedelta(days=1) : eval_window.index[0] - pd.Timedelta(days=1)]
+            if not interim.empty and interim['High'].max() >= price:
+                continue 
         
-        sweep_low_price = eval_window['Low'].min()
-        pre_sweep_data = df.loc[:first_sweep_day].iloc[-30:-1]
-        
-        swing_highs_info = []
-        for i in range(1, len(pre_sweep_data)-1):
-            if pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i-1] and pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i+1]:
-                swing_highs_info.append({'price': pre_sweep_data['High'].iloc[i], 'time': pre_sweep_data.index[i]})
-        
-        if not swing_highs_info: return None
-        
-        nearest_pre_sweep_high = None
-        for sh in reversed(swing_highs_info):
-            subsequent_data = pre_sweep_data.loc[sh['time']:].iloc[1:]
-            if subsequent_data.empty or subsequent_data['High'].max() < sh['price']:
-                nearest_pre_sweep_high = sh['price']
-                break
+        sweep_cands = eval_window[eval_window['High'] > price]
+        if not sweep_cands.empty:
+            if price > swept_price:
+                sweep_occurred = True
+                swept_name = name
+                swept_price = price
+                absolute_sweep_day = sweep_cands['High'].idxmax()
                 
-        if nearest_pre_sweep_high is None: return None
-        
-        post_sweep_data = df.loc[first_sweep_day:]
-        breakout_days = post_sweep_data[post_sweep_data['Close'] > nearest_pre_sweep_high]
-        if breakout_days.empty: return None 
+    if not sweep_occurred: return None
+    
+    sweep_idx = df.index.get_loc(absolute_sweep_day)
+    
+    # 4. Macro Top Trend (Rising EMA before sweep)
+    if sweep_idx < 40: return None
+    ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
+    ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
+    ema_sweep = df['EMA20'].iloc[sweep_idx]
+    if not (ema_40_pre < ema_20_pre < ema_sweep): return None
+    
+    # 5. Untested Pre-Sweep Swing Low (MSS)
+    pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
+    if len(pre_sweep_df) < 5: return None
+    
+    swing_lows = []
+    for i in range(1, len(pre_sweep_df)-1):
+        if pre_sweep_df['Low'].iloc[i] < pre_sweep_df['Low'].iloc[i-1] and pre_sweep_df['Low'].iloc[i] < pre_sweep_df['Low'].iloc[i+1]:
+            swing_lows.append({'price': pre_sweep_df['Low'].iloc[i], 'time': pre_sweep_df.index[i]})
+    
+    nearest_untested_low = None
+    for sl in reversed(swing_lows):
+        interim = pre_sweep_df.loc[sl['time']:].iloc[1:]
+        if interim.empty or interim['Low'].min() > sl['price']:
+            nearest_untested_low = sl['price']
+            break
             
-        trading_days_to_mss = df.index.get_loc(breakout_days.index[0]) - df.index.get_loc(first_sweep_day)
-        if trading_days_to_mss > 10: return None
+    if not nearest_untested_low: return None
+    
+    # 6. Breakout checks (Downside Breakout)
+    post_sweep_df = df.iloc[sweep_idx:idx+1]
+    if post_sweep_df[post_sweep_df['Close'] < nearest_untested_low].empty: return None
+    
+    closes_below_ema = post_sweep_df[post_sweep_df['Close'] < post_sweep_df['EMA20']]
+    if closes_below_ema.empty: return None
+    first_breakout_idx = df.index.get_loc(closes_below_ema.index[0])
+    
+    # 7. Pre-touch Flag rules (max 5 hits from below in 30 days before first touch)
+    window_start = max(0, first_breakout_idx - 30)
+    pre_touch_window = df.iloc[window_start:first_breakout_idx]
+    if len(pre_touch_window[pre_touch_window['Low'] <= pre_touch_window['EMA20']]) > 5: return None
+    
+    # 8. Doji Count during resting phase
+    recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
+    doji_count = 0
+    for i in range(len(recent_window)):
+        r = recent_window.iloc[i]
+        c_idx = df.index.get_loc(recent_window.index[i])
+        ema_val = df['EMA20'].iloc[c_idx]
+        body = abs(r['Open'] - r['Close'])
+        rng = r['High'] - r['Low']
+        if (rng > 0) and (body <= rng * 0.35) and (r['Close'] < ema_val):
+            doji_count += 1
             
-        displacement_high = post_sweep_data['High'].max()
-        dealing_range_50_level = sweep_low_price + (displacement_high - sweep_low_price) * 0.5
-        
-        post_high_data = post_sweep_data.loc[post_sweep_data['High'].idxmax():]
-        if not post_high_data.empty and post_high_data['Low'].min() <= dealing_range_50_level: return None 
-        if cmp <= dealing_range_50_level: return None
-            
-        return {
-            "Stock Symbol": ticker.replace('.NS', ''),
-            "Swept Liquidity": swept_level_details[2],
-            "Level Price (₹)": round(swept_level_details[0], 2),
-            "Sweep Low (₹)": round(sweep_low_price, 2),
-            "Prior Swing High (₹)": round(nearest_pre_sweep_high, 2),
-            "Days to MSS": trading_days_to_mss,
-            "Displacement High (₹)": round(displacement_high, 2),
-            "Untested 50% Eq. (₹)": round(dealing_range_50_level, 2),
-            "Live CMP (₹)": round(cmp, 2),
-            "Distance to Entry (%)": round(((cmp - dealing_range_50_level) / cmp) * 100, 2)
-        }
-    except Exception:
-        return None
+    if doji_count < 1: return None
+    
+    # 9. Exact Day Condition (Resting below EMA)
+    row = df.iloc[idx]
+    ema_val = df['EMA20'].iloc[idx]
+    if row['Close'] >= ema_val: return None 
+    
+    distance_to_ema = ((ema_val - row['High']) / ema_val) * 100
+    if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
+    
+    return {
+        "Stock Symbol": ticker.replace('.NS', ''),
+        "Trigger Date": current_day.strftime('%Y-%m-%d'),
+        "HTF Swept": swept_name,
+        "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
+        "Pre-Sweep Low (₹)": round(nearest_untested_low, 2),
+        "EMA20 Rest Level (₹)": round(ema_val, 2),
+        "Closing Price (₹)": round(row['Close'], 2)
+    }
 
 # ==========================================
-# TAB 2: 15-MIN INTRADAY SETUP
+# WRAPPER FUNCTIONS
 # ==========================================
-def find_ict_15m_intraday_setups(ticker):
+def fast_price_filter(ticker):
     try:
         t = yf.Ticker(ticker)
-        df = t.history(period="5d", interval="15m", auto_adjust=False)
-        if df.empty or len(df) < 20: return None
-        cmp = float(df['Close'].iloc[-1])
-        if pd.isna(cmp) or cmp <= 60: return None
-        
-        unique_dates = pd.Series(df.index.date).unique()
-        if len(unique_dates) < 2: return None
-        
-        yesterday_date = unique_dates[-2]
-        today_date = unique_dates[-1]
-        
-        yesterday_data = df[df.index.date == yesterday_date]
-        today_data = df[df.index.date == today_date]
-        if yesterday_data.empty or today_data.empty: return None
-        
-        pdl = yesterday_data['Low'].min()
-        sweep_candidates = today_data[today_data['Low'] < pdl]
-        if sweep_candidates.empty: return None
-        
-        absolute_sweep_time = today_data['Low'].idxmin()
-        sweep_low_price = today_data['Low'].min()
-        
-        pre_sweep_data = df.loc[:absolute_sweep_time].iloc[:-1]
-        if len(pre_sweep_data) < 5: return None
-        
-        swing_highs_info = []
-        for i in range(2, len(pre_sweep_data)-2):
-            if (pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i-1] and 
-                pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i-2] and 
-                pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i+1] and 
-                pre_sweep_data['High'].iloc[i] > pre_sweep_data['High'].iloc[i+2]):
-                
-                swing_highs_info.append({'price': pre_sweep_data['High'].iloc[i], 'time': pre_sweep_data.index[i]})
-                
-        if not swing_highs_info: return None
-        
-        valid_pre_sweep_high = None
-        for sh in reversed(swing_highs_info):
-            subsequent_data = pre_sweep_data.loc[sh['time']:].iloc[1:] 
-            if subsequent_data.empty or subsequent_data['High'].max() < sh['price']:
-                valid_pre_sweep_high = sh['price']
-                break
-                
-        if valid_pre_sweep_high is None: return None
-        
-        post_sweep_data = df.loc[absolute_sweep_time:]
-        breakout_candles = post_sweep_data[post_sweep_data['Close'] > valid_pre_sweep_high]
-        if breakout_candles.empty: return None
-        
-        displacement_high = post_sweep_data['High'].max()
-        displacement_high_time = post_sweep_data['High'].idxmax()
-        eq_50_level = sweep_low_price + (displacement_high - sweep_low_price) * 0.5
-        
-        post_high_data = post_sweep_data.loc[displacement_high_time:]
-        if not post_high_data.empty and post_high_data['Low'].min() <= eq_50_level: return None
-        if cmp <= eq_50_level: return None
-        
-        return {
-            "Stock Symbol": ticker.replace('.NS', ''),
-            "PDL Swept (₹)": round(pdl, 2),
-            "15m Sweep Low (₹)": round(sweep_low_price, 2),
-            "15m Pre-Sweep High (₹)": round(valid_pre_sweep_high, 2),
-            "15m Displacement High (₹)": round(displacement_high, 2),
-            "15m Entry 50% Eq (₹)": round(eq_50_level, 2),
-            "Live CMP (₹)": round(cmp, 2),
-            "Distance to Entry (%)": round(((cmp - eq_50_level) / cmp) * 100, 2)
-        }
-    except Exception:
-        return None
+        # Using fast_info to save huge amounts of download time for penny stocks
+        cmp = float(t.fast_info.last_price)
+        return cmp >= 100
+    except: return False
 
-# ==========================================
-# TAB 3 & 4: EMA 20 RESTING SETUP (LIVE & BACKTEST)
-# ==========================================
-def find_ema20_resting_setups(ticker):
+def scan_live_setups(ticker, setup_type="Bullish"):
+    if not fast_price_filter(ticker): return None
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="1y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 50: return None
-        try: cmp = float(t.fast_info.last_price)
-        except Exception: cmp = float(df['Close'].iloc[-1])
-        if pd.isna(cmp) or cmp <= 60: return None
-
-        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        if not check_ema20_rounded_bottom(df['EMA20']): return None
-
-        current_month_period = df.index[-1].to_period('M')
-        previous_month_period = current_month_period - 1
-        
-        prev_month_data = df[df.index.to_period('M') == previous_month_period]
-        if prev_month_data.empty: return None
-        pml = prev_month_data['Low'].min()
-        
-        curr_month_data = df[df.index.to_period('M') == current_month_period]
-        sweep_candidates = curr_month_data[curr_month_data['Low'] < pml]
-        if sweep_candidates.empty: return None
-        
-        absolute_sweep_day = sweep_candidates['Low'].idxmin()
-        post_sweep_data = df.loc[absolute_sweep_day:]
-        breakout_days = post_sweep_data[post_sweep_data['Close'] > post_sweep_data['EMA20']]
-        if breakout_days.empty: return None
-        
-        current_ema20 = df['EMA20'].iloc[-1]
-        if cmp < current_ema20: return None 
-        buffer_zone_ceiling = current_ema20 * 1.015
-        if cmp > buffer_zone_ceiling: return None 
-        
-        return {
-            "Stock Symbol": ticker.replace('.NS', ''),
-            "PML Swept (₹)": round(pml, 2),
-            "Current EMA20 (₹)": round(current_ema20, 2),
-            "Live CMP (₹)": round(cmp, 2),
-            "Distance to EMA20 (%)": round(((cmp - current_ema20) / current_ema20) * 100, 2)
-        }
-    except Exception:
-        return None
-
-def backtest_ema20_setups(ticker, target_year, target_month):
-    try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="2y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 50: return []
-        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        target_dates = df[(df.index.year == target_year) & (df.index.month == target_month)].index
-        valid_setups = []
-        for current_day in target_dates:
-            idx = df.index.get_loc(current_day)
-            if idx < 30: continue
-            cmp_on_day = df['Close'].iloc[idx]
-            if pd.isna(cmp_on_day) or cmp_on_day <= 60: continue
-            
-            current_period = current_day.to_period('M')
-            prev_month_data = df[df.index.to_period('M') == current_period - 1]
-            if prev_month_data.empty: continue
-            pml = prev_month_data['Low'].min()
-            
-            curr_month_so_far = df[(df.index.to_period('M') == current_period) & (df.index <= current_day)]
-            sweep_candidates = curr_month_so_far[curr_month_so_far['Low'] < pml]
-            if sweep_candidates.empty: continue
-            
-            if not check_ema20_rounded_bottom(df['EMA20'].iloc[idx-20:idx+1]): continue
-            
-            post_sweep_data = df.loc[sweep_candidates['Low'].idxmin():current_day]
-            if post_sweep_data[post_sweep_data['Close'] > post_sweep_data['EMA20']].empty: continue
-            
-            current_ema20 = df['EMA20'].iloc[idx]
-            if cmp_on_day < current_ema20 or cmp_on_day > current_ema20 * 1.015: continue 
-            
-            valid_setups.append({
-                "Stock Symbol": ticker.replace('.NS', ''),
-                "Trigger Date": current_day.strftime('%Y-%m-%d'),
-                "PML Swept (₹)": round(pml, 2),
-                "EMA20 Level (₹)": round(current_ema20, 2),
-                "Closing Price (₹)": round(cmp_on_day, 2)
-            })
-        return valid_setups
-    except Exception:
-        return []
-
-# ==========================================
-# TAB 5: STRICT EMA 20 (DATE RANGE BACKTEST)
-# ==========================================
-def backtest_strict_ema20_date_range(ticker, start_date, end_date):
-    try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="2y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 50: return []
-        
-        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        
-        target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
-        valid_setups = []
-        
-        for current_day in target_dates:
-            idx = df.index.get_loc(current_day)
-            if idx < 30: continue
-            
-            cmp_on_day = float(df['Close'].iloc[idx])
-            if pd.isna(cmp_on_day) or cmp_on_day <= 60: continue
-            
-            target_period = current_day.to_period('M')
-            prev_month_data = df[df.index.to_period('M') == target_period - 1]
-            if prev_month_data.empty: continue
-            pml = prev_month_data['Low'].min()
-            
-            curr_month_so_far = df[(df.index.to_period('M') == target_period) & (df.index <= current_day)]
-            sweep_candidates = curr_month_so_far[curr_month_so_far['Low'] < pml]
-            if sweep_candidates.empty: continue
-            
-            absolute_sweep_day = sweep_candidates['Low'].idxmin()
-            sweep_idx = df.index.get_loc(absolute_sweep_day)
-            
-            if sweep_idx < 5: continue
-            ema_pre_sweep_start = df['EMA20'].iloc[sweep_idx - 5]
-            ema_at_sweep = df['EMA20'].iloc[sweep_idx]
-            if ema_at_sweep >= ema_pre_sweep_start: continue
-            
-            post_sweep_data = df.iloc[sweep_idx:idx+1]
-            touches = post_sweep_data[post_sweep_data['High'] >= post_sweep_data['EMA20']]
-            if touches.empty: continue
-            
-            first_touch_date = touches.index[0]
-            first_touch_idx = df.index.get_loc(first_touch_date)
-            
-            window_start = max(0, first_touch_idx - 15)
-            pre_touch_window = df.iloc[window_start:first_touch_idx]
-            touch_count = len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']])
-            
-            if touch_count > 2: continue
-            
-            target_ema = df['EMA20'].iloc[idx]
-            if cmp_on_day < target_ema: continue
-            buffer_zone_ceiling = target_ema * 1.015
-            if cmp_on_day > buffer_zone_ceiling: continue
-            
-            distance_to_ema = ((cmp_on_day - target_ema) / target_ema) * 100
-            
-            valid_setups.append({
-                "Stock Symbol": ticker.replace('.NS', ''),
-                "Trigger Date": current_day.strftime('%Y-%m-%d'),
-                "PML Swept (₹)": round(pml, 2),
-                "First Touch Date": first_touch_date.strftime('%Y-%m-%d'),
-                "Pre-Touch Hits (15d)": touch_count,
-                "EMA20 Level (₹)": round(target_ema, 2),
-                "Closing Price (₹)": round(cmp_on_day, 2),
-                "Distance to EMA20 (%)": round(distance_to_ema, 2)
-            })
-            
-        return valid_setups
-    except Exception:
-        return []
-
-# ==========================================
-# TAB 6 & 7: EXPANDING DIVERGENCE SETUP & BACKTESTER
-# ==========================================
-def find_expanding_divergence_setup(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="2y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 130: return None
-        
-        try: cmp = float(t.fast_info.last_price)
-        except Exception: cmp = float(df['Close'].iloc[-1])
-        if pd.isna(cmp) or cmp <= 60: return None
-        
-        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        current_date = df.index[-1]
-        
-        curr_month = current_date.to_period('M')
-        prev_month_data = df[df.index.to_period('M') == curr_month - 1]
-        pml = prev_month_data['Low'].min() if not prev_month_data.empty else np.nan
-        
-        curr_quarter = current_date.to_period('Q')
-        prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
-        pql = prev_quarter_data['Low'].min() if not prev_quarter_data.empty else np.nan
-        
-        curr_half = 1 if current_date.month <= 6 else 2
-        prev_half_year = current_date.year - 1 if curr_half == 1 else current_date.year
-        prev_half = 2 if curr_half == 1 else 1
-        
-        prev_half_data = df[(df.index.year == prev_half_year) & 
-                            (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
-                             ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
-        phl = prev_half_data['Low'].min() if not prev_half_data.empty else np.nan
-        
-        htf_levels = {'PML': pml, 'PQL': pql, 'PHL': phl}
-        
-        eval_window = df.iloc[-30:]
-        sweep_occurred = False
-        swept_level_name = ""
-        swept_price = np.inf
-        absolute_sweep_day = None
-        
-        for name, price in htf_levels.items():
-            if pd.isna(price): continue
-            sweep_candidates = eval_window[eval_window['Low'] < price]
-            if not sweep_candidates.empty:
-                if price < swept_price:  
-                    sweep_occurred = True
-                    swept_level_name = name
-                    swept_price = price
-                    absolute_sweep_day = sweep_candidates['Low'].idxmin()
-        
-        if not sweep_occurred: return None
-        
-        sweep_idx = df.index.get_loc(absolute_sweep_day)
-        
-        if sweep_idx < 20: return None
-        ema_pre_sweep_start = df['EMA20'].iloc[sweep_idx - 20]
-        ema_at_sweep = df['EMA20'].iloc[sweep_idx]
-        if ema_at_sweep >= ema_pre_sweep_start: return None
-        
-        if sweep_idx < 15: return None
-        pre_sweep_df = df.iloc[sweep_idx-15:sweep_idx+1]
-        distances = pre_sweep_df['EMA20'] - pre_sweep_df['Close']
-        dist_first_half = distances.iloc[:7].mean()
-        dist_second_half = distances.iloc[-7:].mean()
-        
-        if dist_second_half <= dist_first_half: return None 
-        if distances.iloc[-1] < 0: return None 
-        
-        post_sweep_df = df.iloc[sweep_idx:]
-        touches = post_sweep_df[post_sweep_df['High'] >= post_sweep_df['EMA20']]
-        if touches.empty: return None
-        
-        first_touch_idx = df.index.get_loc(touches.index[0])
-        window_start = max(0, first_touch_idx - 30)
-        pre_touch_window = df.iloc[window_start:first_touch_idx]
-        touch_count = len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']])
-        if touch_count > 5: return None
-        
-        closes_above = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
-        if closes_above.empty: return None
-        
-        first_close_above_date = closes_above.index[0]
-        if first_close_above_date < df.index[-2]: return None 
-        
-        breakout_idx = df.index.get_loc(first_close_above_date)
-        if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, breakout_idx-20):breakout_idx+1]): return None
-            
-        return {
-            "Stock Symbol": ticker.replace('.NS', ''),
-            "HTF Swept": swept_level_name,
-            "Sweep Level (₹)": round(swept_price, 2),
-            "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
-            "Breakout Date": first_close_above_date.strftime('%Y-%m-%d'),
-            "Live CMP (₹)": round(cmp, 2)
-        }
-    except Exception:
-        return None
-
-def backtest_expanding_divergence_date_range(ticker, start_date, end_date):
-    try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="3y", interval="1d", auto_adjust=False)
-        if df.empty or len(df) < 200: return []
-        
-        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
-        valid_setups = []
-        
-        for current_day in target_dates:
-            idx = df.index.get_loc(current_day)
-            if idx < 130: continue
-            
-            cmp_on_day = float(df['Close'].iloc[idx])
-            if pd.isna(cmp_on_day) or cmp_on_day <= 60: continue
-            
-            if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-20):idx+1]): continue
-            
-            if cmp_on_day <= df['EMA20'].iloc[idx]: continue
-            if df['Close'].iloc[idx-1] > df['EMA20'].iloc[idx-1]: continue
-            
-            curr_month = current_day.to_period('M')
-            prev_month_data = df[df.index.to_period('M') == curr_month - 1]
-            pml = prev_month_data['Low'].min() if not prev_month_data.empty else np.nan
-            
-            curr_quarter = current_day.to_period('Q')
-            prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
-            pql = prev_quarter_data['Low'].min() if not prev_quarter_data.empty else np.nan
-            
-            curr_half = 1 if current_day.month <= 6 else 2
-            prev_half_year = current_day.year - 1 if curr_half == 1 else current_day.year
-            prev_half = 2 if curr_half == 1 else 1
-            
-            prev_half_data = df[(df.index.year == prev_half_year) & 
-                                (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
-                                 ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
-            phl = prev_half_data['Low'].min() if not prev_half_data.empty else np.nan
-            
-            htf_levels = {'PML': pml, 'PQL': pql, 'PHL': phl}
-            
-            eval_window = df.iloc[idx-30:idx+1]
-            sweep_occurred = False
-            swept_level_name = ""
-            swept_price = np.inf
-            absolute_sweep_day = None
-            
-            for name, price in htf_levels.items():
-                if pd.isna(price): continue
-                sweep_candidates = eval_window[eval_window['Low'] < price]
-                if not sweep_candidates.empty:
-                    if price < swept_price:  
-                        sweep_occurred = True
-                        swept_level_name = name
-                        swept_price = price
-                        absolute_sweep_day = sweep_candidates['Low'].idxmin()
-            
-            if not sweep_occurred: continue
-            
-            sweep_idx = df.index.get_loc(absolute_sweep_day)
-            
-            if sweep_idx < 20: continue
-            ema_pre_sweep_start = df['EMA20'].iloc[sweep_idx - 20]
-            ema_at_sweep = df['EMA20'].iloc[sweep_idx]
-            if ema_at_sweep >= ema_pre_sweep_start: continue
-            
-            if sweep_idx < 15: continue
-            pre_sweep_df = df.iloc[sweep_idx-15:sweep_idx+1]
-            distances = pre_sweep_df['EMA20'] - pre_sweep_df['Close']
-            dist_first_half = distances.iloc[:7].mean()
-            dist_second_half = distances.iloc[-7:].mean()
-            
-            if dist_second_half <= dist_first_half: continue 
-            if distances.iloc[-1] < 0: continue 
-            
-            post_sweep_data = df.iloc[sweep_idx:idx+1]
-            touches = post_sweep_data[post_sweep_data['High'] >= post_sweep_data['EMA20']]
-            if touches.empty: continue
-            
-            first_touch_idx = df.index.get_loc(touches.index[0])
-            window_start = max(0, first_touch_idx - 30)
-            pre_touch_window = df.iloc[window_start:first_touch_idx]
-            touch_count = len(pre_touch_window[pre_touch_window['High'] >= pre_touch_window['EMA20']])
-            if touch_count > 5: continue
-            
-            valid_setups.append({
-                "Stock Symbol": ticker.replace('.NS', ''),
-                "Trigger Date": current_day.strftime('%Y-%m-%d'),
-                "HTF Swept": swept_level_name,
-                "Sweep Level (₹)": round(swept_price, 2),
-                "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
-                "Closing Price (₹)": round(cmp_on_day, 2)
-            })
-            
-        return valid_setups
-    except Exception:
-        return []
-
-# ==========================================
-# TAB 8: DOJI RESTING BACKTESTER (LIVE & BT)
-# ==========================================
-def find_doji_resting_setups(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="3y", interval="1d", auto_adjust=False)
+        df = yf.Ticker(ticker).history(period="3y", interval="1d", auto_adjust=False)
         if df.empty or len(df) < 200: return None
-        
-        try: cmp = float(t.fast_info.last_price)
-        except Exception: cmp = float(df['Close'].iloc[-1])
-        if pd.isna(cmp) or cmp <= 60: return None
-        
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        
         idx = len(df) - 1
-        current_day = df.index[idx]
-        
-        if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-20):idx+1]): return None
-        
-        curr_month = current_day.to_period('M')
-        prev_month_data = df[df.index.to_period('M') == curr_month - 1]
-        pml = (prev_month_data['Low'].min(), prev_month_data['Low'].idxmin(), 'PML') if not prev_month_data.empty else None
-        
-        curr_quarter = current_day.to_period('Q')
-        prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
-        pql = (prev_quarter_data['Low'].min(), prev_quarter_data['Low'].idxmin(), 'PQL') if not prev_quarter_data.empty else None
-        
-        curr_half = 1 if current_day.month <= 6 else 2
-        prev_half_year = current_day.year - 1 if curr_half == 1 else current_day.year
-        prev_half = 2 if curr_half == 1 else 1
-        prev_half_data = df[(df.index.year == prev_half_year) & 
-                            (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
-                             ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
-        phl = (prev_half_data['Low'].min(), prev_half_data['Low'].idxmin(), 'PHL') if not prev_half_data.empty else None
-        
-        htf_levels = [l for l in [pml, pql, phl] if l is not None]
-        
-        eval_window = df.iloc[idx-40:idx+1]
-        sweep_occurred = False
-        swept_name = ""
-        absolute_sweep_day = None
-        swept_price = np.inf
-        
-        for price, date, name in htf_levels:
-            if date < eval_window.index[0]:
-                interim = df.loc[date + pd.Timedelta(days=1) : eval_window.index[0] - pd.Timedelta(days=1)]
-                if not interim.empty and interim['Low'].min() <= price:
-                    continue 
-            
-            sweep_cands = eval_window[eval_window['Low'] < price]
-            if not sweep_cands.empty:
-                if price < swept_price:
-                    sweep_occurred = True
-                    swept_name = name
-                    swept_price = price
-                    absolute_sweep_day = sweep_cands['Low'].idxmin()
-                    
-        if not sweep_occurred: return None
-        
-        sweep_idx = df.index.get_loc(absolute_sweep_day)
-        
-        if sweep_idx < 40: return None
-        ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
-        ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
-        ema_sweep = df['EMA20'].iloc[sweep_idx]
-        if not (ema_40_pre > ema_20_pre > ema_sweep): return None
-        
-        pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
-        if len(pre_sweep_df) < 5: return None
-        
-        swing_highs = []
-        for i in range(1, len(pre_sweep_df)-1):
-            if pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i-1] and pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i+1]:
-                swing_highs.append({'price': pre_sweep_df['High'].iloc[i], 'time': pre_sweep_df.index[i]})
-        
-        nearest_untested_high = None
-        for sh in reversed(swing_highs):
-            interim = pre_sweep_df.loc[sh['time']:].iloc[1:]
-            if interim.empty or interim['High'].max() < sh['price']:
-                nearest_untested_high = sh['price']
-                break
-                
-        if not nearest_untested_high: return None
-        
-        post_sweep_df = df.iloc[sweep_idx:idx+1]
-        
-        closes_above_mss = post_sweep_df[post_sweep_df['Close'] > nearest_untested_high]
-        if closes_above_mss.empty: return None
-        
-        closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
-        if closes_above_ema.empty: return None
-        first_breakout_idx = df.index.get_loc(closes_above_ema.index[0])
-        
-        recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
-        
-        doji_count = 0
-        for i in range(len(recent_window)):
-            r = recent_window.iloc[i]
-            body = abs(r['Open'] - r['Close'])
-            rng = r['High'] - r['Low']
-            is_doji = (rng > 0) and (body <= rng * 0.35)
-            if is_doji: doji_count += 1
-        
-        if doji_count < 2: return None
-        
-        row = df.iloc[idx]
-        ema_val = df['EMA20'].iloc[idx]
-        if row['Close'] <= ema_val: return None 
-        
-        distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
-        if distance_to_ema < -0.5 or distance_to_ema > 1.5: return None
-        
-        return {
-            "Stock Symbol": ticker.replace('.NS', ''),
-            "HTF Swept": swept_name,
-            "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
-            "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
-            "EMA20 Rest Level (₹)": round(ema_val, 2),
-            "Live CMP (₹)": round(cmp, 2)
-        }
-    except Exception:
-        return None
+        if setup_type == "Bullish":
+            return evaluate_bullish_day(ticker, df, idx, df.index[idx])
+        else:
+            return evaluate_bearish_day(ticker, df, idx, df.index[idx])
+    except: return None
 
-def backtest_doji_resting_date_range(ticker, start_date, end_date):
+def backtest_setups(ticker, start_date, end_date, setup_type="Bullish"):
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period="3y", interval="1d", auto_adjust=False)
+        df = yf.Ticker(ticker).history(period="3y", interval="1d", auto_adjust=False)
         if df.empty or len(df) < 200: return []
-        
         df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        
         target_dates = df[(df.index.date >= start_date) & (df.index.date <= end_date)].index
         valid_setups = []
         
@@ -753,415 +374,115 @@ def backtest_doji_resting_date_range(ticker, start_date, end_date):
             idx = df.index.get_loc(current_day)
             if idx < 130: continue
             
-            if not check_ema20_rounded_bottom(df['EMA20'].iloc[max(0, idx-20):idx+1]): continue
+            cmp = df['Close'].iloc[idx]
+            if pd.isna(cmp) or cmp < 100: continue
             
-            curr_month = current_day.to_period('M')
-            prev_month_data = df[df.index.to_period('M') == curr_month - 1]
-            pml = (prev_month_data['Low'].min(), prev_month_data['Low'].idxmin(), 'PML') if not prev_month_data.empty else None
-            
-            curr_quarter = current_day.to_period('Q')
-            prev_quarter_data = df[df.index.to_period('Q') == curr_quarter - 1]
-            pql = (prev_quarter_data['Low'].min(), prev_quarter_data['Low'].idxmin(), 'PQL') if not prev_quarter_data.empty else None
-            
-            curr_half = 1 if current_day.month <= 6 else 2
-            prev_half_year = current_day.year - 1 if curr_half == 1 else current_day.year
-            prev_half = 2 if curr_half == 1 else 1
-            prev_half_data = df[(df.index.year == prev_half_year) & 
-                                (((df.index.month >= 1) & (df.index.month <= 6) & (prev_half == 1)) | 
-                                 ((df.index.month >= 7) & (df.index.month <= 12) & (prev_half == 2)))]
-            phl = (prev_half_data['Low'].min(), prev_half_data['Low'].idxmin(), 'PHL') if not prev_half_data.empty else None
-            
-            htf_levels = [l for l in [pml, pql, phl] if l is not None]
-            
-            eval_window = df.iloc[idx-40:idx+1]
-            sweep_occurred = False
-            swept_name = ""
-            absolute_sweep_day = None
-            swept_price = np.inf
-            
-            for price, date, name in htf_levels:
-                if date < eval_window.index[0]:
-                    interim = df.loc[date + pd.Timedelta(days=1) : eval_window.index[0] - pd.Timedelta(days=1)]
-                    if not interim.empty and interim['Low'].min() <= price:
-                        continue 
+            if setup_type == "Bullish":
+                res = evaluate_bullish_day(ticker, df, idx, current_day)
+            else:
+                res = evaluate_bearish_day(ticker, df, idx, current_day)
                 
-                sweep_cands = eval_window[eval_window['Low'] < price]
-                if not sweep_cands.empty:
-                    if price < swept_price:
-                        sweep_occurred = True
-                        swept_name = name
-                        swept_price = price
-                        absolute_sweep_day = sweep_cands['Low'].idxmin()
-                        
-            if not sweep_occurred: continue
-            
-            sweep_idx = df.index.get_loc(absolute_sweep_day)
-            
-            if sweep_idx < 40: continue
-            ema_40_pre = df['EMA20'].iloc[sweep_idx - 40]
-            ema_20_pre = df['EMA20'].iloc[sweep_idx - 20]
-            ema_sweep = df['EMA20'].iloc[sweep_idx]
-            if not (ema_40_pre > ema_20_pre > ema_sweep): continue
-            
-            pre_sweep_df = df.iloc[max(0, sweep_idx-60):sweep_idx]
-            if len(pre_sweep_df) < 5: continue
-            
-            swing_highs = []
-            for i in range(1, len(pre_sweep_df)-1):
-                if pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i-1] and pre_sweep_df['High'].iloc[i] > pre_sweep_df['High'].iloc[i+1]:
-                    swing_highs.append({'price': pre_sweep_df['High'].iloc[i], 'time': pre_sweep_df.index[i]})
-            
-            nearest_untested_high = None
-            for sh in reversed(swing_highs):
-                interim = pre_sweep_df.loc[sh['time']:].iloc[1:]
-                if interim.empty or interim['High'].max() < sh['price']:
-                    nearest_untested_high = sh['price']
-                    break
-                    
-            if not nearest_untested_high: continue
-            
-            post_sweep_df = df.iloc[sweep_idx:idx+1]
-            
-            closes_above_mss = post_sweep_df[post_sweep_df['Close'] > nearest_untested_high]
-            if closes_above_mss.empty: continue
-            
-            closes_above_ema = post_sweep_df[post_sweep_df['Close'] > post_sweep_df['EMA20']]
-            if closes_above_ema.empty: continue
-            first_breakout_idx = df.index.get_loc(closes_above_ema.index[0])
-            
-            recent_window = df.iloc[max(first_breakout_idx, idx-5):idx+1]
-            
-            doji_count = 0
-            for i in range(len(recent_window)):
-                r = recent_window.iloc[i]
-                body = abs(r['Open'] - r['Close'])
-                rng = r['High'] - r['Low']
-                is_doji = (rng > 0) and (body <= rng * 0.35)
-                if is_doji: doji_count += 1
-            
-            if doji_count < 2: continue
-            
-            row = df.iloc[idx]
-            ema_val = df['EMA20'].iloc[idx]
-            if row['Close'] <= ema_val: continue 
-            
-            distance_to_ema = ((row['Low'] - ema_val) / ema_val) * 100
-            if distance_to_ema < -0.5 or distance_to_ema > 1.5: continue
-            
-            valid_setups.append({
-                "Stock Symbol": ticker.replace('.NS', ''),
-                "Trigger Date": current_day.strftime('%Y-%m-%d'),
-                "HTF Swept": swept_name,
-                "Sweep Date": absolute_sweep_day.strftime('%Y-%m-%d'),
-                "Pre-Sweep High (₹)": round(nearest_untested_high, 2),
-                "EMA20 Rest Level (₹)": round(ema_val, 2),
-                "Closing Price (₹)": round(row['Close'], 2)
-            })
+            if res: valid_setups.append(res)
             
         return valid_setups
-    except Exception:
-        return []
+    except: return []
 
 # ==============================
 # STREAMLIT UI
 # ==============================
-st.title("ICT Liquidity Screener (Nifty 500)")
+st.title("ICT Doji Resting Screener")
+st.markdown("Macro Trend -> Untested HTF Sweep -> Daily MSS -> Flag -> Pinpoint Curvature Doji Rest")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-    "Daily HTF", 
-    "15m Intraday", 
-    "EMA20 Resting", 
-    "BT: EMA 20",
-    "BT: Strict EMA",
-    "Exp Div",
-    "BT: Exp Div",
-    "Doji Resting"
-])
+# Universe Selection
+universe_option = st.sidebar.selectbox("Select Stock Universe", ["Nifty 200", "Nifty 500", "All NSE Stocks (> ₹100)"])
 
-with tab1:
-    st.markdown("### Higher Timeframe Structural Shifts")
-    st.markdown("Identifies fresh Monthly/Weekly Liquidity Sweeps, daily MSS within 10 days, and strictly untested 50% Discount Levels.")
-    if st.button("Run Daily HTF Screener"):
-        with st.spinner("Scanning Nifty 500 Universe..."):
-            tickers = get_nifty500_symbols()
-            my_bar = st.progress(0)
-            active_setups = []
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(find_ict_htf_setups, t): t for t in tickers}
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    res = future.result()
-                    if res: active_setups.append(res)
-                    my_bar.progress((i + 1) / len(tickers))
-                    
-            my_bar.empty()
-            if active_setups:
-                active_setups.sort(key=lambda x: x['Distance to Entry (%)'])
-                df_final = pd.DataFrame(active_setups)
-                st.success(f"Found {len(df_final)} HTF setups!")
-                st.dataframe(df_final, use_container_width=True)
-            else:
-                st.warning("No daily HTF setups found today.")
+bullish_tab, bearish_tab = st.tabs(["Bullish Setups (Sweep Low)", "Bearish Setups (Sweep High)"])
 
-with tab2:
-    st.markdown("### 15-Minute Intraday Setups")
-    st.markdown("Identifies intraday sweeps of the Previous Day Low (PDL), subsequent 15m MSS over **strictly untested** 5-candle structural highs, and calculates the 15m entry zone.")
-    if st.button("Run 15m Intraday Screener"):
-        with st.spinner("Fetching 15m Intraday Data for Nifty 500..."):
-            tickers = get_nifty500_symbols()
-            my_bar = st.progress(0)
-            intraday_setups = []
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(find_ict_15m_intraday_setups, t): t for t in tickers}
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    res = future.result()
-                    if res: intraday_setups.append(res)
-                    my_bar.progress((i + 1) / len(tickers))
-                    
-            my_bar.empty()
-            if intraday_setups:
-                intraday_setups.sort(key=lambda x: x['Distance to Entry (%)'])
-                df_intra = pd.DataFrame(intraday_setups)
-                st.success(f"Found {len(df_intra)} 15-minute setups!")
-                st.dataframe(df_intra, use_container_width=True)
-            else:
-                st.warning("No 15-minute PDL sweep setups found right now.")
-
-with tab3:
-    st.markdown("### EMA 20 Resting Setups (Titan Structure)")
-    st.markdown("Identifies a Previous Month Low sweep followed by a thrust above a structurally sound, 'rounded bottom' EMA 20, where price is currently resting tight upon the EMA support.")
-    if st.button("Run EMA 20 Screener"):
-        with st.spinner("Analyzing EMA Convexity for Nifty 500..."):
-            tickers = get_nifty500_symbols()
-            my_bar = st.progress(0)
-            ema_setups = []
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(find_ema20_resting_setups, t): t for t in tickers}
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    res = future.result()
-                    if res: ema_setups.append(res)
-                    my_bar.progress((i + 1) / len(tickers))
-                    
-            my_bar.empty()
-            if ema_setups:
-                ema_setups.sort(key=lambda x: x['Distance to EMA20 (%)'])
-                df_ema = pd.DataFrame(ema_setups)
-                st.success(f"Found {len(df_ema)} EMA Resting setups!")
-                st.dataframe(df_ema, use_container_width=True)
-            else:
-                st.warning("No stocks are currently resting tightly on a rounded EMA 20 after a PML sweep.")
-
-with tab4:
-    st.markdown("### Historical Backtester (EMA 20 Resting)")
-    st.markdown("Select a specific month to see which stocks triggered the EMA20 Titan Setup and on what exact dates.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
-        selected_month_str = st.selectbox("Select Month", months, index=datetime.now().month - 1)
-        target_month_num = months.index(selected_month_str) + 1
-    with col2:
-        current_year = datetime.now().year
-        selected_year = st.selectbox("Select Year", [current_year, current_year - 1, current_year - 2])
+def run_screener(setup_type):
+    with st.spinner(f"Fetching {universe_option} universe and scanning for {setup_type} setups..."):
+        if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
+        elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
+        else: tickers = get_all_nse_symbols()
         
-    if st.button("Run Historical Backtest"):
-        with st.spinner(f"Simulating daily price action across Nifty 500 for {selected_month_str} {selected_year}..."):
-            tickers = get_nifty500_symbols()
-            my_bar = st.progress(0)
-            backtest_results = []
+        if not tickers:
+            st.error("Failed to fetch universe. Please try again.")
+            return
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(backtest_ema20_setups, t, selected_year, target_month_num): t for t in tickers}
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    res_list = future.result()
-                    if res_list: backtest_results.extend(res_list)
-                    my_bar.progress((i + 1) / len(tickers))
-                    
-            my_bar.empty()
-            if backtest_results:
-                backtest_results.sort(key=lambda x: x['Trigger Date'])
-                df_backtest = pd.DataFrame(backtest_results)
-                st.success(f"Found {len(df_backtest)} triggers in {selected_month_str} {selected_year}!")
-                st.dataframe(df_backtest, use_container_width=True)
-            else:
-                st.warning(f"No stocks triggered the EMA20 resting setup in {selected_month_str} {selected_year}.")
-
-with tab5:
-    st.markdown("### Strict EMA 20 Backtester (Custom Date Range)")
-    st.markdown("Enforces a falling EMA 20 prior to sweep and limits pre-touch hits to <= 2 in the 15 days before the first post-sweep touch.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("From Date", datetime.today() - timedelta(days=30))
-    with col2:
-        end_date = st.date_input("To Date", datetime.today())
-    
-    if st.button("Run Strict Date Range Screener"):
-        if start_date > end_date:
-            st.error("Start Date must be before End Date.")
-        else:
-            with st.spinner(f"Simulating exact historical structures between {start_date} and {end_date}..."):
-                tickers = get_nifty500_symbols()
-                my_bar = st.progress(0)
-                strict_date_results = []
+        my_bar = st.progress(0)
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(scan_live_setups, t, setup_type): t for t in tickers}
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                res = future.result()
+                if res: results.append(res)
+                my_bar.progress((i + 1) / len(tickers))
                 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                    futures = {executor.submit(backtest_strict_ema20_date_range, t, start_date, end_date): t for t in tickers}
-                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                        res_list = future.result()
-                        if res_list: strict_date_results.extend(res_list)
-                        my_bar.progress((i + 1) / len(tickers))
-                        
-                my_bar.empty()
-                if strict_date_results:
-                    strict_date_results.sort(key=lambda x: x['Trigger Date'])
-                    df_strict = pd.DataFrame(strict_date_results)
-                    st.success(f"Found {len(df_strict)} strict setups within the selected range!")
-                    st.dataframe(df_strict, use_container_width=True)
-                    
-                    csv_strict = df_strict.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="Download Strict Backtest Data",
-                        data=csv_strict,
-                        file_name=f"Strict_EMA20_Backtest_{start_date}_to_{end_date}.csv",
-                        mime="text/csv",
-                    )
-                else:
-                    st.warning(f"No Nifty 500 stocks met these strict criteria between {start_date} and {end_date}.")
+        my_bar.empty()
+        if results:
+            df_res = pd.DataFrame(results)
+            st.success(f"Found {len(df_res)} Live {setup_type} Setups!")
+            st.dataframe(df_res, use_container_width=True)
+        else:
+            st.warning(f"No {setup_type} setups found today.")
 
-with tab6:
-    st.markdown("### Expanding Divergence Setup (HTF Sweep)")
-    st.markdown("Identifies price dropping away from a falling EMA 20, sweeping HTF liquidity (Monthly/Quarterly/Half-Yearly), and breaking above a curvature-checked EMA 20.")
-    
-    if st.button("Run Expanding Divergence Screener"):
-        with st.spinner("Scanning for HTF rubber-band reversals..."):
-            tickers = get_nifty500_symbols()
-            my_bar = st.progress(0)
-            divergence_results = []
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(find_expanding_divergence_setup, t): t for t in tickers}
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    res = future.result()
-                    if res: divergence_results.append(res)
-                    my_bar.progress((i + 1) / len(tickers))
-                    
-            my_bar.empty()
-            if divergence_results:
-                df_div = pd.DataFrame(divergence_results)
-                st.success(f"Found {len(df_div)} fresh setups breaking above a curved EMA 20!")
-                st.dataframe(df_div, use_container_width=True)
-            else:
-                st.warning("No stocks triggered the expanding divergence and HTF sweep setup today.")
-
-with tab7:
-    st.markdown("### Expanding Divergence Backtester (Custom Date Range)")
-    st.markdown("Simulates the Expanding Divergence and HTF Sweep setup across a specific date range to find past trigger days.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date_div = st.date_input("From Date (Div Backtest)", datetime.today() - timedelta(days=30))
-    with col2:
-        end_date_div = st.date_input("To Date (Div Backtest)", datetime.today())
+def run_backtest(setup_type, start_date, end_date):
+    if start_date > end_date:
+        st.error("Start Date must be before End Date.")
+        return
         
-    if st.button("Run Expanding Div Backtester"):
-        if start_date_div > end_date_div:
-            st.error("Start Date must be before End Date.")
-        else:
-            with st.spinner(f"Simulating Expanding Divergence structures between {start_date_div} and {end_date_div}..."):
-                tickers = get_nifty500_symbols()
-                my_bar = st.progress(0)
-                div_backtest_results = []
+    with st.spinner(f"Simulating daily data across {universe_option} for {setup_type} setups..."):
+        if universe_option == "Nifty 200": tickers = get_nifty200_symbols()
+        elif universe_option == "Nifty 500": tickers = get_nifty500_symbols()
+        else: tickers = get_all_nse_symbols()
+        
+        my_bar = st.progress(0)
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(backtest_setups, t, start_date, end_date, setup_type): t for t in tickers}
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                res_list = future.result()
+                if res_list: results.extend(res_list)
+                my_bar.progress((i + 1) / len(tickers))
                 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                    futures = {executor.submit(backtest_expanding_divergence_date_range, t, start_date_div, end_date_div): t for t in tickers}
-                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                        res_list = future.result()
-                        if res_list: div_backtest_results.extend(res_list)
-                        my_bar.progress((i + 1) / len(tickers))
-                        
-                my_bar.empty()
-                if div_backtest_results:
-                    div_backtest_results.sort(key=lambda x: x['Trigger Date'])
-                    df_div_bt = pd.DataFrame(div_backtest_results)
-                    st.success(f"Found {len(df_div_bt)} Expanding Divergence setups within the selected range!")
-                    st.dataframe(df_div_bt, use_container_width=True)
-                    
-                    csv_div_bt = df_div_bt.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="Download Div Backtest Data",
-                        data=csv_div_bt,
-                        file_name=f"Expanding_Div_Backtest_{start_date_div}_to_{end_date_div}.csv",
-                        mime="text/csv",
-                    )
-                else:
-                    st.warning(f"No stocks triggered the expanding divergence setup between {start_date_div} and {end_date_div}.")
-
-with tab8:
-    st.markdown("### Doji Resting Setup & Backtester")
-    st.markdown("Identifies an **untested HTF liquidity sweep** formed at a **Macro Bottom**, daily **MSS**, cross above a **rounded EMA 20**, and a **flag pullback** printing at least one **Doji** resting directly on the EMA.")
-    
-    if st.button("Run Live Screener (Doji Rest)"):
-        with st.spinner("Scanning Nifty 500 for live Doji structural flags..."):
-            tickers = get_nifty500_symbols()
-            my_bar = st.progress(0)
-            doji_live_results = []
+        my_bar.empty()
+        if results:
+            results.sort(key=lambda x: x['Trigger Date'])
+            df_bt = pd.DataFrame(results)
+            st.success(f"Found {len(df_bt)} {setup_type} triggers in the selected range!")
+            st.dataframe(df_bt, use_container_width=True)
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                futures = {executor.submit(find_doji_resting_setups, t): t for t in tickers}
-                for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                    res = future.result()
-                    if res: doji_live_results.append(res)
-                    my_bar.progress((i + 1) / len(tickers))
-                    
-            my_bar.empty()
-            if doji_live_results:
-                df_doji_live = pd.DataFrame(doji_live_results)
-                st.success(f"Found {len(df_doji_live)} fresh Doji Resting setups today!")
-                st.dataframe(df_doji_live, use_container_width=True)
-            else:
-                st.warning("No stocks triggered the Doji Resting setup today.")
-                
+            csv = df_bt.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label=f"Download {setup_type} Backtest Data",
+                data=csv,
+                file_name=f"{setup_type}_Backtest_{start_date}_to_{end_date}.csv",
+                mime="text/csv",
+            )
+        else:
+            st.warning(f"No {setup_type} setups found in the specified range.")
+
+with bullish_tab:
+    st.markdown("Identifies a sustained **Macro Downtrend**, an **untested HTF low sweep**, daily **MSS**, a breakout above a **rounded EMA 20 bottom**, and a flag pulling back to print at least one **Doji resting precisely ON the EMA**.")
+    if st.button("Run Live Bullish Screener"):
+        run_screener("Bullish")
+        
     st.divider()
-    st.markdown("#### Backtest Custom Date Range")
-    
+    st.markdown("#### Backtest Custom Date Range (Bullish)")
     col1, col2 = st.columns(2)
-    with col1:
-        start_date_doji = st.date_input("From Date (Doji Backtest)", datetime.today() - timedelta(days=30))
-    with col2:
-        end_date_doji = st.date_input("To Date (Doji Backtest)", datetime.today())
+    with col1: start_b = st.date_input("From Date (Bullish)", datetime.today() - timedelta(days=30))
+    with col2: end_b = st.date_input("To Date (Bullish)", datetime.today())
+    if st.button("Run Bullish Backtester"):
+        run_backtest("Bullish", start_b, end_b)
+
+with bearish_tab:
+    st.markdown("Identifies a sustained **Macro Uptrend**, an **untested HTF high sweep**, daily **MSS (Downside)**, a drop below a **rounded EMA 20 top**, and a rally flag printing at least one **Doji resting tightly BENEATH the EMA**.")
+    if st.button("Run Live Bearish Screener"):
+        run_screener("Bearish")
         
-    if st.button("Run Doji Resting Backtester"):
-        if start_date_doji > end_date_doji:
-            st.error("Start Date must be before End Date.")
-        else:
-            with st.spinner(f"Simulating Doji Resting structures between {start_date_doji} and {end_date_doji}..."):
-                tickers = get_nifty500_symbols()
-                my_bar = st.progress(0)
-                doji_backtest_results = []
-                
-                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                    futures = {executor.submit(backtest_doji_resting_date_range, t, start_date_doji, end_date_doji): t for t in tickers}
-                    for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                        res_list = future.result()
-                        if res_list: doji_backtest_results.extend(res_list)
-                        my_bar.progress((i + 1) / len(tickers))
-                        
-                my_bar.empty()
-                if doji_backtest_results:
-                    doji_backtest_results.sort(key=lambda x: x['Trigger Date'])
-                    df_doji_bt = pd.DataFrame(doji_backtest_results)
-                    st.success(f"Found {len(df_doji_bt)} Doji Resting setups within the selected range!")
-                    st.dataframe(df_doji_bt, use_container_width=True)
-                    
-                    csv_doji_bt = df_doji_bt.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="Download Doji Backtest Data",
-                        data=csv_doji_bt,
-                        file_name=f"Doji_Resting_Backtest_{start_date_doji}_to_{end_date_doji}.csv",
-                        mime="text/csv",
-                    )
-                else:
-                    st.warning(f"No stocks triggered the Doji Resting setup between {start_date_doji} and {end_date_doji}.")
+    st.divider()
+    st.markdown("#### Backtest Custom Date Range (Bearish)")
+    col3, col4 = st.columns(2)
+    with col3: start_br = st.date_input("From Date (Bearish)", datetime.today() - timedelta(days=30))
+    with col4: end_br = st.date_input("To Date (Bearish)", datetime.today())
+    if st.button("Run Bearish Backtester"):
+        run_backtest("Bearish", start_br, end_br)
