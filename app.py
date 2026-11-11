@@ -3,13 +3,13 @@ import pandas as pd
 import numpy as np
 import requests
 import io
-import time
 import warnings
 import logging
 import concurrent.futures
 from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="ICT Doji Resting Screener", layout="wide")
 
@@ -77,10 +77,10 @@ def get_all_nse_symbols():
 # ==========================================
 def fetch_dhan_data(security_id, client_id, access_token):
     try:
-        url = "https://api.dhan.co/charts/historical"
+        url = "https://api.dhan.co/v2/charts/historical"
+        
         headers = {
             "access-token": access_token.strip(),
-            "client-id": client_id.strip(),
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
@@ -93,49 +93,38 @@ def fetch_dhan_data(security_id, client_id, access_token):
             "exchangeSegment": "NSE_EQ",
             "instrument": "EQUITY",
             "expiryCode": 0,
+            "oi": False,
             "fromDate": from_date_str,
             "toDate": to_date_str
         }
         
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         
-        # Explicit check for blank responses (Dhan drops payload if token is stale)
-        if not response.text.strip():
-            return "API_FAIL: Dhan returned a completely blank response. Please generate a NEW Access Token on the Dhan dashboard now that you have bought the Data API."
-            
-        if response.status_code != 200:
-            return f"API_FAIL: HTTP {response.status_code} - {response.text}"
-            
-        try:
+        if response.status_code == 200:
             data = response.json()
-        except ValueError:
-            return f"API_FAIL: Invalid JSON from Dhan -> {response.text[:150]}"
-            
-        if data.get('status') == 'success' and 'data' in data:
-            if not data['data']: 
-                return pd.DataFrame() # Clean empty response
+            if data.get('status') == 'success' and 'data' in data:
+                df = pd.DataFrame(data['data'])
+                if df.empty: return pd.DataFrame()
                 
-            df = pd.DataFrame(data['data'])
-            if df.empty: return pd.DataFrame()
-            
-            if pd.api.types.is_numeric_dtype(df['start_Time']):
-                if df['start_Time'].iloc[0] > 1e11: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='ms')
-                else: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='s')
+                if pd.api.types.is_numeric_dtype(df['start_Time']):
+                    if df['start_Time'].iloc[0] > 1e11: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='ms')
+                    else: df['start_Time'] = pd.to_datetime(df['start_Time'], unit='s')
+                else:
+                    df['start_Time'] = pd.to_datetime(df['start_Time'])
+                    
+                if df['start_Time'].dt.tz is not None:
+                    df['start_Time'] = df['start_Time'].dt.tz_localize(None)
+                    
+                df.set_index('start_Time', inplace=True)
+                df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+                df.sort_index(inplace=True)
+                return df
             else:
-                df['start_Time'] = pd.to_datetime(df['start_Time'])
+                return f"API_FAIL: {data.get('remarks', data)}"
                 
-            if df['start_Time'].dt.tz is not None:
-                df['start_Time'] = df['start_Time'].dt.tz_localize(None)
-                
-            df.set_index('start_Time', inplace=True)
-            df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-            df.sort_index(inplace=True)
-            return df
-            
-        return f"API_FAIL: Dhan Error -> {data.get('remarks', data.get('errorType', str(data)))}"
-        
+        return f"API_FAIL: HTTP {response.status_code} - {response.text}"
     except Exception as e:
-        return f"API_FAIL: Python Exception -> {str(e)}"
+        return f"API_FAIL: Exception - {str(e)}"
 
 # ==========================================
 # CURVATURE MATH
@@ -466,8 +455,8 @@ def execute_scan(setup_type, mode, start_date=None, end_date=None):
         api_fails = 0
         last_error_msg = ""
         
-        # Micro-delay in the fetch logic means we can safely run 10 background threads
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # Throttled to 5 workers to prevent API Rate Limiting from DhanHQ
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = {}
             for t in tickers:
                 clean_sym = t.replace('.NS', '')
